@@ -94,7 +94,7 @@ fn did_cid_win(
             reset_cached_stmt(col_val_stmt.stmt)?;
             if ret == 0 && unsafe { (*ext_data).mergeEqualValues == 1 } {
                 // values are the same (ret == 0) and the option to tie break on site_id is true
-                let ret = did_site_id_win(
+                let won = did_site_id_win(
                     db,
                     insert_tbl,
                     tbl_info,
@@ -103,7 +103,7 @@ fn did_cid_win(
                     insert_site_id,
                     errmsg,
                 )?;
-                return Ok(ret);
+                return Ok(won);
             }
             return Ok(ret > 0);
         }
