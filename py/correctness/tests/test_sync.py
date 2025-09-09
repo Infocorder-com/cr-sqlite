@@ -438,6 +438,34 @@ def test_merge_same_w_tie_breaker():
 
     assert (changes1 == changes2 == changes3)
 
+
+    # test that delete also merge when conflicts are shared
+    db1.execute("DELETE FROM foo WHERE a = 1;")
+    db1.commit()
+
+    db2.execute("DELETE FROM foo WHERE a = 1;")
+    db2.commit()
+
+    sync_left_to_right(db1, db2, 0)
+    sync_left_to_right(db2, db1, 0)
+
+    changes1 = db1.execute("SELECT \"table\", pk, cid, val, col_version, site_id, db_version FROM crsql_changes").fetchall()
+    changes2 = db2.execute("SELECT \"table\", pk, cid, val, col_version, site_id, db_version FROM crsql_changes").fetchall()
+
+    assert (changes1 == changes2)
+
+    db3.execute("DELETE FROM foo WHERE a = 1;")
+    db3.commit()
+
+    for dba, dbb in possibilities:
+        sync_left_to_right(dba, dbb, 0)
+
+    changes1 = db1.execute("SELECT \"table\", pk, cid, val, col_version, site_id, db_version FROM crsql_changes").fetchall()
+    changes2 = db2.execute("SELECT \"table\", pk, cid, val, col_version, site_id, db_version FROM crsql_changes").fetchall()
+    changes3 = db3.execute("SELECT \"table\", pk, cid, val, col_version, site_id, db_version FROM crsql_changes").fetchall()
+
+    assert (changes1 == changes2 == changes3)
+
 def test_merge_matching_clocks_lesser_value():
     def make_dbs():
         db1 = create_basic_db()
