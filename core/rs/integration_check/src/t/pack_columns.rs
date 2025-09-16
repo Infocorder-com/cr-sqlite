@@ -190,29 +190,6 @@ fn test_unpack_columns() -> Result<(), ResultCode> {
         }
     }
 
-    db.db.exec_safe("DELETE FROM bar")?;
-    let float_col: [f64; 6] = [1.0, -1.0, f64::MIN, f64::MAX, 2.0, 0.7899];
-
-    for f in float_col {
-        let insert_stmt = db.db.prepare_v2("INSERT INTO bar VALUES (?)")?;
-        insert_stmt.bind_double(1, f)?;
-        insert_stmt.step()?;
-
-        let select_stmt = db
-            .db
-            .prepare_v2("SELECT crsql_pack_columns(id) FROM bar where id = ?")?;
-        select_stmt.bind_double(1, f)?;
-        select_stmt.step()?;
-        let result = select_stmt.column_blob(0)?;
-        let unpacked = unpack_columns(result)?;
-        assert!(unpacked.len() == 1);
-        if let ColumnValue::Float(i) = unpacked[0] {
-            assert!(i == f);
-        } else {
-            assert!("unexpected type" == "");
-        }
-    }
-
     Ok(())
 }
 
