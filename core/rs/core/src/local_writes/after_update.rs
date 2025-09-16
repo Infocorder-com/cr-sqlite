@@ -200,30 +200,6 @@ fn after_update__move_non_pk_col(
     super::step_trigger_stmt(move_non_pk_col_stmt)
 }
 
-// TODO: in the future we can keep sentinel information in the lookaside
-#[allow(non_snake_case)]
-fn after_update__move_non_sentinels(
-    db: *mut sqlite3,
-    tbl_info: &TableInfo,
-    new_key: sqlite::int64,
-    old_key: sqlite::int64,
-) -> Result<ResultCode, String> {
-    let move_non_sentinels_stmt_ref = tbl_info
-        .get_move_non_sentinels_stmt(db)
-        .or_else(|_| Err("failed to get move_non_sentinels_stmt"))?;
-    let move_non_sentinels_stmt = move_non_sentinels_stmt_ref
-        .as_ref()
-        .ok_or("Failed to deref move_non_sentinels_stmt")?;
-
-    move_non_sentinels_stmt
-        // set things to new key
-        .bind_int64(1, new_key)
-        // where they have the old key
-        .and_then(|_| move_non_sentinels_stmt.bind_int64(2, old_key))
-        .or_else(|_| Err("failed to bind pks to move_non_sentinels_stmt"))?;
-    super::step_trigger_stmt(move_non_sentinels_stmt)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

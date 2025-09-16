@@ -903,8 +903,8 @@ unsafe extern "C" fn x_crsql_db_version(
  */
 unsafe extern "C" fn x_crsql_next_db_version(
     ctx: *mut sqlite::context,
-    argc: i32,
-    argv: *mut *mut sqlite::value,
+    _argc: i32,
+    _argv: *mut *mut sqlite::value,
 ) {
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let db = ctx.db_handle();
@@ -962,8 +962,8 @@ unsafe extern "C" fn x_crsql_set_db_version(
  */
 unsafe extern "C" fn x_crsql_peek_next_db_version(
     ctx: *mut sqlite::context,
-    argc: i32,
-    argv: *mut *mut sqlite::value,
+    _argc: i32,
+    _argv: *mut *mut sqlite::value,
 ) {
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let db = ctx.db_handle();
@@ -984,16 +984,16 @@ unsafe extern "C" fn x_crsql_peek_next_db_version(
  */
 unsafe extern "C" fn x_crsql_sha(
     ctx: *mut sqlite::context,
-    argc: i32,
-    argv: *mut *mut sqlite::value,
+    _argc: i32,
+    _argv: *mut *mut sqlite::value,
 ) {
     ctx.result_text_static(sha::SHA);
 }
 
 unsafe extern "C" fn x_crsql_version(
     ctx: *mut sqlite::context,
-    argc: i32,
-    argv: *mut *mut sqlite::value,
+    _argc: i32,
+    _argv: *mut *mut sqlite::value,
 ) {
     ctx.result_int64(consts::CRSQLITE_VERSION as i64);
 }

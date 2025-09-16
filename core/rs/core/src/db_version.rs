@@ -14,11 +14,8 @@ use sqlite_nostd as sqlite;
 
 use crate::c::crsql_ExtData;
 use crate::c::crsql_fetchPragmaDataVersion;
-use crate::c::crsql_fetchPragmaSchemaVersion;
-use crate::c::DB_VERSION_SCHEMA_VERSION;
 use crate::consts::MIN_POSSIBLE_DB_VERSION;
 use crate::consts::SITE_ID_LEN;
-use crate::ext_data::recreate_db_version_stmt;
 use crate::stmt_cache::reset_cached_stmt;
 #[no_mangle]
 pub extern "C" fn crsql_fill_db_version_if_needed(
@@ -135,7 +132,7 @@ pub fn fill_db_version_if_needed(
 }
 
 pub fn fetch_db_version_from_storage(
-    db: *mut sqlite3,
+    _db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
 ) -> Result<ResultCode, String> {
     unsafe {

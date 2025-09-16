@@ -90,7 +90,7 @@ fn did_cid_win(
     match step_result {
         Ok(ResultCode::ROW) => {
             let local_value = col_val_stmt.column_value(0)?;
-            let mut ret = crsql_compare_sqlite_values(insert_val, local_value);
+            let ret = crsql_compare_sqlite_values(insert_val, local_value);
             reset_cached_stmt(col_val_stmt.stmt)?;
             if ret == 0 && unsafe { (*ext_data).mergeEqualValues == 1 } {
                 // values are the same (ret == 0) and the option to tie break on site_id is true
@@ -215,7 +215,7 @@ fn set_winner_clock(
                     );
 
                     if let Err(rc) = bind_result {
-                        reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt);
+                        reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
                         return Err(rc);
                     }
 
@@ -322,7 +322,7 @@ fn merge_sentinel_only_insert(
     }
 
     if rc.is_ok() {
-        zero_clocks_on_resurrect(db, tbl_info, key, remote_db_vsn)?;
+        zero_clocks_on_resurrect(db, tbl_info, key)?;
         return set_winner_clock(
             db,
             ext_data,
@@ -344,7 +344,6 @@ fn zero_clocks_on_resurrect(
     db: *mut sqlite3,
     tbl_info: &TableInfo,
     key: sqlite::int64,
-    insert_db_vrsn: sqlite::int64,
 ) -> Result<ResultCode, ResultCode> {
     let zero_stmt_ref = tbl_info.get_zero_clocks_on_resurrect_stmt(db)?;
     let zero_stmt = zero_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
