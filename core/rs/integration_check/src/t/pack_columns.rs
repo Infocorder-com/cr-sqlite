@@ -135,6 +135,61 @@ fn test_unpack_columns() -> Result<(), ResultCode> {
     select_stmt.step()?;
     assert!(select_stmt.column_blob(0)? == blob);
 
+    db.db.exec_safe("CREATE TABLE bar (id PRIMARY KEY)")?;
+    let int_col: [i64; 7] = [
+        1,
+        -1,
+        i64::MAX,
+        i64::MIN,
+        i8::MAX as i64,
+        i16::MIN as i64,
+        10156800_i64,
+    ];
+
+    for i in int_col {
+        let insert_stmt = db.db.prepare_v2("INSERT INTO bar VALUES (?)")?;
+        insert_stmt.bind_int64(1, i)?;
+        insert_stmt.step()?;
+
+        let select_stmt = db
+            .db
+            .prepare_v2("SELECT crsql_pack_columns(id) FROM bar where id = ?")?;
+        select_stmt.bind_int64(1, i)?;
+        select_stmt.step()?;
+        let result = select_stmt.column_blob(0)?;
+        let unpacked = unpack_columns(result)?;
+        assert!(unpacked.len() == 1);
+        if let ColumnValue::Integer(i) = unpacked[0] {
+            assert!(i == i);
+        } else {
+            assert!("unexpected type" == "");
+        }
+    }
+
+    db.db.exec_safe("DELETE FROM bar")?;
+    let text_col: [&str; 4] = ["a", ",", "-abcdefghijklmnopqrstuvwxyz1234567890?!", ""];
+
+    for txt in text_col {
+        let insert_stmt = db.db.prepare_v2("INSERT INTO bar VALUES (?)")?;
+        insert_stmt.bind_text(1, txt, sqlite::Destructor::STATIC)?;
+        insert_stmt.step()?;
+
+        let select_stmt = db
+            .db
+            .prepare_v2("SELECT crsql_pack_columns(id) FROM bar where id = ?")?;
+        select_stmt.bind_text(1, txt, sqlite::Destructor::STATIC)?;
+        select_stmt.step()?;
+        let result = select_stmt.column_blob(0)?;
+        let unpacked = unpack_columns(result)?;
+        assert!(unpacked.len() == 1);
+        libc_print::std_name::println!("unpacked: {:?}", txt);
+        if let ColumnValue::Text(i) = &unpacked[0] {
+            assert!(i == txt);
+        } else {
+            assert!("unexpected type" == "");
+        }
+    }
+
     Ok(())
 }
 

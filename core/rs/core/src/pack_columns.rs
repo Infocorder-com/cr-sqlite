@@ -157,7 +157,8 @@ pub fn unpack_columns(data: &[u8]) -> Result<Vec<ColumnValue>, ResultCode> {
                 if buf.remaining() < intlen {
                     return Err(ResultCode::ABORT);
                 }
-                ret.push(ColumnValue::Integer(buf.get_int(intlen)));
+                let unsigned = buf.get_uint(intlen);
+                ret.push(ColumnValue::Integer(unsigned as i64));
             }
             Some(ColumnType::Null) => {
                 ret.push(ColumnValue::Null);
@@ -166,7 +167,7 @@ pub fn unpack_columns(data: &[u8]) -> Result<Vec<ColumnValue>, ResultCode> {
                 if buf.remaining() < intlen {
                     return Err(ResultCode::ABORT);
                 }
-                let len = buf.get_int(intlen) as usize;
+                let len = buf.get_uint(intlen) as usize;
                 if buf.remaining() < len {
                     return Err(ResultCode::ABORT);
                 }
