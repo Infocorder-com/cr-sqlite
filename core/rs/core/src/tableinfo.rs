@@ -468,6 +468,7 @@ impl TableInfo {
         Ok(self.mark_locally_deleted_stmt.try_borrow()?)
     }
 
+    #[allow(dead_code)]
     pub fn get_move_non_sentinels_stmt(
         &self,
         db: *mut sqlite3,
@@ -571,6 +572,7 @@ impl TableInfo {
         Ok(self.combo_insert_clock_stmt.try_borrow()?)
     }
 
+    #[allow(dead_code)]
     pub fn get_select_clock_stmt(
         &self,
         db: *mut sqlite3,
