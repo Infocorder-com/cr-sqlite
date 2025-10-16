@@ -17,6 +17,7 @@ use crate::c::crsql_fetchPragmaDataVersion;
 use crate::consts::MIN_POSSIBLE_DB_VERSION;
 use crate::consts::SITE_ID_LEN;
 use crate::stmt_cache::reset_cached_stmt;
+
 #[no_mangle]
 pub extern "C" fn crsql_fill_db_version_if_needed(
     db: *mut sqlite3,
@@ -208,10 +209,13 @@ pub fn insert_db_version(
 
         if let Some(db_v) = last_db_versions.get(insert_site_id) {
             if *db_v >= insert_db_vrsn {
-                // already inserted this site version!
+                // already inserted this a greater or equal db version!
                 return Ok(());
             }
         }
+
+        // ensure the site_id exists in the crsql_site_id table
+        let _ = get_or_set_site_ordinal(ext_data, insert_site_id)?;
 
         let bind_result = (*ext_data)
             .pSetDbVersionStmt
@@ -238,4 +242,63 @@ pub fn insert_db_version(
         reset_cached_stmt((*ext_data).pSetDbVersionStmt)?;
     }
     Ok(())
+}
+
+pub unsafe fn get_or_set_site_ordinal(
+    ext_data: *mut crsql_ExtData,
+    site_id: &[u8],
+) -> Result<i64, ResultCode> {
+    let bind_result = (*ext_data).pSelectSiteIdOrdinalStmt.bind_blob(
+        1,
+        site_id,
+        sqlite::Destructor::STATIC,
+    );
+
+    if let Err(rc) = bind_result {
+        reset_cached_stmt((*ext_data).pSelectSiteIdOrdinalStmt)?;
+        return Err(rc);
+    }
+
+    match (*ext_data).pSelectSiteIdOrdinalStmt.step() {
+        Ok(ResultCode::ROW) => {
+            let ordinal = (*ext_data).pSelectSiteIdOrdinalStmt.column_int64(0);
+            reset_cached_stmt((*ext_data).pSelectSiteIdOrdinalStmt)?;
+            Ok(ordinal)
+        }
+        Ok(_) => {
+            reset_cached_stmt((*ext_data).pSelectSiteIdOrdinalStmt)?;
+            // site id had no ordinal yet.
+            // set one and return the ordinal.
+            let bind_result = (*ext_data).pSetSiteIdOrdinalStmt.bind_blob(
+                1,
+                site_id,
+                sqlite::Destructor::STATIC,
+            );
+
+            if let Err(rc) = bind_result {
+                reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
+                return Err(rc);
+            }
+
+            match (*ext_data).pSetSiteIdOrdinalStmt.step() {
+                Ok(ResultCode::DONE) => {
+                    reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
+                    return Err(ResultCode::ABORT);
+                }
+                Ok(_) => {
+                    let ordinal = (*ext_data).pSetSiteIdOrdinalStmt.column_int64(0);
+                    reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
+                    Ok(ordinal)
+                }
+                Err(rc) => {
+                    reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
+                    return Err(rc);
+                }
+            }
+        }
+        Err(rc) => {
+            reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
+            return Err(rc);
+        }
+    }
 }

@@ -1,4 +1,6 @@
 import pathlib
+import sqlite3
+import pytest
 from crsql_correctness import connect, close, min_db_v, get_site_id, sync_left_to_right
 
 # c1
@@ -134,22 +136,16 @@ def test_rollback_does_not_move_db_version():
     close(c)
 
 def test_overwriting_keeps_track_of_true_db_version():
-    def create_db1():
+    def create_db():
         db1 = connect(":memory:")
         db1.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b DEFAULT 0);")
         db1.execute("SELECT crsql_as_crr('foo');")
         db1.commit()
         return db1
 
-    def create_db2():
-        db2 = connect(":memory:")
-        db2.execute("CREATE TABLE foo (a PRIMARY KEY NOT NULL, b DEFAULT 0);")
-        db2.execute("SELECT crsql_as_crr('foo');")
-        db2.commit()
-        return db2
 
-    db1 = create_db1()
-    db2 = create_db2()
+    db1 = create_db()
+    db2 = create_db()
 
     db1_site_id = get_site_id(db1)
     db2_site_id = get_site_id(db2)
@@ -222,3 +218,26 @@ def test_overwriting_keeps_track_of_true_db_version():
 
     close(db1)
     close(db2)
+
+def test_site_id_ordinal_is_set_and_updated():
+    c1 = connect(":memory:")
+    c2 = connect(":memory:")
+
+    other_site_id = get_site_id(c2)
+    c1_site_id = get_site_id(c1)
+    # first insert, assert db_version and ordinal is set
+    c1.execute("SELECT crsql_set_db_version(?, ?)", (bytes(other_site_id), 3))
+    c1.commit()
+    assert c1.execute("SELECT db_version from crsql_db_versions where site_id = ?", (bytes(other_site_id),)).fetchone()[0] == 3
+    assert c1.execute("SELECT count(*) from crsql_site_id").fetchone()[0] == 2
+    assert c1.execute("SELECT ordinal from crsql_site_id where site_id = ?", (bytes(other_site_id),)).fetchone()[0] == 1
+
+    c1.execute("SELECT crsql_set_db_version(?, ?)", (bytes(other_site_id), 5))
+    assert c1.execute("SELECT db_version from crsql_db_versions where site_id = ?", (bytes(other_site_id),)).fetchone()[0] == 5
+
+    # smaller db_version should not get set`x`
+    c1.execute("SELECT crsql_set_db_version(?, ?)", (bytes(other_site_id), 2))
+    assert c1.execute("SELECT db_version from crsql_db_versions where site_id = ?", (bytes(other_site_id),)).fetchone()[0] == 5
+
+    close(c1)
+    close(c2)
