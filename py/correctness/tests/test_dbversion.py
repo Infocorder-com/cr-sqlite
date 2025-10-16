@@ -239,5 +239,9 @@ def test_site_id_ordinal_is_set_and_updated():
     c1.execute("SELECT crsql_set_db_version(?, ?)", (bytes(other_site_id), 2))
     assert c1.execute("SELECT db_version from crsql_db_versions where site_id = ?", (bytes(other_site_id),)).fetchone()[0] == 5
 
+    # setting our own site_id should error
+    with pytest.raises(sqlite3.Error):
+        c1.execute("SELECT crsql_set_db_version(?, ?)", (bytes(c1_site_id), 6))
+
     close(c1)
     close(c2)

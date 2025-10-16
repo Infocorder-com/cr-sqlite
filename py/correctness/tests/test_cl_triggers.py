@@ -17,8 +17,10 @@ from crsql_correctness import connect, close, min_db_v
 from pprint import pprint
 import pytest
 
-def create_db():
-    c = connect(":memory:")
+def create_db(db_file=None):
+    if db_file is None:
+        db_file = ":memory:"
+    c = connect(db_file)
     c.execute("CREATE TABLE foo (a INTEGER PRIMARY KEY NOT NULL, b INTEGER) STRICT;")
     c.execute("SELECT crsql_as_crr('foo')")
     c.commit()
