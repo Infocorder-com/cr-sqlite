@@ -450,6 +450,7 @@ fn remove_col() -> Result<(), ResultCode> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn remove_col_fract_table() {
     let db = crate::opendb().expect("db opened");
     db.db
