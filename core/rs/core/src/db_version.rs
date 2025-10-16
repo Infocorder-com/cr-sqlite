@@ -210,7 +210,7 @@ pub fn insert_db_version(
 
         if let Some(db_v) = last_db_versions.get(insert_site_id) {
             if *db_v >= insert_db_vrsn {
-                // already inserted this a greater or equal db version!
+                // already inserted a greater or equal db version!
                 return Ok(());
             }
         }
