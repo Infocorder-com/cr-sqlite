@@ -170,6 +170,7 @@ fn modify_pkonly_row() -> Result<(), ResultCode> {
 // Current issue with this test is that we're not recording the actual
 // delete event on update of primary key. We're creating a synthetic one
 // on read from `changes` when the target row is missing.
+#[allow(dead_code)]
 fn junction_table() -> Result<(), ResultCode> {
     let db_a = crate::opendb()?;
     let db_b = crate::opendb()?;

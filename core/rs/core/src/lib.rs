@@ -338,21 +338,21 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     }
 
     let rc = db
-    .create_function_v2(
-        "crsql_version",
-        0,
-        sqlite::UTF8 | sqlite::INNOCUOUS | sqlite::DETERMINISTIC,
-        None,
-        Some(x_crsql_version),
-        None,
-        None,
-        None,
-    )
-    .unwrap_or(ResultCode::ERROR);
-if rc != ResultCode::OK {
-    unsafe { crsql_freeExtData(ext_data) };
-    return null_mut();
-}
+        .create_function_v2(
+            "crsql_version",
+            0,
+            sqlite::UTF8 | sqlite::INNOCUOUS | sqlite::DETERMINISTIC,
+            None,
+            Some(x_crsql_version),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
 
     let rc = db
         .create_function_v2(

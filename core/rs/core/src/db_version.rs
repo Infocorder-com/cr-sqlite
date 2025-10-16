@@ -17,6 +17,7 @@ use crate::c::crsql_fetchPragmaDataVersion;
 use crate::consts::MIN_POSSIBLE_DB_VERSION;
 use crate::consts::SITE_ID_LEN;
 use crate::stmt_cache::reset_cached_stmt;
+
 #[no_mangle]
 pub extern "C" fn crsql_fill_db_version_if_needed(
     db: *mut sqlite3,
@@ -201,6 +202,7 @@ pub fn insert_db_version(
     insert_db_vrsn: i64,
 ) -> Result<(), ResultCode> {
     unsafe {
+        // we can get a more recent db_versio
         let mut last_db_versions: mem::ManuallyDrop<Box<BTreeMap<Vec<u8>, i64>>> =
             mem::ManuallyDrop::new(Box::from_raw(
                 (*ext_data).lastDbVersions as *mut BTreeMap<Vec<u8>, i64>,
@@ -208,9 +210,21 @@ pub fn insert_db_version(
 
         if let Some(db_v) = last_db_versions.get(insert_site_id) {
             if *db_v >= insert_db_vrsn {
-                // already inserted this site version!
+                // already inserted a greater or equal db version!
                 return Ok(());
             }
+        }
+
+        // ensure the site_id exists in the crsql_site_id table
+        let ordinal = get_or_set_site_ordinal(ext_data, insert_site_id)?;
+        if ordinal == 0 {
+            // we manage our own db_version internally but only error if we get a bigger db_version
+            // cause we can get our own rows from other nodes but the version should never be greater than our own.
+            let db_version = (*ext_data).dbVersion;
+            if insert_db_vrsn > db_version {
+                return Err(ResultCode::ERROR);
+            }
+            return Ok(());
         }
 
         let bind_result = (*ext_data)
@@ -238,4 +252,61 @@ pub fn insert_db_version(
         reset_cached_stmt((*ext_data).pSetDbVersionStmt)?;
     }
     Ok(())
+}
+
+pub unsafe fn get_or_set_site_ordinal(
+    ext_data: *mut crsql_ExtData,
+    site_id: &[u8],
+) -> Result<i64, ResultCode> {
+    let bind_result =
+        (*ext_data)
+            .pSelectSiteIdOrdinalStmt
+            .bind_blob(1, site_id, sqlite::Destructor::STATIC);
+
+    if let Err(rc) = bind_result {
+        reset_cached_stmt((*ext_data).pSelectSiteIdOrdinalStmt)?;
+        return Err(rc);
+    }
+
+    match (*ext_data).pSelectSiteIdOrdinalStmt.step() {
+        Ok(ResultCode::ROW) => {
+            let ordinal = (*ext_data).pSelectSiteIdOrdinalStmt.column_int64(0);
+            reset_cached_stmt((*ext_data).pSelectSiteIdOrdinalStmt)?;
+            Ok(ordinal)
+        }
+        Ok(_) => {
+            reset_cached_stmt((*ext_data).pSelectSiteIdOrdinalStmt)?;
+            // site id had no ordinal yet.
+            // set one and return the ordinal.
+            let bind_result =
+                (*ext_data)
+                    .pSetSiteIdOrdinalStmt
+                    .bind_blob(1, site_id, sqlite::Destructor::STATIC);
+
+            if let Err(rc) = bind_result {
+                reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
+                return Err(rc);
+            }
+
+            match (*ext_data).pSetSiteIdOrdinalStmt.step() {
+                Ok(ResultCode::DONE) => {
+                    reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
+                    return Err(ResultCode::ABORT);
+                }
+                Ok(_) => {
+                    let ordinal = (*ext_data).pSetSiteIdOrdinalStmt.column_int64(0);
+                    reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
+                    Ok(ordinal)
+                }
+                Err(rc) => {
+                    reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
+                    return Err(rc);
+                }
+            }
+        }
+        Err(rc) => {
+            reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
+            return Err(rc);
+        }
+    }
 }
