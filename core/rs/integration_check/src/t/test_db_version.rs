@@ -1,6 +1,6 @@
 extern crate alloc;
-use alloc::{ffi::CString, string::String};
-use core::ffi::c_char;
+use alloc::{boxed::Box, collections::BTreeMap, ffi::CString, format, string::String, vec::Vec};
+use core::{ffi::c_char, mem};
 use crsql_bundle::test_exports;
 use sqlite::{Connection, ResultCode};
 use sqlite_nostd as sqlite;
@@ -8,6 +8,11 @@ use sqlite_nostd as sqlite;
 fn make_site() -> *mut c_char {
     let inner_ptr: *mut c_char = CString::new("0000000000000000").unwrap().into_raw();
     inner_ptr
+}
+
+fn convert_to_bytes(id: *mut c_char) -> Vec<u8> {
+    let site_id_string = unsafe { CString::from_raw(id) };
+    site_id_string.into_bytes()
 }
 
 fn get_site_id(db: *mut sqlite::sqlite3) -> *mut c_char {
@@ -112,8 +117,49 @@ fn test_next_db_version() -> Result<(), String> {
     Ok(())
 }
 
+fn test_get_or_set_site_ordinal() -> Result<(), ResultCode> {
+    let c = crate::opendb().expect("db opened");
+    let db = &c.db;
+    let raw_db = db.db;
+    let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db, get_site_id(raw_db)) };
+
+    let site_id = convert_to_bytes(get_site_id(raw_db));
+    let ordinal = unsafe { test_exports::db_version::get_or_set_site_ordinal(ext_data, &site_id)? };
+    assert_eq!(0, ordinal);
+
+    let mut ordinals = unsafe {
+        mem::ManuallyDrop::new(Box::from_raw(
+            (*ext_data).ordinalMap as *mut BTreeMap<Vec<u8>, i64>,
+        ))
+    };
+
+    assert_eq!(0, *(ordinals.get(&site_id).unwrap()));
+
+    // update ordinal in db but it should remain the same on the map
+    let update_stmt =
+        raw_db.prepare_v2("UPDATE crsql_site_id SET ordinal = 8 WHERE site_id = ?")?;
+    update_stmt.bind_blob(1, &site_id, sqlite::Destructor::STATIC)?;
+    update_stmt.step()?;
+
+    let ordinal = unsafe { test_exports::db_version::get_or_set_site_ordinal(ext_data, &site_id)? };
+    assert_eq!(0, ordinal);
+
+    // clear ordinals and call func again, we should get update
+    ordinals.clear();
+    let ordinal = unsafe { test_exports::db_version::get_or_set_site_ordinal(ext_data, &site_id)? };
+    assert_eq!(8, ordinal);
+
+    unsafe {
+        test_exports::c::crsql_freeExtData(ext_data);
+    };
+    Ok(())
+}
+
 pub fn run_suite() -> Result<(), String> {
     test_fetch_db_version_from_storage()?;
     test_next_db_version()?;
+    if let Err(rc) = test_get_or_set_site_ordinal() {
+        return Err(format!("test_get_or_set_site_ordinal failed: {:?}", rc));
+    }
     Ok(())
 }

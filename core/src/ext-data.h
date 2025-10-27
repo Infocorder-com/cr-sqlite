@@ -48,6 +48,7 @@ struct crsql_ExtData {
 
   int mergeEqualValues;
   unsigned long long timestamp;
+  void *ordinalMap;
 };
 
 crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer);
@@ -57,5 +58,7 @@ int crsql_fetchPragmaSchemaVersion(sqlite3 *db, crsql_ExtData *pExtData,
 int crsql_fetchPragmaDataVersion(sqlite3 *db, crsql_ExtData *pExtData);
 int crsql_recreate_db_version_stmt(sqlite3 *db, crsql_ExtData *pExtData);
 void crsql_finalize(crsql_ExtData *pExtData);
+void crsql_init_ordinal_map(crsql_ExtData *pExtData);
+void crsql_drop_ordinal_map(crsql_ExtData *pExtData);
 
 #endif
