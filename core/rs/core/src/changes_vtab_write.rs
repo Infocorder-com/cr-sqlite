@@ -575,7 +575,7 @@ unsafe fn merge_insert(
             if insert_cl == local_cl {
                 return Ok(ResultCode::OK);
             }
-            let merge_result = merge_sentinel_only_insert(
+            let inner_rowid = merge_sentinel_only_insert(
                 db,
                 (*tab).pExtData,
                 &tbl_info,
@@ -586,22 +586,15 @@ unsafe fn merge_insert(
                 insert_site_id,
                 insert_seq,
                 insert_ts,
-            );
-            match merge_result {
-                Err(rc) => {
-                    return Err(rc);
-                }
-                Ok(inner_rowid) => {
-                    // a success & rowid of -1 means the merge was a no-op
-                    if inner_rowid != -1 {
-                        (*(*tab).pExtData).rowsImpacted += 1;
-                        *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
-                        return Ok(ResultCode::OK);
-                    } else {
-                        return Ok(ResultCode::OK);
-                    }
-                }
+            )?;
+            // a success & rowid of -1 means the merge was a no-op
+            if inner_rowid != -1 {
+                (*(*tab).pExtData).rowsImpacted += 1;
+                *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
             }
+            return Ok(ResultCode::OK);
+            
+            
         }
 
         // we got a causal length which would resurrect the row.
@@ -613,7 +606,7 @@ unsafe fn merge_insert(
         if needs_resurrect && (row_exists_locally || (!row_exists_locally && insert_cl > 1)) {
             // this should work -- same as `merge_sentinel_only_insert` except we're not done once we do it
             // and the version to set to is the cl not col_vrsn of current insert
-            merge_sentinel_only_insert(
+            let inner_rowid = merge_sentinel_only_insert(
                 db,
                 (*tab).pExtData,
                 &tbl_info,
@@ -625,7 +618,11 @@ unsafe fn merge_insert(
                 insert_seq,
                 insert_ts,
             )?;
-            (*(*tab).pExtData).rowsImpacted += 1;
+            // a success & rowid of -1 means the merge was a no-op
+            if inner_rowid != -1 {
+                (*(*tab).pExtData).rowsImpacted += 1;
+                *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
+            }
         }
 
         // we can short-circuit via needs_resurrect
