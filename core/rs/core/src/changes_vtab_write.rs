@@ -704,7 +704,14 @@ unsafe fn merge_insert(
 
     // Update the received db_version whether the change won or not.
     if res.is_ok() && !insert_site_id.is_empty() {
-        insert_db_version((*tab).pExtData, insert_site_id, insert_db_vrsn)?;
+        if let Err(rc) = insert_db_version((*tab).pExtData, insert_site_id, insert_db_vrsn) {
+            let err = CString::new(format!(
+                "Unable to insert db version {} for site id {:?}",
+                insert_db_vrsn, insert_site_id
+            ))?;
+            *errmsg = err.into_raw();
+            return Err(rc);
+        }
     }
 
     res
