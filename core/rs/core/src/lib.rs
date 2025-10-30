@@ -48,9 +48,9 @@ mod triggers;
 mod unpack_columns_vtab;
 mod util;
 
-use alloc::borrow::Cow;
 use alloc::format;
 use alloc::string::ToString;
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, vec::Vec};
 use core::ffi::c_char;
 use core::mem;
 use core::ptr::null_mut;
@@ -58,7 +58,7 @@ extern crate alloc;
 use alter::crsql_compact_post_alter;
 use automigrate::*;
 use backfill::*;
-use c::{crsql_freeExtData, crsql_newExtData};
+use c::{crsql_freeExtData, crsql_initSiteIdExt, crsql_newExtData};
 use config::{crsql_config_get, crsql_config_set};
 use core::ffi::{c_int, c_void, CStr};
 use create_crr::create_crr;
@@ -232,6 +232,30 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
+    // allocate ext data earlier in the init process because we need its
+    // pointer to be available for the crsql_update_site_id function.
+    let ext_data = unsafe { crsql_newExtData(db) };
+    if ext_data.is_null() {
+        return null_mut();
+    }
+
+    let rc = db
+        .create_function_v2(
+            "crsql_update_site_id",
+            2,
+            sqlite::UTF8 | sqlite::INNOCUOUS | sqlite::DETERMINISTIC,
+            Some(ext_data as *mut c_void),
+            Some(x_crsql_update_site_id),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
     // TODO: convert this function to a proper rust function
     // and have rust free:
     // 1. site_id_buffer
@@ -243,12 +267,18 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     let rc = crate::bootstrap::crsql_init_site_id(db, site_id_buffer);
     if rc != ResultCode::OK as c_int {
         sqlite::free(site_id_buffer as *mut c_void);
+        unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
 
-    let ext_data = unsafe { crsql_newExtData(db, site_id_buffer as *mut c_char) };
-    if ext_data.is_null() {
-        // no need to free the site id buffer here, this is cleaned up already.
+    let rc = unsafe { crsql_initSiteIdExt(db, ext_data, site_id_buffer as *mut c_char) };
+    if rc != ResultCode::OK as c_int {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    if let Err(_) = crate::bootstrap::create_site_id_triggers(db) {
+        sqlite::free(site_id_buffer as *mut c_void);
         return null_mut();
     }
 
@@ -408,10 +438,28 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     let rc = db
         .create_function_v2(
             "crsql_set_ts",
-            -1,
+            1,
             sqlite::UTF8 | sqlite::DETERMINISTIC,
             Some(ext_data as *mut c_void),
             Some(x_crsql_set_ts),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    #[cfg(feature = "test")]
+    let rc = db
+        .create_function_v2(
+            "crsql_cache_site_ordinal",
+            1,
+            sqlite::UTF8 | sqlite::DETERMINISTIC,
+            Some(ext_data as *mut c_void),
+            Some(x_crsql_cache_site_ordinal),
             None,
             None,
             None,
@@ -625,6 +673,32 @@ unsafe extern "C" fn x_crsql_site_id(
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
     let site_id = (*ext_data).siteId;
     sqlite::result_blob(ctx, site_id, consts::SITE_ID_LEN, Destructor::STATIC);
+}
+
+/**
+ * update in-memory map of site ids to ordinals. Only valid within a transaction.
+ *
+ * `select crsql_update_site_id(site_id, ordinal)`
+ */
+unsafe extern "C" fn x_crsql_update_site_id(
+    ctx: *mut sqlite::context,
+    argc: i32,
+    argv: *mut *mut sqlite::value,
+) {
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    let args = sqlite::args!(argc, argv);
+    let site_id = args[0].blob();
+    let ordinal = args[1].int64();
+    let mut ordinals: mem::ManuallyDrop<Box<BTreeMap<Vec<u8>, i64>>> = mem::ManuallyDrop::new(
+        Box::from_raw((*ext_data).ordinalMap as *mut BTreeMap<Vec<u8>, i64>),
+    );
+
+    if ordinal == -1 {
+        ordinals.remove(&site_id.to_vec());
+    } else {
+        ordinals.insert(site_id.to_vec(), ordinal);
+    }
+    ctx.result_text_static("OK");
 }
 
 unsafe extern "C" fn x_crsql_finalize(
@@ -854,10 +928,7 @@ unsafe extern "C" fn x_crsql_set_ts(
     argv: *mut *mut sqlite::value,
 ) {
     if argc == 0 {
-        ctx.result_error(
-            "Wrong number of args provided to crsql_begin_alter. Provide the
-          schema name and table name or just the table name.",
-        );
+        ctx.result_error("Wrong number of args provided to x_crsql_set_ts. Provide the timestamp.");
         return;
     }
 
@@ -876,6 +947,37 @@ unsafe extern "C" fn x_crsql_set_ts(
     ctx.result_text_static("OK");
 }
 
+/**
+ * Get the site ordinal cached in the ext data for the current transaction.
+ * only used for test to inspect the ordinal map.
+ */
+#[cfg(feature = "test")]
+unsafe extern "C" fn x_crsql_cache_site_ordinal(
+    ctx: *mut sqlite::context,
+    argc: i32,
+    argv: *mut *mut sqlite::value,
+) {
+    if argc == 0 {
+        ctx.result_error(
+            "Wrong number of args provided to crsql_cache_site_ordinal. Provide the site id.",
+        );
+        return;
+    }
+
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    let args = sqlite::args!(argc, argv);
+    let site_id = args[0].blob();
+
+    let ord_map = mem::ManuallyDrop::new(Box::from_raw(
+        (*ext_data).ordinalMap as *mut BTreeMap<Vec<u8>, i64>,
+    ));
+    let res = ord_map.get(site_id).cloned().unwrap_or(-1);
+    sqlite::result_int64(ctx, res);
+}
+
+/**
+ * Return the timestamp for the current transaction.
+ */
 unsafe extern "C" fn x_crsql_get_ts(
     ctx: *mut sqlite::context,
     _argc: i32,

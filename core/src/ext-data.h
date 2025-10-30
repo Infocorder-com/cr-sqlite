@@ -51,7 +51,8 @@ struct crsql_ExtData {
   void *ordinalMap;
 };
 
-crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer);
+crsql_ExtData *crsql_newExtData(sqlite3 *db);
+int crsql_initSiteIdExt(sqlite3 *db, crsql_ExtData *pExtData, unsigned char *siteIdBuffer);
 void crsql_freeExtData(crsql_ExtData *pExtData);
 int crsql_fetchPragmaSchemaVersion(sqlite3 *db, crsql_ExtData *pExtData,
                                    int which);

@@ -10,6 +10,13 @@
 
 int crsql_close(sqlite3 *db);
 
+crsql_ExtData *crsqlExtDataInit(sqlite3 *db, unsigned char *siteIdBuffer) {
+  crsql_ExtData *pExtData = crsql_newExtData(db);
+  int rc = crsql_initSiteIdExt(db, pExtData, siteIdBuffer);
+  assert(rc == 0);
+  return pExtData;
+}
+
 static void textNewExtData() {
   printf("NewExtData\n");
   sqlite3 *db;
@@ -18,7 +25,7 @@ static void textNewExtData() {
   assert(rc == SQLITE_OK);
   unsigned char *siteIdBuffer =
       sqlite3_malloc(SITE_ID_LEN * sizeof *(siteIdBuffer));
-  crsql_ExtData *pExtData = crsql_newExtData(db, siteIdBuffer);
+  crsql_ExtData *pExtData = crsqlExtDataInit(db, siteIdBuffer);
 
   assert(pExtData->dbVersion == -1);
   // statement used to determine schema version
@@ -35,6 +42,8 @@ static void textNewExtData() {
   assert(pExtData->pDbVersionStmt != 0);
   // table info allocated to an empty vec
   assert(pExtData->tableInfos != 0);
+  // ordinal map allocated to an empty map
+  assert(pExtData->ordinalMap != 0);
 
   // data version should have been fetched
   assert(pExtData->pragmaDataVersion != -1);
@@ -45,6 +54,26 @@ static void textNewExtData() {
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
+static void testAllocateExtData() {
+  printf("AllocateExtData\n");
+  sqlite3 *db;
+  int rc = SQLITE_OK;
+  rc = sqlite3_open(":memory:", &db);
+  assert(rc == SQLITE_OK);
+  unsigned char *siteIdBuffer =
+      sqlite3_malloc(SITE_ID_LEN * sizeof *(siteIdBuffer));
+      
+  crsql_ExtData *pExtData = crsqlExtDataInit(db, siteIdBuffer);
+  // ordinal map allocated to an empty map
+  assert(pExtData->ordinalMap != 0);
+
+  // crsql_finalize(pExtData);
+  // crsql_freeExtData(pExtData);
+  crsql_close(db);
+  printf("\t\e[0;32mSuccess\e[0m\n");
+}
+
+
 // valgrind will let us know if we failed to free something
 // mainly testing that we can finalize + free without error
 static void testFreeExtData() {
@@ -54,7 +83,8 @@ static void testFreeExtData() {
   rc = sqlite3_open(":memory:", &db);
   assert(rc == SQLITE_OK);
   unsigned char *siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof(char *));
-  crsql_ExtData *pExtData = crsql_newExtData(db, siteIdBuffer);
+  crsql_ExtData *pExtData = crsqlExtDataInit(db, siteIdBuffer);
+  assert(rc == 0);
 
   crsql_finalize(pExtData);
   crsql_freeExtData(pExtData);
@@ -69,7 +99,8 @@ static void testFinalize() {
   rc = sqlite3_open(":memory:", &db);
   assert(rc == SQLITE_OK);
   unsigned char *siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof(char *));
-  crsql_ExtData *pExtData = crsql_newExtData(db, siteIdBuffer);
+  crsql_ExtData *pExtData = crsqlExtDataInit(db, siteIdBuffer);
+  assert(rc == 0);
 
   crsql_finalize(pExtData);
   assert(pExtData->pDbVersionStmt == 0);
@@ -90,7 +121,8 @@ static void testFetchPragmaSchemaVersion() {
   rc = sqlite3_open(":memory:", &db);
   assert(rc == SQLITE_OK);
   unsigned char *siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof(char *));
-  crsql_ExtData *pExtData = crsql_newExtData(db, siteIdBuffer);
+  crsql_ExtData *pExtData = crsqlExtDataInit(db, siteIdBuffer);
+  assert(rc == 0);
 
   // fetch the schema info for db version update
   didChange = crsql_fetchPragmaSchemaVersion(db, pExtData, 0);
@@ -158,9 +190,9 @@ static void testFetchPragmaDataVersion() {
   assert(rc == SQLITE_OK);
 
   unsigned char *siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof(char *));
-  crsql_ExtData *pExtData1 = crsql_newExtData(db1, siteIdBuffer);
+  crsql_ExtData *pExtData1 = crsqlExtDataInit(db1, siteIdBuffer);
   siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof(char *));
-  crsql_ExtData *pExtData2 = crsql_newExtData(db2, siteIdBuffer);
+  crsql_ExtData *pExtData2 = crsqlExtDataInit(db2, siteIdBuffer);
 
   // should not change after init
   rc = crsql_fetchPragmaDataVersion(db1, pExtData1);
@@ -205,47 +237,12 @@ static void testFetchPragmaDataVersion() {
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
-// we use a static statement for db_version and no longer recreate it.
-// static void testRecreateDbVersionStmt() {
-//   printf("RecreateDbVersionStmt\n");
-//   sqlite3 *db;
-//   int rc;
-//   rc = sqlite3_open(":memory:", &db);
-//   unsigned char *siteIdBuffer = sqlite3_malloc(SITE_ID_LEN * sizeof(char *));
-//   crsql_ExtData *pExtData = crsql_newExtData(db, siteIdBuffer);
-
-//   rc = crsql_recreate_db_version_stmt(db, pExtData);
-
-//   // there are no clock tables yet. nothing to create.
-//   assert(rc == -1);
-//   assert(pExtData->pDbVersionStmt == 0);
-
-//   sqlite3_exec(db, "CREATE TABLE foo (a primary key not null, b);", 0, 0, 0);
-//   sqlite3_exec(db, "SELECT crsql_as_crr('foo')", 0, 0, 0);
-
-//   rc = crsql_recreate_db_version_stmt(db, pExtData);
-//   assert(rc == 0);
-//   assert(pExtData->pDbVersionStmt != 0);
-
-//   // recreating while a created statement exists isn't an error
-//   rc = crsql_recreate_db_version_stmt(db, pExtData);
-//   assert(rc == 0);
-//   assert(pExtData->pDbVersionStmt != 0);
-
-//   crsql_finalize(pExtData);
-//   assert(pExtData->pDbVersionStmt == 0);
-//   crsql_freeExtData(pExtData);
-//   crsql_close(db);
-//   printf("\t\e[0;32mSuccess\e[0m\n");
-// }
-
 void crsqlExtDataTestSuite() {
   printf("\e[47m\e[1;30mSuite: crsql_ExtData\e[0m\n");
   textNewExtData();
   testFreeExtData();
   testFinalize();
   testFetchPragmaSchemaVersion();
-  // We no longer recreate the db version stmt
-  // testRecreateDbVersionStmt();
   testFetchPragmaDataVersion();
+  testAllocateExtData();
 }

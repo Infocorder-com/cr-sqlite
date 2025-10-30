@@ -53,7 +53,9 @@ fn test_ensure_table_infos_are_up_to_date() {
     )
     .expect("made foo clock");
 
-    let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db, make_site()) };
+    let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db) };
+    let rc = unsafe { test_exports::c::crsql_initSiteIdExt(raw_db, ext_data, make_site()) };
+    assert_eq!(rc, 0);
     test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
 
     let mut table_infos = unsafe {
@@ -359,6 +361,7 @@ fn test_leak_condition() {
 }
 
 pub fn run_suite() {
+    libc_print::libc_println!("Running tableinfo suite");
     test_ensure_table_infos_are_up_to_date();
     test_pull_table_info();
     test_is_table_compatible();

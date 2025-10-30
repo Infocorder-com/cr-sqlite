@@ -151,9 +151,12 @@ int crsql_changes_column(
     int i                     /* Which column to return */
 );
 int crsql_changes_eof(sqlite3_vtab_cursor *cur);
+int crsql_changes_savepoint(sqlite3_vtab *pVTab, int iSavepoint);
+int crsql_changes_release(sqlite3_vtab *pVTab, int iSavepoint);
+int crsql_changes_rollback_to(sqlite3_vtab *pVTab, int iSavepoint);
 
 sqlite3_module crsql_changesModule = {
-    /* iVersion    */ 0,
+    /* iVersion    */ 2,
     /* xCreate     */ 0,
     /* xConnect    */ changesConnect,
     /* xBestIndex  */ crsql_changes_best_index,
@@ -173,9 +176,9 @@ sqlite3_module crsql_changesModule = {
     /* xRollback   */ 0,
     /* xFindMethod */ 0,
     /* xRename     */ 0,
-    /* xSavepoint  */ 0,
-    /* xRelease    */ 0,
-    /* xRollbackTo */ 0,
+    /* xSavepoint  */ crsql_changes_savepoint,
+    /* xRelease    */ crsql_changes_release,
+    /* xRollbackTo */ crsql_changes_rollback_to,
     /* xShadowName */ 0
 #ifdef LIBSQL
     ,

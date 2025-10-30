@@ -109,10 +109,12 @@ extern "C" {
         db: *mut sqlite::sqlite3,
         pExtData: *mut crsql_ExtData,
     ) -> c_int;
-    pub fn crsql_newExtData(
+    pub fn crsql_newExtData(db: *mut sqlite::sqlite3) -> *mut crsql_ExtData;
+    pub fn crsql_initSiteIdExt(
         db: *mut sqlite::sqlite3,
+        pExtData: *mut crsql_ExtData,
         siteIdBuffer: *mut c_char,
-    ) -> *mut crsql_ExtData;
+    ) -> c_int;
     pub fn crsql_freeExtData(pExtData: *mut crsql_ExtData);
     pub fn crsql_finalize(pExtData: *mut crsql_ExtData);
 }
