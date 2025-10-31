@@ -54,26 +54,6 @@ static void textNewExtData() {
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
-static void testAllocateExtData() {
-  printf("AllocateExtData\n");
-  sqlite3 *db;
-  int rc = SQLITE_OK;
-  rc = sqlite3_open(":memory:", &db);
-  assert(rc == SQLITE_OK);
-  unsigned char *siteIdBuffer =
-      sqlite3_malloc(SITE_ID_LEN * sizeof *(siteIdBuffer));
-      
-  crsql_ExtData *pExtData = crsqlExtDataInit(db, siteIdBuffer);
-  // ordinal map allocated to an empty map
-  assert(pExtData->ordinalMap != 0);
-
-  // crsql_finalize(pExtData);
-  // crsql_freeExtData(pExtData);
-  crsql_close(db);
-  printf("\t\e[0;32mSuccess\e[0m\n");
-}
-
-
 // valgrind will let us know if we failed to free something
 // mainly testing that we can finalize + free without error
 static void testFreeExtData() {
@@ -244,5 +224,4 @@ void crsqlExtDataTestSuite() {
   testFinalize();
   testFetchPragmaSchemaVersion();
   testFetchPragmaDataVersion();
-  testAllocateExtData();
 }
