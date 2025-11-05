@@ -1,5 +1,5 @@
 extern crate alloc;
-use crate::alloc::string::ToString;
+use crate::alloc::{collections::BTreeMap, string::ToString};
 use crate::changes_vtab_write::crsql_merge_insert;
 use crate::stmt_cache::reset_cached_stmt;
 use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, TableInfo};
@@ -563,5 +563,29 @@ pub extern "C" fn crsql_changes_commit(vtab: *mut sqlite::vtab) -> c_int {
     unsafe {
         (*(*tab).pExtData).rowsImpacted = 0;
     }
+    ResultCode::OK as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn crsql_changes_savepoint(_vtab: *mut sqlite::vtab, _n: c_int) -> c_int {
+    ResultCode::OK as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn crsql_changes_release(_vtab: *mut sqlite::vtab, _n: c_int) -> c_int {
+    ResultCode::OK as c_int
+}
+
+// clear ordinal cache on rollback so we don't have wrong data in the cache.
+#[no_mangle]
+pub extern "C" fn crsql_changes_rollback_to(vtab: *mut sqlite::vtab, _: c_int) -> c_int {
+    let tab = vtab.cast::<crsql_Changes_vtab>();
+
+    let mut ordinals = unsafe {
+        mem::ManuallyDrop::new(Box::from_raw(
+            (*(*tab).pExtData).ordinalMap as *mut BTreeMap<Vec<u8>, i64>,
+        ))
+    };
+    ordinals.clear();
     ResultCode::OK as c_int
 }

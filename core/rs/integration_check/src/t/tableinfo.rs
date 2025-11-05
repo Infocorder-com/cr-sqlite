@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::{ffi::c_char, mem};
 use crsql_bundle::test_exports;
 use crsql_bundle::test_exports::tableinfo::TableInfo;
-use sqlite::Connection;
+use sqlite::{Connection, ResultCode};
 use sqlite_nostd as sqlite;
 
 // Unfortunate circumstance that we still have some C code that requires this argument
@@ -53,7 +53,9 @@ fn test_ensure_table_infos_are_up_to_date() {
     )
     .expect("made foo clock");
 
-    let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db, make_site()) };
+    let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db) };
+    let rc = unsafe { test_exports::c::crsql_initSiteIdExt(raw_db, ext_data, make_site()) };
+    assert_eq!(rc, 0);
     test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
 
     let mut table_infos = unsafe {
@@ -358,10 +360,44 @@ fn test_leak_condition() {
         .expect("inserted into foo");
 }
 
+fn test_site_id_initialization() {
+    {
+        let db = crate::opendb().expect("Opened DB");
+        let raw_db = db.db.db;
+        let site_id = select_site_id(raw_db).expect("selected site id");
+        assert_eq!(site_id.len(), 16);
+        raw_db.exec_safe("DELETE FROM crsql_site_id;").expect("deleted site id");
+    }
+
+    {
+        let db = crate::opendb().expect("Opened DB");
+        let raw_db = db.db.db;
+        let site_id = select_site_id(raw_db).expect("selected site id");
+        assert_eq!(site_id.len(), 16);
+        raw_db.exec_safe("DROP TABLE crsql_site_id;").expect("dropped crsql_site_id");
+    }
+
+    {
+        let db = crate::opendb().expect("Opened DB");
+        let raw_db = db.db.db;
+        let site_id = select_site_id(raw_db).expect("selected site id");
+        assert_eq!(site_id.len(), 16);
+    }
+}
+
+fn select_site_id(db: *mut sqlite::sqlite3) -> Result<Vec<u8>, ResultCode> {
+    let site_id_stmt = db.prepare_v2("SELECT crsql_site_id()")?;
+    site_id_stmt.step()?;
+    let site_id = site_id_stmt.column_blob(0)?.to_vec();
+    Ok(site_id)
+}
+
 pub fn run_suite() {
+    libc_print::libc_println!("Running tableinfo suite");
     test_ensure_table_infos_are_up_to_date();
     test_pull_table_info();
     test_is_table_compatible();
     test_create_clock_table_from_table_info();
     test_leak_condition();
+    test_site_id_initialization();
 }

@@ -73,6 +73,7 @@ pub struct crsql_ExtData {
     pub pSelectClockTablesStmt: *mut sqlite::stmt,
     pub mergeEqualValues: ::core::ffi::c_int,
     pub timestamp: ::core::ffi::c_ulonglong,
+    pub ordinalMap: *mut ::core::ffi::c_void,
 }
 
 #[repr(C)]
@@ -108,10 +109,12 @@ extern "C" {
         db: *mut sqlite::sqlite3,
         pExtData: *mut crsql_ExtData,
     ) -> c_int;
-    pub fn crsql_newExtData(
+    pub fn crsql_newExtData(db: *mut sqlite::sqlite3) -> *mut crsql_ExtData;
+    pub fn crsql_initSiteIdExt(
         db: *mut sqlite::sqlite3,
+        pExtData: *mut crsql_ExtData,
         siteIdBuffer: *mut c_char,
-    ) -> *mut crsql_ExtData;
+    ) -> c_int;
     pub fn crsql_freeExtData(pExtData: *mut crsql_ExtData);
     pub fn crsql_finalize(pExtData: *mut crsql_ExtData);
 }
@@ -268,7 +271,7 @@ fn bindgen_test_layout_crsql_ExtData() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::core::mem::size_of::<crsql_ExtData>(),
-        160usize,
+        168usize,
         concat!("Size of: ", stringify!(crsql_ExtData))
     );
     assert_eq!(
@@ -496,6 +499,16 @@ fn bindgen_test_layout_crsql_ExtData() {
             stringify!(crsql_ExtData),
             "::",
             stringify!(timestamp)
+        )
+    );
+    assert_eq!(
+        unsafe { ::core::ptr::addr_of!((*ptr).ordinalMap) as usize - ptr as usize },
+        160usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(crsql_ExtData),
+            "::",
+            stringify!(ordinalMap)
         )
     );
 }

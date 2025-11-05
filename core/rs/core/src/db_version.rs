@@ -188,10 +188,25 @@ pub extern "C" fn crsql_init_last_db_versions_map(ext_data: *mut crsql_ExtData) 
 }
 
 #[no_mangle]
+pub extern "C" fn crsql_init_ordinal_map(ext_data: *mut crsql_ExtData) {
+    let map: BTreeMap<Vec<u8>, i64> = BTreeMap::new();
+    unsafe { (*ext_data).ordinalMap = Box::into_raw(Box::new(map)) as *mut c_void }
+}
+
+#[no_mangle]
 pub extern "C" fn crsql_drop_last_db_versions_map(ext_data: *mut crsql_ExtData) {
     unsafe {
         drop(Box::from_raw(
             (*ext_data).lastDbVersions as *mut BTreeMap<Vec<u8>, i64>,
+        ));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn crsql_drop_ordinal_map(ext_data: *mut crsql_ExtData) {
+    unsafe {
+        drop(Box::from_raw(
+            (*ext_data).ordinalMap as *mut BTreeMap<Vec<u8>, i64>,
         ));
     }
 }
@@ -258,6 +273,15 @@ pub unsafe fn get_or_set_site_ordinal(
     ext_data: *mut crsql_ExtData,
     site_id: &[u8],
 ) -> Result<i64, ResultCode> {
+    // check the cache first
+    let mut ordinals: mem::ManuallyDrop<Box<BTreeMap<Vec<u8>, i64>>> = mem::ManuallyDrop::new(
+        Box::from_raw((*ext_data).ordinalMap as *mut BTreeMap<Vec<u8>, i64>),
+    );
+
+    if let Some(ordinal) = ordinals.get(site_id) {
+        return Ok(*ordinal);
+    }
+
     let bind_result =
         (*ext_data)
             .pSelectSiteIdOrdinalStmt
@@ -268,11 +292,11 @@ pub unsafe fn get_or_set_site_ordinal(
         return Err(rc);
     }
 
-    match (*ext_data).pSelectSiteIdOrdinalStmt.step() {
+    let ordinal = match (*ext_data).pSelectSiteIdOrdinalStmt.step() {
         Ok(ResultCode::ROW) => {
             let ordinal = (*ext_data).pSelectSiteIdOrdinalStmt.column_int64(0);
             reset_cached_stmt((*ext_data).pSelectSiteIdOrdinalStmt)?;
-            Ok(ordinal)
+            ordinal
         }
         Ok(_) => {
             reset_cached_stmt((*ext_data).pSelectSiteIdOrdinalStmt)?;
@@ -296,7 +320,7 @@ pub unsafe fn get_or_set_site_ordinal(
                 Ok(_) => {
                     let ordinal = (*ext_data).pSetSiteIdOrdinalStmt.column_int64(0);
                     reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
-                    Ok(ordinal)
+                    ordinal
                 }
                 Err(rc) => {
                     reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
@@ -308,5 +332,7 @@ pub unsafe fn get_or_set_site_ordinal(
             reset_cached_stmt((*ext_data).pSetSiteIdOrdinalStmt)?;
             return Err(rc);
         }
-    }
+    };
+    ordinals.insert(site_id.to_vec(), ordinal);
+    Ok(ordinal)
 }

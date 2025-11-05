@@ -48,6 +48,27 @@ fn create_site_id_and_site_id_table(db: *mut sqlite3) -> Result<[u8; 16], Result
     insert_site_id(db)
 }
 
+pub fn create_site_id_triggers(db: *mut sqlite3) -> Result<ResultCode, ResultCode> {
+    db.exec_safe(&format!(
+        "CREATE TRIGGER IF NOT EXISTS {tbl}_insert_trig AFTER INSERT ON \"{tbl}\"
+        WHEN NEW.ordinal != 0
+        BEGIN
+          VALUES (crsql_update_site_id(NEW.site_id, NEW.ordinal));
+        END;
+        CREATE TRIGGER IF NOT EXISTS {tbl}_update_trig AFTER UPDATE ON \"{tbl}\"
+        WHEN NEW.ordinal != 0
+        BEGIN
+          VALUES (crsql_update_site_id(NEW.site_id, NEW.ordinal));
+        END;
+        CREATE TRIGGER IF NOT EXISTS {tbl}_delete_trig AFTER DELETE ON \"{tbl}\"
+        WHEN OLD.ordinal != 0
+        BEGIN
+          VALUES (crsql_update_site_id(OLD.site_id, -1));
+        END;",
+        tbl = consts::TBL_SITE_ID
+    ))
+}
+
 #[no_mangle]
 pub extern "C" fn crsql_init_peer_tracking_table(db: *mut sqlite3) -> c_int {
     match db.exec_safe("CREATE TABLE IF NOT EXISTS crsql_tracked_peers (\"site_id\" BLOB NOT NULL, \"version\" INTEGER NOT NULL, \"seq\" INTEGER DEFAULT 0, \"tag\" INTEGER, \"event\" INTEGER, PRIMARY KEY (\"site_id\", \"tag\", \"event\")) STRICT;") {

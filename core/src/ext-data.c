@@ -7,17 +7,19 @@
 
 void crsql_clear_stmt_cache(crsql_ExtData *pExtData);
 void crsql_init_table_info_vec(crsql_ExtData *pExtData);
+void crsql_init_ordinal_map(crsql_ExtData *pExtData);
+void crsql_drop_ordinal_map(crsql_ExtData *pExtData);
 void crsql_drop_table_info_vec(crsql_ExtData *pExtData);
 void crsql_init_last_db_versions_map(crsql_ExtData *pExtData);
 void crsql_drop_last_db_versions_map(crsql_ExtData *pExtData);
 // void crsql_init_table_info_vec(crsql_ExtData *pExtData);
 // void crsql_drop_table_info_vec(crsql_ExtData *pExtData);
 
-crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
+// The initialization here is incomplete! We need to call crsql_initSiteIdExt after this.
+crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   crsql_ExtData *pExtData = sqlite3_malloc(sizeof *pExtData);
 
-  pExtData->siteId = siteIdBuffer;
-
+  pExtData->siteId = 0;
   pExtData->pPragmaSchemaVersionStmt = 0;
   int rc = sqlite3_prepare_v3(db, "PRAGMA schema_version", -1,
                               SQLITE_PREPARE_PERSISTENT,
@@ -34,14 +36,8 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
                            &(pExtData->pClearSyncBitStmt), 0);
 
   pExtData->pSetSiteIdOrdinalStmt = 0;
-  rc += sqlite3_prepare_v3(
-      db, "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal",
-      -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pSetSiteIdOrdinalStmt), 0);
 
   pExtData->pSelectSiteIdOrdinalStmt = 0;
-  rc += sqlite3_prepare_v3(
-      db, "SELECT ordinal FROM crsql_site_id WHERE site_id = ?", -1,
-      SQLITE_PREPARE_PERSISTENT, &(pExtData->pSelectSiteIdOrdinalStmt), 0);
 
   pExtData->pSelectClockTablesStmt = 0;
   rc +=
@@ -52,7 +48,6 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
   pExtData->pendingDbVersion = -1;
 
   pExtData->pSetDbVersionStmt = 0;
-  // printf("instantiating pSetDbVersionStmt... current rc: %d\n", rc);
   rc += sqlite3_prepare_v3(
       db,
       "INSERT INTO crsql_db_versions (site_id, db_version) VALUES "
@@ -74,10 +69,12 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
       -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pDbVersionStmt), 0);
   pExtData->tableInfos = 0;
   pExtData->lastDbVersions = 0;
+  pExtData->ordinalMap = 0;
   pExtData->rowsImpacted = 0;
   pExtData->updatedTableInfosThisTx = 0;
   crsql_init_table_info_vec(pExtData);
   crsql_init_last_db_versions_map(pExtData);
+  crsql_init_ordinal_map(pExtData);
 
   sqlite3_stmt *pStmt;
 
@@ -123,9 +120,27 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db, unsigned char *siteIdBuffer) {
   return pExtData;
 }
 
+int crsql_initSiteIdExt(sqlite3 *db, crsql_ExtData *pExtData, unsigned char *siteIdBuffer) {
+  pExtData->siteId = siteIdBuffer;
+
+  pExtData->pSetSiteIdOrdinalStmt = 0;
+  int rc = sqlite3_prepare_v3(
+      db, "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal",
+      -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pSetSiteIdOrdinalStmt), 0);
+
+  pExtData->pSelectSiteIdOrdinalStmt = 0;
+  rc += sqlite3_prepare_v3(
+      db, "SELECT ordinal FROM crsql_site_id WHERE site_id = ?", -1,
+      SQLITE_PREPARE_PERSISTENT, &(pExtData->pSelectSiteIdOrdinalStmt), 0);
+
+  return rc;
+}
+
 void crsql_freeExtData(crsql_ExtData *pExtData) {
   // printf("free ext\n");
-  sqlite3_free(pExtData->siteId);
+  if (pExtData->siteId != 0) {
+    sqlite3_free(pExtData->siteId);
+  }
   sqlite3_finalize(pExtData->pDbVersionStmt);
   sqlite3_finalize(pExtData->pSetDbVersionStmt);
   sqlite3_finalize(pExtData->pPragmaSchemaVersionStmt);
@@ -133,8 +148,12 @@ void crsql_freeExtData(crsql_ExtData *pExtData) {
   sqlite3_finalize(pExtData->pSetSyncBitStmt);
   sqlite3_finalize(pExtData->pClearSyncBitStmt);
   sqlite3_finalize(pExtData->pSetSiteIdOrdinalStmt);
-  sqlite3_finalize(pExtData->pSelectSiteIdOrdinalStmt);
-  sqlite3_finalize(pExtData->pSelectClockTablesStmt);
+  if (pExtData->pSelectClockTablesStmt != 0) {
+    sqlite3_finalize(pExtData->pSelectClockTablesStmt);
+  }
+  if (pExtData->pSelectSiteIdOrdinalStmt != 0) {
+    sqlite3_finalize(pExtData->pSelectSiteIdOrdinalStmt);
+  }
   pExtData->pDbVersionStmt = 0;
   pExtData->pSetDbVersionStmt = 0;
   pExtData->pPragmaSchemaVersionStmt = 0;
@@ -147,6 +166,7 @@ void crsql_freeExtData(crsql_ExtData *pExtData) {
   crsql_clear_stmt_cache(pExtData);
   crsql_drop_table_info_vec(pExtData);
   crsql_drop_last_db_versions_map(pExtData);
+  crsql_drop_ordinal_map(pExtData);
   sqlite3_free(pExtData);
 }
 
@@ -163,8 +183,12 @@ void crsql_finalize(crsql_ExtData *pExtData) {
   sqlite3_finalize(pExtData->pPragmaDataVersionStmt);
   sqlite3_finalize(pExtData->pSetSyncBitStmt);
   sqlite3_finalize(pExtData->pClearSyncBitStmt);
-  sqlite3_finalize(pExtData->pSetSiteIdOrdinalStmt);
-  sqlite3_finalize(pExtData->pSelectSiteIdOrdinalStmt);
+  if (pExtData->pSetSiteIdOrdinalStmt != 0) {
+    sqlite3_finalize(pExtData->pSetSiteIdOrdinalStmt);
+  }
+  if (pExtData->pSelectSiteIdOrdinalStmt != 0) {
+    sqlite3_finalize(pExtData->pSelectSiteIdOrdinalStmt);
+  }
   sqlite3_finalize(pExtData->pSelectClockTablesStmt);
   crsql_clear_stmt_cache(pExtData);
   pExtData->pDbVersionStmt = 0;
