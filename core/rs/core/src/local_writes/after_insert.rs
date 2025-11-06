@@ -53,8 +53,10 @@ fn after_insert(
     } else if create_record_existed {
         // update the create record since it already exists.
         let seq = bump_seq(ext_data);
-        let col_version = update_create_record(db, tbl_info, key_new, db_version, seq, &ts)?;
-        tbl_info.set_cl(key_new, col_version);
+        let cl = update_create_record(db, tbl_info, key_new, db_version, seq, &ts)?;
+        if let Some(cl) = cl {
+            tbl_info.set_cl(key_new, cl);
+        }
     }
 
     super::mark_locally_inserted(db, ext_data, tbl_info, key_new, db_version, &ts)?;
@@ -69,7 +71,7 @@ fn update_create_record(
     db_version: sqlite::int64,
     seq: i32,
     ts: &str,
-) -> Result<i64, String> {
+) -> Result<Option<i64>, String> {
     let update_create_record_stmt_ref = tbl_info
         .get_maybe_mark_locally_reinserted_stmt(db)
         .map_err(|_e| "failed to get update_create_record_stmt")?;
@@ -97,7 +99,12 @@ fn update_create_record(
             let col_version = update_create_record_stmt.column_int64(0);
             super::reset_cached_stmt(update_create_record_stmt.stmt)
                 .map_err(|_e| "failed to reset cached stmt")?;
-            Ok(col_version)
+            Ok(Some(col_version))
+        }
+        Ok(ResultCode::DONE) => {
+            super::reset_cached_stmt(update_create_record_stmt.stmt)
+                .map_err(|_e| "failed to reset cached stmt")?;
+            Ok(None)
         }
         _ => {
             super::reset_cached_stmt(update_create_record_stmt.stmt)

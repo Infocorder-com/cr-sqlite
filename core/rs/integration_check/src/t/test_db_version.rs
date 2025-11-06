@@ -207,6 +207,8 @@ fn test_get_or_set_pk_cl() -> Result<(), ResultCode> {
 
     insert_foo_row(&insert_foo_stmt, 2, "c")?;
 
+    insert_foo_row(&insert_foo_stmt, 4, "d")?;
+
     let key1 = get_pk_key(&get_pk_key_stmt, 1).expect("get pk key");
     let key2 = get_pk_key(&get_pk_key_stmt, 2).expect("get pk key");
 
@@ -228,12 +230,24 @@ fn test_get_or_set_pk_cl() -> Result<(), ResultCode> {
 
     // pk 1 and 2 should have a cl of 2 since they have been deleted
     assert_eq!(2, get_cache_cl(&get_cache_cl_stmt, "foo", key1)?);
-
     assert_eq!(2, get_cache_cl(&get_cache_cl_stmt, "foo", key2)?);
 
     // reinsert pk 2, check cl is 3
     insert_foo_row(&insert_foo_stmt, 2, "d")?;
     assert_eq!(3, get_cache_cl(&get_cache_cl_stmt, "foo", key2)?);
+
+    // check insert or replace updates the cache
+    let insert_or_replace = db
+        .db
+        .prepare_v2("INSERT OR REPLACE INTO foo VALUES (?, ?);")?;
+    insert_or_replace.bind_int64(1, 4)?;
+    insert_or_replace.bind_text(2, "c", sqlite::Destructor::STATIC)?;
+    insert_or_replace.step()?;
+    reset_cached_stmt(&insert_or_replace)?;
+
+    // insert of pk with no clock row gets no update
+    let key4 = get_pk_key(&get_pk_key_stmt, 4).expect("get pk key");
+    assert_eq!(-1, get_cache_cl(&get_cache_cl_stmt, "foo", key4)?);
 
     db.db.exec_safe("COMMIT;")?;
 

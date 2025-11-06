@@ -73,13 +73,11 @@ use local_writes::after_update::x_crsql_after_update;
 use sqlite::{Destructor, ResultCode};
 use sqlite_nostd as sqlite;
 use sqlite_nostd::{Connection, Context, Value};
-use tableinfo::{
-    crsql_ensure_table_infos_are_up_to_date, is_table_compatible, pull_table_info,
-};
-use teardown::*;
-use triggers::create_triggers;
 #[cfg(feature = "test")]
 use tableinfo::TableInfo;
+use tableinfo::{crsql_ensure_table_infos_are_up_to_date, is_table_compatible, pull_table_info};
+use teardown::*;
+use triggers::create_triggers;
 
 pub use debug::debug_log;
 
