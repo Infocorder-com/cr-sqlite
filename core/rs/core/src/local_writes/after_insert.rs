@@ -1,9 +1,6 @@
-use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::string::ToString;
 use core::ffi::c_int;
-use core::mem;
 use sqlite::sqlite3;
 use sqlite::value;
 use sqlite::Context;
@@ -40,7 +37,7 @@ pub unsafe extern "C" fn x_crsql_after_insert(
 fn after_insert(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
-    tbl_info: &TableInfo,
+    tbl_info: &mut TableInfo,
     pks_new: &[*mut value],
 ) -> Result<ResultCode, String> {
     let ts = unsafe { (*ext_data).timestamp.to_string() };
@@ -57,16 +54,7 @@ fn after_insert(
         // update the create record since it already exists.
         let seq = bump_seq(ext_data);
         let col_version = update_create_record(db, tbl_info, key_new, db_version, seq, &ts)?;
-
-        let mut cl_cache = unsafe {
-            mem::ManuallyDrop::new(Box::from_raw(
-                (*ext_data).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
-            ))
-        };
-        cl_cache
-            .entry(tbl_info.tbl_name.clone())
-            .or_default()
-            .insert(key_new, col_version);
+        tbl_info.set_cl(key_new, col_version);
     }
 
     super::mark_locally_inserted(db, ext_data, tbl_info, key_new, db_version, &ts)?;

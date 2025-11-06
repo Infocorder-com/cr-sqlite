@@ -1,10 +1,8 @@
 use core::ffi::c_int;
-use core::mem;
 
 use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
-use alloc::{boxed::Box, collections::BTreeMap};
 use sqlite::{sqlite3, value, Context, ResultCode};
 use sqlite_nostd as sqlite;
 
@@ -68,7 +66,7 @@ fn partition_values<T>(
 fn after_update(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
-    tbl_info: &TableInfo,
+    tbl_info: &mut TableInfo,
     pks_new: &[*mut value],
     pks_old: &[*mut value],
     non_pks_new: &[*mut value],
@@ -145,15 +143,7 @@ fn after_update(
     }
 
     if let Some((old_key, cl)) = cl_info {
-        let mut cl_cache = unsafe {
-            mem::ManuallyDrop::new(Box::from_raw(
-                (*ext_data).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
-            ))
-        };
-        cl_cache
-            .entry(tbl_info.tbl_name.clone())
-            .or_default()
-            .insert(old_key, cl);
+        tbl_info.set_cl(old_key, cl);
     }
 
     Ok(ResultCode::OK)

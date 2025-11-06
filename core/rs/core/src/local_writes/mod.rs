@@ -26,7 +26,7 @@ fn trigger_fn_preamble<F>(
     f: F,
 ) -> Result<ResultCode, String>
 where
-    F: Fn(&TableInfo, &[*mut sqlite::value], *mut crsql_ExtData) -> Result<ResultCode, String>,
+    F: Fn(&mut TableInfo, &[*mut sqlite::value], *mut crsql_ExtData) -> Result<ResultCode, String>,
 {
     if argc < 1 {
         return Err("expected at least 1 argument".to_string());
@@ -45,10 +45,10 @@ where
         ));
     }
 
-    let table_infos =
+    let mut table_infos =
         unsafe { ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>)) };
     let table_name = values[0].text();
-    let table_info = match table_infos.iter().find(|t| &(t.tbl_name) == table_name) {
+    let table_info = match table_infos.iter_mut().find(|t| &(t.tbl_name) == table_name) {
         Some(t) => t,
         None => {
             return Err(format!("table {} not found", table_name));

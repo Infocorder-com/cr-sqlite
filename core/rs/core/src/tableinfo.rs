@@ -7,6 +7,7 @@ use crate::pack_columns::ColumnValue;
 use crate::stmt_cache::reset_cached_stmt;
 use crate::util::Countable;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -66,9 +67,24 @@ pub struct TableInfo {
     move_non_sentinels_stmt: RefCell<Option<ManagedStmt>>,
     mark_locally_created_stmt: RefCell<Option<ManagedStmt>>,
     maybe_mark_locally_reinserted_stmt: RefCell<Option<ManagedStmt>>,
+    cl_cache: BTreeMap<i64, i64>,
 }
 
 impl TableInfo {
+    pub fn get_cl(&self, key: i64) -> Option<&i64> {
+        self.cl_cache.get(&key)
+    }
+
+    pub fn set_cl(&mut self, key: i64, cl: i64) {
+        self.cl_cache.insert(key, cl);
+    }
+
+    pub fn clear_cl_cache(&mut self) {
+        if !self.cl_cache.is_empty() {
+            self.cl_cache.clear();
+        }
+    }
+
     fn find_non_pk_col(&self, col_name: &str) -> Result<&ColumnInfo, ResultCode> {
         for col in &self.non_pks {
             if col.name == col_name {
@@ -1009,6 +1025,7 @@ pub fn pull_table_info(
         select_clock_stmt: RefCell::new(None),
         insert_clock_stmt: RefCell::new(None),
         update_clock_stmt: RefCell::new(None),
+        cl_cache: BTreeMap::new(),
     })
 }
 

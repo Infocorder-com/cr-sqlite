@@ -49,7 +49,6 @@ mod unpack_columns_vtab;
 mod util;
 
 use alloc::format;
-use alloc::string::String;
 use alloc::string::ToString;
 use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, vec::Vec};
 use core::ffi::c_char;
@@ -74,7 +73,9 @@ use local_writes::after_update::x_crsql_after_update;
 use sqlite::{Destructor, ResultCode};
 use sqlite_nostd as sqlite;
 use sqlite_nostd::{Connection, Context, Value};
-use tableinfo::{crsql_ensure_table_infos_are_up_to_date, is_table_compatible, pull_table_info};
+use tableinfo::{
+    crsql_ensure_table_infos_are_up_to_date, is_table_compatible, pull_table_info, TableInfo,
+};
 use teardown::*;
 use triggers::create_triggers;
 
@@ -1008,16 +1009,16 @@ unsafe extern "C" fn x_crsql_cache_pk_cl(
     let table_name = args[0].text();
     let pk_key = args[1].int64();
 
-    let cl_cache = mem::ManuallyDrop::new(Box::from_raw(
-        (*ext_data).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
-    ));
+    let table_infos =
+        mem::ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>));
+    let table_info = table_infos.iter().find(|t| t.tbl_name == table_name);
 
-    let table_map = cl_cache.get(table_name);
-    let cl = table_map
-        .and_then(|x| x.get(&pk_key))
-        .cloned()
-        .unwrap_or(-1);
-    sqlite::result_int64(ctx, cl);
+    if let Some(table_info) = table_info {
+        let cl = table_info.get_cl(pk_key).cloned().unwrap_or(-1);
+        sqlite::result_int64(ctx, cl);
+    } else {
+        ctx.result_error("table not found");
+    }
 }
 
 /**

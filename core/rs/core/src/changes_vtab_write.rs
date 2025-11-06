@@ -1,8 +1,6 @@
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int};
 use core::mem;
@@ -382,36 +380,45 @@ pub unsafe extern "C" fn crsql_merge_insert(
 
 fn get_local_cl(
     db: *mut sqlite::sqlite3,
-    tbl_info: &TableInfo,
+    tbl_info: &mut TableInfo,
     key: sqlite::int64,
 ) -> Result<sqlite::int64, ResultCode> {
-    let local_cl_stmt_ref = tbl_info.get_local_cl_stmt(db)?;
-    let local_cl_stmt = local_cl_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
-
-    let rc = local_cl_stmt
-        .bind_int64(1, key)
-        .and_then(|_| local_cl_stmt.bind_int64(2, key));
-    if let Err(rc) = rc {
-        reset_cached_stmt(local_cl_stmt.stmt)?;
-        return Err(rc);
+    if let Some(cl) = tbl_info.get_cl(key) {
+        return Ok(*cl);
     }
 
-    let step_result = local_cl_stmt.step();
-    match step_result {
-        Ok(ResultCode::ROW) => {
-            let ret = local_cl_stmt.column_int64(0);
+    let cl = {
+        let local_cl_stmt_ref = tbl_info.get_local_cl_stmt(db)?;
+        let local_cl_stmt = local_cl_stmt_ref.as_ref().ok_or(ResultCode::ERROR)?;
+
+        let rc = local_cl_stmt
+            .bind_int64(1, key)
+            .and_then(|_| local_cl_stmt.bind_int64(2, key));
+        if let Err(rc) = rc {
             reset_cached_stmt(local_cl_stmt.stmt)?;
-            Ok(ret)
+            return Err(rc);
         }
-        Ok(ResultCode::DONE) => {
-            reset_cached_stmt(local_cl_stmt.stmt)?;
-            Ok(0)
+
+        let step_result = local_cl_stmt.step();
+        match step_result {
+            Ok(ResultCode::ROW) => {
+                let ret = local_cl_stmt.column_int64(0);
+                reset_cached_stmt(local_cl_stmt.stmt)?;
+                ret
+            }
+            Ok(ResultCode::DONE) => {
+                reset_cached_stmt(local_cl_stmt.stmt)?;
+                0
+            }
+            Ok(rc) | Err(rc) => {
+                reset_cached_stmt(local_cl_stmt.stmt)?;
+                return Err(rc);
+            }
         }
-        Ok(rc) | Err(rc) => {
-            reset_cached_stmt(local_cl_stmt.stmt)?;
-            Err(rc)
-        }
-    }
+    };
+
+    tbl_info.set_cl(key, cl);
+    Ok(cl)
 }
 
 unsafe fn merge_insert(
@@ -465,12 +472,8 @@ unsafe fn merge_insert(
 
     let insert_site_id = insert_site_id.blob();
 
-    let tbl_infos = mem::ManuallyDrop::new(Box::from_raw(
+    let mut tbl_infos = mem::ManuallyDrop::new(Box::from_raw(
         (*(*tab).pExtData).tableInfos as *mut Vec<TableInfo>,
-    ));
-
-    let mut cl_cache = mem::ManuallyDrop::new(Box::from_raw(
-        (*(*tab).pExtData).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
     ));
 
     // TODO: will this work given `insert_tbl` is null termed?
@@ -487,14 +490,14 @@ unsafe fn merge_insert(
     // TODO: technically safe since we checked `is_none` but this should be more idiomatic
     let tbl_info_index = tbl_info_index.unwrap();
 
-    let tbl_info = &tbl_infos[tbl_info_index];
+    let tbl_info = &mut tbl_infos[tbl_info_index];
     let unpacked_pks = unpack_columns(insert_pks.blob())?;
 
     // Get or create key as the first thing we do.
     // We'll need the key for all later operations.
     let key = tbl_info.get_or_create_key(db, &unpacked_pks)?;
 
-    let local_cl = get_pk_cl(db, &mut cl_cache, &tbl_info, key)?;
+    let local_cl = get_local_cl(db, tbl_info, key)?;
 
     // We can ignore all updates from older causal lengths.
     // They won't win at anything.
@@ -720,37 +723,9 @@ unsafe fn merge_insert(
 
         // a bigger cl always wins
         if insert_cl > local_cl {
-            match cl_cache.get_mut(&tbl_info.tbl_name) {
-                Some(x) => {
-                    x.insert(key, insert_cl);
-                }
-                None => {
-                    let mut new_map = BTreeMap::new();
-                    new_map.insert(key, insert_cl);
-                    cl_cache.insert(tbl_info.tbl_name.clone(), new_map);
-                }
-            }
+            tbl_info.set_cl(key, insert_cl);
         }
     }
 
     res
-}
-
-unsafe fn get_pk_cl(
-    db: *mut sqlite3,
-    cl_cache: &mut BTreeMap<String, BTreeMap<i64, i64>>,
-    tbl_info: &TableInfo,
-    key: sqlite::int64,
-) -> Result<sqlite::int64, ResultCode> {
-    match cl_cache.get(&tbl_info.tbl_name).and_then(|x| x.get(&key)) {
-        Some(cl) => Ok(*cl),
-        None => {
-            let cl = get_local_cl(db, tbl_info, key)?;
-            cl_cache
-                .entry(tbl_info.tbl_name.clone())
-                .or_default()
-                .insert(key, cl);
-            Ok(cl)
-        }
-    }
 }

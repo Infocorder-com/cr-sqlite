@@ -1,8 +1,6 @@
 use alloc::string::String;
 use alloc::string::ToString;
-use alloc::{boxed::Box, collections::BTreeMap};
 use core::ffi::c_int;
-use core::mem;
 use sqlite::sqlite3;
 use sqlite::value;
 use sqlite::Context;
@@ -40,7 +38,7 @@ pub unsafe extern "C" fn x_crsql_after_delete(
 fn after_delete(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
-    tbl_info: &TableInfo,
+    tbl_info: &mut TableInfo,
     pks_old: &[*mut value],
 ) -> Result<ResultCode, String> {
     let ts = unsafe { (*ext_data).timestamp.to_string() };
@@ -52,28 +50,22 @@ fn after_delete(
 
     let cl = mark_locally_deleted(db, tbl_info, key, db_version, seq, &ts)?;
 
-    // now actually delete the row metadata
-    let drop_clocks_stmt_ref = tbl_info
-        .get_merge_delete_drop_clocks_stmt(db)
-        .map_err(|_e| "failed to get mark_locally_deleted_stmt")?;
-    let drop_clocks_stmt = drop_clocks_stmt_ref
-        .as_ref()
-        .ok_or("Failed to deref sentinel stmt")?;
+    {
+        // now actually delete the row metadata
+        let drop_clocks_stmt_ref = tbl_info
+            .get_merge_delete_drop_clocks_stmt(db)
+            .map_err(|_e| "failed to get mark_locally_deleted_stmt")?;
+        let drop_clocks_stmt = drop_clocks_stmt_ref
+            .as_ref()
+            .ok_or("Failed to deref sentinel stmt")?;
 
-    drop_clocks_stmt
-        .bind_int64(1, key)
-        .map_err(|_e| "failed to bind pks to drop_clocks_stmt")?;
-    super::step_trigger_stmt(drop_clocks_stmt)?;
+        drop_clocks_stmt
+            .bind_int64(1, key)
+            .map_err(|_e| "failed to bind pks to drop_clocks_stmt")?;
+        super::step_trigger_stmt(drop_clocks_stmt)?;
+    }
 
-    let mut cl_cache = unsafe {
-        mem::ManuallyDrop::new(Box::from_raw(
-            (*ext_data).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
-        ))
-    };
-    cl_cache
-        .entry(tbl_info.tbl_name.clone())
-        .or_default()
-        .insert(key, cl);
+    tbl_info.set_cl(key, cl);
 
     Ok(ResultCode::OK)
 }

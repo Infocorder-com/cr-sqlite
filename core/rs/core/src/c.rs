@@ -74,7 +74,6 @@ pub struct crsql_ExtData {
     pub mergeEqualValues: ::core::ffi::c_int,
     pub timestamp: ::core::ffi::c_ulonglong,
     pub ordinalMap: *mut ::core::ffi::c_void,
-    pub clCache: *mut ::core::ffi::c_void,
 }
 
 #[repr(C)]
@@ -510,16 +509,6 @@ fn bindgen_test_layout_crsql_ExtData() {
             stringify!(crsql_ExtData),
             "::",
             stringify!(ordinalMap)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).clCache) as usize - ptr as usize },
-        168usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(crsql_ExtData),
-            "::",
-            stringify!(clCache)
         )
     );
 }

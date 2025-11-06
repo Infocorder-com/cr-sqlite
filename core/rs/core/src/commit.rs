@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 use core::{
     ffi::{c_int, c_void},
     mem,
@@ -8,6 +8,7 @@ use core::{
 use sqlite_nostd::ResultCode;
 
 use crate::c::crsql_ExtData;
+use crate::tableinfo::TableInfo;
 
 #[no_mangle]
 pub unsafe extern "C" fn crsql_commit_hook(user_data: *mut c_void) -> c_int {
@@ -38,16 +39,12 @@ pub unsafe fn commit_or_rollback_reset(ext_data: *mut crsql_ExtData) {
         Box::from_raw((*ext_data).ordinalMap as *mut BTreeMap<Vec<u8>, i64>),
     );
 
-    let mut cl_cache = unsafe {
-        mem::ManuallyDrop::new(Box::from_raw(
-            (*ext_data).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
-        ))
+    let mut table_infos = unsafe {
+        mem::ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>))
     };
-
-    for (_, map) in cl_cache.iter_mut() {
-        if !map.is_empty() {
-            map.clear();
-        }
-    }
     ordinals.clear();
+
+    for tbl_info in table_infos.iter_mut() {
+        tbl_info.clear_cl_cache();
+    }
 }

@@ -587,18 +587,15 @@ pub extern "C" fn crsql_changes_rollback_to(vtab: *mut sqlite::vtab, _: c_int) -
         ))
     };
 
-    let mut cl_cache = unsafe {
+    let mut table_infos = unsafe {
         mem::ManuallyDrop::new(Box::from_raw(
-            (*(*tab).pExtData).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
+            (*(*tab).pExtData).tableInfos as *mut Vec<TableInfo>,
         ))
     };
-
-    for (_, map) in cl_cache.iter_mut() {
-        if !map.is_empty() {
-            map.clear(); 
-        }
+    for tbl_info in table_infos.iter_mut() {
+        tbl_info.clear_cl_cache();
     }
-    
+
     ordinals.clear();
     ResultCode::OK as c_int
 }
