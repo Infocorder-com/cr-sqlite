@@ -74,10 +74,12 @@ use sqlite::{Destructor, ResultCode};
 use sqlite_nostd as sqlite;
 use sqlite_nostd::{Connection, Context, Value};
 use tableinfo::{
-    crsql_ensure_table_infos_are_up_to_date, is_table_compatible, pull_table_info, TableInfo,
+    crsql_ensure_table_infos_are_up_to_date, is_table_compatible, pull_table_info,
 };
 use teardown::*;
 use triggers::create_triggers;
+#[cfg(feature = "test")]
+use tableinfo::TableInfo;
 
 pub use debug::debug_log;
 
@@ -469,6 +471,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
+    #[cfg(feature = "test")]
     if let Err(_) = db.create_function_v2(
         "crsql_cache_pk_cl",
         2,
@@ -992,6 +995,7 @@ unsafe extern "C" fn x_crsql_cache_site_ordinal(
  * Get the pk cl cached in the ext data for the current transaction.
  * only used for test to inspect the cl cache.
  */
+#[cfg(feature = "test")]
 unsafe extern "C" fn x_crsql_cache_pk_cl(
     ctx: *mut sqlite::context,
     argc: i32,

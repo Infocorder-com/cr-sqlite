@@ -271,7 +271,7 @@ fn bindgen_test_layout_crsql_ExtData() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::core::mem::size_of::<crsql_ExtData>(),
-        176usize,
+        168usize,
         concat!("Size of: ", stringify!(crsql_ExtData))
     );
     assert_eq!(

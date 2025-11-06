@@ -12,8 +12,6 @@ void crsql_drop_ordinal_map(crsql_ExtData *pExtData);
 void crsql_drop_table_info_vec(crsql_ExtData *pExtData);
 void crsql_init_last_db_versions_map(crsql_ExtData *pExtData);
 void crsql_drop_last_db_versions_map(crsql_ExtData *pExtData);
-void crsql_init_cl_cache(crsql_ExtData *pExtData);
-void crsql_drop_cl_cache(crsql_ExtData *pExtData);
 // void crsql_init_table_info_vec(crsql_ExtData *pExtData);
 // void crsql_drop_table_info_vec(crsql_ExtData *pExtData);
 
@@ -77,7 +75,6 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   crsql_init_table_info_vec(pExtData);
   crsql_init_last_db_versions_map(pExtData);
   crsql_init_ordinal_map(pExtData);
-  crsql_init_cl_cache(pExtData);
 
   sqlite3_stmt *pStmt;
 
@@ -170,7 +167,6 @@ void crsql_freeExtData(crsql_ExtData *pExtData) {
   crsql_drop_table_info_vec(pExtData);
   crsql_drop_last_db_versions_map(pExtData);
   crsql_drop_ordinal_map(pExtData);
-  crsql_drop_cl_cache(pExtData);
   sqlite3_free(pExtData);
 }
 

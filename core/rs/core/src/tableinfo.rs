@@ -28,6 +28,7 @@ use sqlite_nostd::ResultCode;
 use sqlite_nostd::Stmt;
 use sqlite_nostd::StrRef;
 
+const MAX_CL_CACHE_SIZE: usize = 1500;
 pub struct TableInfo {
     pub tbl_name: String,
     pub pks: Vec<ColumnInfo>,
@@ -76,6 +77,10 @@ impl TableInfo {
     }
 
     pub fn set_cl(&mut self, key: i64, cl: i64) {
+        // clear the cache if we are over limit
+        if self.cl_cache.len() >= MAX_CL_CACHE_SIZE {
+            self.cl_cache.clear();
+        }
         self.cl_cache.insert(key, cl);
     }
 
