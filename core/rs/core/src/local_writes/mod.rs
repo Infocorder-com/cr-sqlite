@@ -267,3 +267,43 @@ fn mark_locally_updated(
 
     Ok(ResultCode::OK)
 }
+
+fn mark_locally_deleted(
+    db: *mut sqlite3,
+    tbl_info: &TableInfo,
+    key: sqlite::int64,
+    db_version: sqlite::int64,
+    seq: i32,
+    ts: &str,
+) -> Result<i64, String> {
+    let mark_locally_deleted_stmt_ref = tbl_info
+        .get_mark_locally_deleted_stmt(db)
+        .map_err(|_e| "failed to get mark_locally_deleted_stmt")?;
+
+    let mark_locally_deleted_stmt = mark_locally_deleted_stmt_ref
+        .as_ref()
+        .ok_or("Failed to deref sentinel stmt")?;
+
+    mark_locally_deleted_stmt
+        .bind_int64(1, key)
+        .and_then(|_| mark_locally_deleted_stmt.bind_int64(2, db_version))
+        .and_then(|_| mark_locally_deleted_stmt.bind_int(3, seq))
+        .and_then(|_| mark_locally_deleted_stmt.bind_text(4, &ts, sqlite::Destructor::STATIC))
+        .map_err(|_| "failed binding to mark locally deleted stmt")?;
+
+    let res = mark_locally_deleted_stmt.step();
+
+    match res {
+        Ok(ResultCode::ROW) => {
+            let cl = mark_locally_deleted_stmt.column_int64(0);
+            reset_cached_stmt(mark_locally_deleted_stmt.stmt)
+                .map_err(|_e| "failed to reset cached stmt")?;
+            Ok(cl)
+        }
+        _ => {
+            reset_cached_stmt(mark_locally_deleted_stmt.stmt)
+                .map_err(|_e| "failed to reset cached stmt")?;
+            Err("failed to step mark locally deleted stmt".to_string())
+        }
+    }
+}

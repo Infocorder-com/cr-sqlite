@@ -49,6 +49,7 @@ mod unpack_columns_vtab;
 mod util;
 
 use alloc::format;
+use alloc::string::String;
 use alloc::string::ToString;
 use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, vec::Vec};
 use core::ffi::c_char;
@@ -453,19 +454,30 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     }
 
     #[cfg(feature = "test")]
-    let rc = db
-        .create_function_v2(
-            "crsql_cache_site_ordinal",
-            1,
-            sqlite::UTF8 | sqlite::DETERMINISTIC,
-            Some(ext_data as *mut c_void),
-            Some(x_crsql_cache_site_ordinal),
-            None,
-            None,
-            None,
-        )
-        .unwrap_or(ResultCode::ERROR);
-    if rc != ResultCode::OK {
+    if let Err(_) = db.create_function_v2(
+        "crsql_cache_site_ordinal",
+        1,
+        sqlite::UTF8 | sqlite::DETERMINISTIC,
+        Some(ext_data as *mut c_void),
+        Some(x_crsql_cache_site_ordinal),
+        None,
+        None,
+        None,
+    ) {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    if let Err(_) = db.create_function_v2(
+        "crsql_cache_pk_cl",
+        2,
+        sqlite::UTF8 | sqlite::DETERMINISTIC,
+        Some(ext_data as *mut c_void),
+        Some(x_crsql_cache_pk_cl),
+        None,
+        None,
+        None,
+    ) {
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -973,6 +985,39 @@ unsafe extern "C" fn x_crsql_cache_site_ordinal(
     ));
     let res = ord_map.get(site_id).cloned().unwrap_or(-1);
     sqlite::result_int64(ctx, res);
+}
+
+/**
+ * Get the pk cl cached in the ext data for the current transaction.
+ * only used for test to inspect the cl cache.
+ */
+unsafe extern "C" fn x_crsql_cache_pk_cl(
+    ctx: *mut sqlite::context,
+    argc: i32,
+    argv: *mut *mut sqlite::value,
+) {
+    if argc < 2 {
+        ctx.result_error(
+            "Wrong number of args provided to crsql_cache_pk_cl. Provide the table name and pk key.",
+        );
+        return;
+    }
+
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    let args = sqlite::args!(argc, argv);
+    let table_name = args[0].text();
+    let pk_key = args[1].int64();
+
+    let cl_cache = mem::ManuallyDrop::new(Box::from_raw(
+        (*ext_data).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
+    ));
+
+    let table_map = cl_cache.get(table_name);
+    let cl = table_map
+        .and_then(|x| x.get(&pk_key))
+        .cloned()
+        .unwrap_or(-1);
+    sqlite::result_int64(ctx, cl);
 }
 
 /**

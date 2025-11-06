@@ -1,6 +1,9 @@
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::string::ToString;
 use core::ffi::c_int;
+use core::mem;
 use sqlite::sqlite3;
 use sqlite::value;
 use sqlite::Context;
@@ -53,7 +56,17 @@ fn after_insert(
     } else if create_record_existed {
         // update the create record since it already exists.
         let seq = bump_seq(ext_data);
-        update_create_record(db, tbl_info, key_new, db_version, seq, &ts)?;
+        let col_version = update_create_record(db, tbl_info, key_new, db_version, seq, &ts)?;
+
+        let mut cl_cache = unsafe {
+            mem::ManuallyDrop::new(Box::from_raw(
+                (*ext_data).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
+            ))
+        };
+        cl_cache
+            .entry(tbl_info.tbl_name.clone())
+            .or_default()
+            .insert(key_new, col_version);
     }
 
     super::mark_locally_inserted(db, ext_data, tbl_info, key_new, db_version, &ts)?;
@@ -68,7 +81,7 @@ fn update_create_record(
     db_version: sqlite::int64,
     seq: i32,
     ts: &str,
-) -> Result<ResultCode, String> {
+) -> Result<i64, String> {
     let update_create_record_stmt_ref = tbl_info
         .get_maybe_mark_locally_reinserted_stmt(db)
         .map_err(|_e| "failed to get update_create_record_stmt")?;
@@ -90,5 +103,18 @@ fn update_create_record(
         })
         .map_err(|_e| "failed binding to update_create_record_stmt")?;
 
-    super::step_trigger_stmt(update_create_record_stmt)
+    let res = update_create_record_stmt.step();
+    match res {
+        Ok(ResultCode::ROW) => {
+            let col_version = update_create_record_stmt.column_int64(0);
+            super::reset_cached_stmt(update_create_record_stmt.stmt)
+                .map_err(|_e| "failed to reset cached stmt")?;
+            Ok(col_version)
+        }
+        _ => {
+            super::reset_cached_stmt(update_create_record_stmt.stmt)
+                .map_err(|_e| "failed to reset cached stmt")?;
+            Err("failed to step update_create_record_stmt".to_string())
+        }
+    }
 }

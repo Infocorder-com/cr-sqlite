@@ -93,6 +93,7 @@ version = "0.1.0"
 dependencies = [
  "crsql_core",
  "crsql_fractindex_core",
+ "libc-print",
  "sqlite_nostd",
 ]
 

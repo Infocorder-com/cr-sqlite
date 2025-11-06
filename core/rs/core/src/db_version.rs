@@ -211,6 +211,21 @@ pub extern "C" fn crsql_drop_ordinal_map(ext_data: *mut crsql_ExtData) {
     }
 }
 
+#[no_mangle]
+pub extern "C" fn crsql_init_cl_cache(ext_data: *mut crsql_ExtData) {
+    let map: BTreeMap<String, BTreeMap<i64, i64>> = BTreeMap::new();
+    unsafe { (*ext_data).clCache = Box::into_raw(Box::new(map)) as *mut c_void }
+}
+
+#[no_mangle]
+pub extern "C" fn crsql_drop_cl_cache(ext_data: *mut crsql_ExtData) {
+    unsafe {
+        drop(Box::from_raw(
+            (*ext_data).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
+        ));
+    }
+}
+
 pub fn insert_db_version(
     ext_data: *mut crsql_ExtData,
     insert_site_id: &[u8],

@@ -366,7 +366,9 @@ fn test_site_id_initialization() {
         let raw_db = db.db.db;
         let site_id = select_site_id(raw_db).expect("selected site id");
         assert_eq!(site_id.len(), 16);
-        raw_db.exec_safe("DELETE FROM crsql_site_id;").expect("deleted site id");
+        raw_db
+            .exec_safe("DELETE FROM crsql_site_id;")
+            .expect("deleted site id");
     }
 
     {
@@ -374,7 +376,9 @@ fn test_site_id_initialization() {
         let raw_db = db.db.db;
         let site_id = select_site_id(raw_db).expect("selected site id");
         assert_eq!(site_id.len(), 16);
-        raw_db.exec_safe("DROP TABLE crsql_site_id;").expect("dropped crsql_site_id");
+        raw_db
+            .exec_safe("DROP TABLE crsql_site_id;")
+            .expect("dropped crsql_site_id");
     }
 
     {

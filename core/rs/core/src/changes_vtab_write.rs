@@ -1,6 +1,8 @@
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int};
 use core::mem;
@@ -466,6 +468,11 @@ unsafe fn merge_insert(
     let tbl_infos = mem::ManuallyDrop::new(Box::from_raw(
         (*(*tab).pExtData).tableInfos as *mut Vec<TableInfo>,
     ));
+
+    let mut cl_cache = mem::ManuallyDrop::new(Box::from_raw(
+        (*(*tab).pExtData).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
+    ));
+
     // TODO: will this work given `insert_tbl` is null termed?
     let tbl_info_index = tbl_infos.iter().position(|x| x.tbl_name == insert_tbl);
 
@@ -487,7 +494,7 @@ unsafe fn merge_insert(
     // We'll need the key for all later operations.
     let key = tbl_info.get_or_create_key(db, &unpacked_pks)?;
 
-    let local_cl = get_local_cl(db, &tbl_info, key)?;
+    let local_cl = get_pk_cl(db, &mut cl_cache, &tbl_info, key)?;
 
     // We can ignore all updates from older causal lengths.
     // They won't win at anything.
@@ -593,8 +600,6 @@ unsafe fn merge_insert(
                 *rowid = slab_rowid(tbl_info_index as i32, inner_rowid);
             }
             return Ok(ResultCode::OK);
-            
-            
         }
 
         // we got a causal length which would resurrect the row.
@@ -712,7 +717,40 @@ unsafe fn merge_insert(
             *errmsg = err.into_raw();
             return Err(rc);
         }
+
+        // a bigger cl always wins
+        if insert_cl > local_cl {
+            match cl_cache.get_mut(&tbl_info.tbl_name) {
+                Some(x) => {
+                    x.insert(key, insert_cl);
+                }
+                None => {
+                    let mut new_map = BTreeMap::new();
+                    new_map.insert(key, insert_cl);
+                    cl_cache.insert(tbl_info.tbl_name.clone(), new_map);
+                }
+            }
+        }
     }
 
     res
+}
+
+unsafe fn get_pk_cl(
+    db: *mut sqlite3,
+    cl_cache: &mut BTreeMap<String, BTreeMap<i64, i64>>,
+    tbl_info: &TableInfo,
+    key: sqlite::int64,
+) -> Result<sqlite::int64, ResultCode> {
+    match cl_cache.get(&tbl_info.tbl_name).and_then(|x| x.get(&key)) {
+        Some(cl) => Ok(*cl),
+        None => {
+            let cl = get_local_cl(db, tbl_info, key)?;
+            cl_cache
+                .entry(tbl_info.tbl_name.clone())
+                .or_default()
+                .insert(key, cl);
+            Ok(cl)
+        }
+    }
 }

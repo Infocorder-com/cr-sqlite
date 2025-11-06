@@ -1,8 +1,10 @@
 use core::ffi::c_int;
+use core::mem;
 
 use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
+use alloc::{boxed::Box, collections::BTreeMap};
 use sqlite::{sqlite3, value, Context, ResultCode};
 use sqlite_nostd as sqlite;
 
@@ -81,39 +83,37 @@ fn after_update(
     let mut changed = false;
     // Changing a primary key column to a new value is the same thing as deleting the row
     // previously identified by the primary key.
-    if crate::compare_values::any_value_changed(pks_new, pks_old)? {
-        let old_key = tbl_info
-            .get_or_create_key_via_raw_values(db, pks_old)
-            .map_err(|_| "failed geteting or creating lookaside key")?;
-        let next_seq = super::bump_seq(ext_data);
-        changed = true;
-        // Record the delete of the row identified by the old primary keys
-        after_update__mark_old_pk_row_deleted(
-            db,
-            tbl_info,
-            old_key,
-            next_db_version,
-            next_seq,
-            &ts,
-        )?;
-        let next_seq = super::bump_seq(ext_data);
-        // todo: we don't need to this, if there's no existing row (cl is assumed to be 1).
-        super::mark_new_pk_row_created(db, tbl_info, new_key, next_db_version, next_seq, &ts)?;
-        for col in tbl_info.non_pks.iter() {
+    let cl_info = {
+        if crate::compare_values::any_value_changed(pks_new, pks_old)? {
+            let old_key = tbl_info
+                .get_or_create_key_via_raw_values(db, pks_old)
+                .map_err(|_| "failed geteting or creating lookaside key")?;
             let next_seq = super::bump_seq(ext_data);
-            after_update__move_non_pk_col(
-                db,
-                tbl_info,
-                new_key,
-                old_key,
-                &col.name,
-                next_db_version,
-                &ts,
-                next_seq,
-            )?;
+            changed = true;
+            // Record the delete of the row identified by the old primary keys
+            let cl =
+                super::mark_locally_deleted(db, tbl_info, old_key, next_db_version, next_seq, &ts)?;
+            let next_seq = super::bump_seq(ext_data);
+            // todo: we don't need to this, if there's no existing row (cl is assumed to be 1).
+            super::mark_new_pk_row_created(db, tbl_info, new_key, next_db_version, next_seq, &ts)?;
+            for col in tbl_info.non_pks.iter() {
+                let next_seq = super::bump_seq(ext_data);
+                after_update__move_non_pk_col(
+                    db,
+                    tbl_info,
+                    new_key,
+                    old_key,
+                    &col.name,
+                    next_db_version,
+                    &ts,
+                    next_seq,
+                )?;
+            }
+            Some((old_key, cl))
+        } else {
+            None
         }
-    }
-
+    };
     // now for each non_pk_col we need to do an insert
     // where new value is not old value
     for ((new, old), col_info) in non_pks_new
@@ -144,32 +144,19 @@ fn after_update(
         crate::db_version::next_db_version(db, ext_data)?;
     }
 
-    Ok(ResultCode::OK)
-}
+    if let Some((old_key, cl)) = cl_info {
+        let mut cl_cache = unsafe {
+            mem::ManuallyDrop::new(Box::from_raw(
+                (*ext_data).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
+            ))
+        };
+        cl_cache
+            .entry(tbl_info.tbl_name.clone())
+            .or_default()
+            .insert(old_key, cl);
+    }
 
-#[allow(non_snake_case)]
-fn after_update__mark_old_pk_row_deleted(
-    db: *mut sqlite3,
-    tbl_info: &TableInfo,
-    old_key: sqlite::int64,
-    db_version: sqlite::int64,
-    seq: i32,
-    ts: &str,
-) -> Result<ResultCode, String> {
-    let mark_locally_deleted_stmt_ref = tbl_info
-        .get_mark_locally_deleted_stmt(db)
-        .or_else(|_e| Err("failed to get mark_locally_deleted_stmt"))?;
-    let mark_locally_deleted_stmt = mark_locally_deleted_stmt_ref
-        .as_ref()
-        .ok_or("Failed to deref sentinel stmt")?;
-    mark_locally_deleted_stmt
-        .bind_int64(1, old_key)
-        .and_then(|_| mark_locally_deleted_stmt.bind_int64(2, db_version))
-        .and_then(|_| mark_locally_deleted_stmt.bind_int(3, seq))
-        .and_then(|_| mark_locally_deleted_stmt.bind_text(4, ts, sqlite::Destructor::STATIC))
-        // .and_then(|_| mark_locally_deleted_stmt.bind_int64(4, db_version))
-        .or_else(|_| Err("failed binding to mark_locally_deleted_stmt"))?;
-    super::step_trigger_stmt(mark_locally_deleted_stmt)
+    Ok(ResultCode::OK)
 }
 
 #[allow(non_snake_case)]

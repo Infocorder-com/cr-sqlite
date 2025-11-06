@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use core::{
     ffi::{c_int, c_void},
     mem,
@@ -37,5 +37,17 @@ pub unsafe fn commit_or_rollback_reset(ext_data: *mut crsql_ExtData) {
     let mut ordinals: mem::ManuallyDrop<Box<BTreeMap<Vec<u8>, i64>>> = mem::ManuallyDrop::new(
         Box::from_raw((*ext_data).ordinalMap as *mut BTreeMap<Vec<u8>, i64>),
     );
+
+    let mut cl_cache = unsafe {
+        mem::ManuallyDrop::new(Box::from_raw(
+            (*ext_data).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
+        ))
+    };
+
+    for (_, map) in cl_cache.iter_mut() {
+        if !map.is_empty() {
+            map.clear();
+        }
+    }
     ordinals.clear();
 }

@@ -458,7 +458,8 @@ impl TableInfo {
             db_version = excluded.db_version,
             seq = excluded.seq,
             site_id = 0,
-            ts = excluded.ts",
+            ts = excluded.ts
+          RETURNING col_version",
                 table_name = crate::util::escape_ident(&self.tbl_name),
                 sentinel = crate::c::DELETE_SENTINEL,
             );
@@ -644,7 +645,8 @@ impl TableInfo {
                 seq = ?,
                 site_id = 0,
                 ts = ?
-              WHERE key = ? AND col_name = ?",
+              WHERE key = ? AND col_name = ?
+              RETURNING col_version",
               table_name = crate::util::escape_ident(&self.tbl_name),
             );
             let ret = db.prepare_v3(&sql, sqlite::PREPARE_PERSISTENT)?;
@@ -862,7 +864,8 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
         return ResultCode::ERROR as c_int;
     }
 
-    let mut table_infos = unsafe { Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>) };
+    let mut table_infos: Box<Vec<TableInfo>> =
+        unsafe { Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>) };
 
     if schema_changed > 0 || table_infos.len() == 0 {
         match pull_all_table_infos(db, ext_data, err) {

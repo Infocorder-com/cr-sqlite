@@ -1,6 +1,8 @@
 use alloc::string::String;
 use alloc::string::ToString;
+use alloc::{boxed::Box, collections::BTreeMap};
 use core::ffi::c_int;
+use core::mem;
 use sqlite::sqlite3;
 use sqlite::value;
 use sqlite::Context;
@@ -10,6 +12,7 @@ use sqlite_nostd as sqlite;
 use crate::{c::crsql_ExtData, tableinfo::TableInfo};
 
 use super::bump_seq;
+use super::mark_locally_deleted;
 use super::trigger_fn_preamble;
 
 /**
@@ -47,19 +50,7 @@ fn after_delete(
         .get_or_create_key_via_raw_values(db, pks_old)
         .map_err(|_| "failed getting or creating lookaside key")?;
 
-    let mark_locally_deleted_stmt_ref = tbl_info
-        .get_mark_locally_deleted_stmt(db)
-        .map_err(|_e| "failed to get mark_locally_deleted_stmt")?;
-    let mark_locally_deleted_stmt = mark_locally_deleted_stmt_ref
-        .as_ref()
-        .ok_or("Failed to deref sentinel stmt")?;
-    mark_locally_deleted_stmt
-        .bind_int64(1, key)
-        .and_then(|_| mark_locally_deleted_stmt.bind_int64(2, db_version))
-        .and_then(|_| mark_locally_deleted_stmt.bind_int(3, seq))
-        .and_then(|_| mark_locally_deleted_stmt.bind_text(4, &ts, sqlite::Destructor::STATIC))
-        .map_err(|_| "failed binding to mark locally deleted stmt")?;
-    super::step_trigger_stmt(mark_locally_deleted_stmt)?;
+    let cl = mark_locally_deleted(db, tbl_info, key, db_version, seq, &ts)?;
 
     // now actually delete the row metadata
     let drop_clocks_stmt_ref = tbl_info
@@ -72,5 +63,17 @@ fn after_delete(
     drop_clocks_stmt
         .bind_int64(1, key)
         .map_err(|_e| "failed to bind pks to drop_clocks_stmt")?;
-    super::step_trigger_stmt(drop_clocks_stmt)
+    super::step_trigger_stmt(drop_clocks_stmt)?;
+
+    let mut cl_cache = unsafe {
+        mem::ManuallyDrop::new(Box::from_raw(
+            (*ext_data).clCache as *mut BTreeMap<String, BTreeMap<i64, i64>>,
+        ))
+    };
+    cl_cache
+        .entry(tbl_info.tbl_name.clone())
+        .or_default()
+        .insert(key, cl);
+
+    Ok(ResultCode::OK)
 }

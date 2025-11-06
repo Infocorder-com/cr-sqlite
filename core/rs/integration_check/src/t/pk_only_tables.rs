@@ -149,7 +149,8 @@ fn modify_pkonly_row() -> Result<(), ResultCode> {
         .db
         .prepare_v2("UPDATE foo SET id = 2 WHERE id = 1;")
         .expect("prepare set to foo");
-    stmt.step().expect("step update to foo");
+    let result = stmt.step();
+    assert_eq!(result, Ok(ResultCode::DONE), "failed to update foo");
 
     sync_left_to_right(&db_a.db, &db_b.db, -1);
 
