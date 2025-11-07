@@ -84,7 +84,7 @@ fn mark_new_pk_row_created(
     db_version: i64,
     seq: i32,
     ts: &str,
-) -> Result<ResultCode, String> {
+) -> Result<i64, String> {
     let mark_locally_created_stmt_ref = tbl_info
         .get_mark_locally_created_stmt(db)
         .map_err(|_e| "failed to get mark_locally_created_stmt")?;
@@ -98,7 +98,17 @@ fn mark_new_pk_row_created(
         .and_then(|_| mark_locally_created_stmt.bind_int(3, seq))
         .and_then(|_| mark_locally_created_stmt.bind_text(4, ts, sqlite::Destructor::STATIC))
         .map_err(|_| "failed binding to mark_locally_created_stmt")?;
-    step_trigger_stmt(mark_locally_created_stmt)
+    let stmt_res = mark_locally_created_stmt.step();
+    let result = match stmt_res {
+        Ok(ResultCode::ROW) => {
+            let cl = mark_locally_created_stmt.column_int64(0);
+            Ok(cl)
+        }
+        _ => Err("failed to step mark locally created stmt".to_string()),
+    };
+    reset_cached_stmt(mark_locally_created_stmt.stmt)
+        .map_err(|_e| "failed to reset cached stmt")?;
+    result
 }
 
 fn bump_seq(ext_data: *mut crsql_ExtData) -> c_int {
@@ -291,19 +301,18 @@ fn mark_locally_deleted(
         .and_then(|_| mark_locally_deleted_stmt.bind_text(4, &ts, sqlite::Destructor::STATIC))
         .map_err(|_| "failed binding to mark locally deleted stmt")?;
 
-    let res = mark_locally_deleted_stmt.step();
+    let stmt_res = mark_locally_deleted_stmt.step();
 
-    match res {
+    let result = match stmt_res {
         Ok(ResultCode::ROW) => {
             let cl = mark_locally_deleted_stmt.column_int64(0);
-            reset_cached_stmt(mark_locally_deleted_stmt.stmt)
-                .map_err(|_e| "failed to reset cached stmt")?;
             Ok(cl)
         }
-        _ => {
-            reset_cached_stmt(mark_locally_deleted_stmt.stmt)
-                .map_err(|_e| "failed to reset cached stmt")?;
-            Err("failed to step mark locally deleted stmt".to_string())
-        }
-    }
+        _ => Err("failed to step mark locally deleted stmt".to_string()),
+    };
+
+    reset_cached_stmt(mark_locally_deleted_stmt.stmt)
+        .map_err(|_e| "failed to reset cached stmt")?;
+
+    result
 }

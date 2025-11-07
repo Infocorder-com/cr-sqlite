@@ -85,7 +85,7 @@ fn after_update(
         if crate::compare_values::any_value_changed(pks_new, pks_old)? {
             let old_key = tbl_info
                 .get_or_create_key_via_raw_values(db, pks_old)
-                .map_err(|_| "failed geteting or creating lookaside key")?;
+                .map_err(|_| "failed getting or creating lookaside key")?;
             let next_seq = super::bump_seq(ext_data);
             changed = true;
             // Record the delete of the row identified by the old primary keys

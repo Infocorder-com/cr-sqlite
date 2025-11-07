@@ -28,6 +28,7 @@ use sqlite_nostd::ResultCode;
 use sqlite_nostd::Stmt;
 use sqlite_nostd::StrRef;
 
+// TODO: make this configurable with a crsql_config_set.
 const MAX_CL_CACHE_SIZE: usize = 1500;
 pub struct TableInfo {
     pub tbl_name: String,
@@ -561,7 +562,8 @@ impl TableInfo {
                   db_version = excluded.db_version,
                   seq = excluded.seq,
                   site_id = 0,
-                  ts = excluded.ts",
+                  ts = excluded.ts
+                  RETURNING col_version",
               table_name = crate::util::escape_ident(&self.tbl_name),
               sentinel = crate::c::INSERT_SENTINEL,
             );
