@@ -2,7 +2,7 @@ use alloc::format;
 
 use sqlite::{Connection, Context};
 use sqlite_nostd as sqlite;
-use sqlite_nostd::{ResultCode, Value};
+use sqlite_nostd::{ManagedStmt, ResultCode, Value};
 
 use crate::c::crsql_ExtData;
 
@@ -33,7 +33,7 @@ pub extern "C" fn crsql_config_set(
 
     let db = ctx.db_handle();
     match insert_config_setting(db, name, value) {
-        Ok(value) => {
+        Ok((_stmt, value)) => {
             ctx.result_value(value);
         }
         Err(rc) => {
@@ -48,7 +48,7 @@ fn insert_config_setting(
     db: *mut sqlite_nostd::sqlite3,
     name: &str,
     value: *mut sqlite::value,
-) -> Result<*mut sqlite::value, ResultCode> {
+) -> Result<(ManagedStmt, *mut sqlite::value), ResultCode> {
     let stmt =
         db.prepare_v2("INSERT OR REPLACE INTO crsql_master VALUES (?, ?) RETURNING value")?;
 
@@ -56,7 +56,10 @@ fn insert_config_setting(
     stmt.bind_value(2, value)?;
 
     if let ResultCode::ROW = stmt.step()? {
-        stmt.column_value(0)
+        let res = stmt.column_value(0)?;
+        // Res will get invalidated when stmt gets dropped
+        // The lifetime of res is not currently checked by the compiler
+        Ok((stmt, res))
     } else {
         Err(ResultCode::ERROR)
     }
