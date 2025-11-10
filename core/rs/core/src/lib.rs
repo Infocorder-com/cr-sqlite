@@ -73,6 +73,8 @@ use local_writes::after_update::x_crsql_after_update;
 use sqlite::{Destructor, ResultCode};
 use sqlite_nostd as sqlite;
 use sqlite_nostd::{Connection, Context, Value};
+#[cfg(feature = "test")]
+use tableinfo::TableInfo;
 use tableinfo::{crsql_ensure_table_infos_are_up_to_date, is_table_compatible, pull_table_info};
 use teardown::*;
 use triggers::create_triggers;
@@ -453,19 +455,31 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     }
 
     #[cfg(feature = "test")]
-    let rc = db
-        .create_function_v2(
-            "crsql_cache_site_ordinal",
-            1,
-            sqlite::UTF8 | sqlite::DETERMINISTIC,
-            Some(ext_data as *mut c_void),
-            Some(x_crsql_cache_site_ordinal),
-            None,
-            None,
-            None,
-        )
-        .unwrap_or(ResultCode::ERROR);
-    if rc != ResultCode::OK {
+    if let Err(_) = db.create_function_v2(
+        "crsql_cache_site_ordinal",
+        1,
+        sqlite::UTF8 | sqlite::DETERMINISTIC,
+        Some(ext_data as *mut c_void),
+        Some(x_crsql_cache_site_ordinal),
+        None,
+        None,
+        None,
+    ) {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    #[cfg(feature = "test")]
+    if let Err(_) = db.create_function_v2(
+        "crsql_cache_pk_cl",
+        2,
+        sqlite::UTF8 | sqlite::DETERMINISTIC,
+        Some(ext_data as *mut c_void),
+        Some(x_crsql_cache_pk_cl),
+        None,
+        None,
+        None,
+    ) {
         unsafe { crsql_freeExtData(ext_data) };
         return null_mut();
     }
@@ -973,6 +987,40 @@ unsafe extern "C" fn x_crsql_cache_site_ordinal(
     ));
     let res = ord_map.get(site_id).cloned().unwrap_or(-1);
     sqlite::result_int64(ctx, res);
+}
+
+/**
+ * Get the pk cl cached in the ext data for the current transaction.
+ * only used for test to inspect the cl cache.
+ */
+#[cfg(feature = "test")]
+unsafe extern "C" fn x_crsql_cache_pk_cl(
+    ctx: *mut sqlite::context,
+    argc: i32,
+    argv: *mut *mut sqlite::value,
+) {
+    if argc < 2 {
+        ctx.result_error(
+            "Wrong number of args provided to crsql_cache_pk_cl. Provide the table name and pk key.",
+        );
+        return;
+    }
+
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    let args = sqlite::args!(argc, argv);
+    let table_name = args[0].text();
+    let pk_key = args[1].int64();
+
+    let table_infos =
+        mem::ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>));
+    let table_info = table_infos.iter().find(|t| t.tbl_name == table_name);
+
+    if let Some(table_info) = table_info {
+        let cl = table_info.get_cl(pk_key).cloned().unwrap_or(-1);
+        sqlite::result_int64(ctx, cl);
+    } else {
+        ctx.result_error("table not found");
+    }
 }
 
 /**

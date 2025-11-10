@@ -7,6 +7,7 @@ use crate::pack_columns::ColumnValue;
 use crate::stmt_cache::reset_cached_stmt;
 use crate::util::Countable;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -27,6 +28,8 @@ use sqlite_nostd::ResultCode;
 use sqlite_nostd::Stmt;
 use sqlite_nostd::StrRef;
 
+// TODO: make this configurable with a crsql_config_set.
+const MAX_CL_CACHE_SIZE: usize = 1500;
 pub struct TableInfo {
     pub tbl_name: String,
     pub pks: Vec<ColumnInfo>,
@@ -66,9 +69,28 @@ pub struct TableInfo {
     move_non_sentinels_stmt: RefCell<Option<ManagedStmt>>,
     mark_locally_created_stmt: RefCell<Option<ManagedStmt>>,
     maybe_mark_locally_reinserted_stmt: RefCell<Option<ManagedStmt>>,
+    cl_cache: BTreeMap<i64, i64>,
 }
 
 impl TableInfo {
+    pub fn get_cl(&self, key: i64) -> Option<&i64> {
+        self.cl_cache.get(&key)
+    }
+
+    pub fn set_cl(&mut self, key: i64, cl: i64) {
+        // clear the cache if we are over limit
+        if self.cl_cache.len() >= MAX_CL_CACHE_SIZE {
+            self.cl_cache.clear();
+        }
+        self.cl_cache.insert(key, cl);
+    }
+
+    pub fn clear_cl_cache(&mut self) {
+        if !self.cl_cache.is_empty() {
+            self.cl_cache.clear();
+        }
+    }
+
     fn find_non_pk_col(&self, col_name: &str) -> Result<&ColumnInfo, ResultCode> {
         for col in &self.non_pks {
             if col.name == col_name {
@@ -458,7 +480,8 @@ impl TableInfo {
             db_version = excluded.db_version,
             seq = excluded.seq,
             site_id = 0,
-            ts = excluded.ts",
+            ts = excluded.ts
+          RETURNING col_version",
                 table_name = crate::util::escape_ident(&self.tbl_name),
                 sentinel = crate::c::DELETE_SENTINEL,
             );
@@ -539,7 +562,8 @@ impl TableInfo {
                   db_version = excluded.db_version,
                   seq = excluded.seq,
                   site_id = 0,
-                  ts = excluded.ts",
+                  ts = excluded.ts
+                  RETURNING col_version",
               table_name = crate::util::escape_ident(&self.tbl_name),
               sentinel = crate::c::INSERT_SENTINEL,
             );
@@ -644,7 +668,8 @@ impl TableInfo {
                 seq = ?,
                 site_id = 0,
                 ts = ?
-              WHERE key = ? AND col_name = ?",
+              WHERE key = ? AND col_name = ?
+              RETURNING col_version",
               table_name = crate::util::escape_ident(&self.tbl_name),
             );
             let ret = db.prepare_v3(&sql, sqlite::PREPARE_PERSISTENT)?;
@@ -862,7 +887,8 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
         return ResultCode::ERROR as c_int;
     }
 
-    let mut table_infos = unsafe { Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>) };
+    let mut table_infos: Box<Vec<TableInfo>> =
+        unsafe { Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>) };
 
     if schema_changed > 0 || table_infos.len() == 0 {
         match pull_all_table_infos(db, ext_data, err) {
@@ -1006,6 +1032,7 @@ pub fn pull_table_info(
         select_clock_stmt: RefCell::new(None),
         insert_clock_stmt: RefCell::new(None),
         update_clock_stmt: RefCell::new(None),
+        cl_cache: BTreeMap::new(),
     })
 }
 

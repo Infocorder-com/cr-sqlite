@@ -10,6 +10,7 @@ use sqlite_nostd as sqlite;
 use crate::{c::crsql_ExtData, tableinfo::TableInfo};
 
 use super::bump_seq;
+use super::mark_locally_deleted;
 use super::trigger_fn_preamble;
 
 /**
@@ -37,7 +38,7 @@ pub unsafe extern "C" fn x_crsql_after_delete(
 fn after_delete(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
-    tbl_info: &TableInfo,
+    tbl_info: &mut TableInfo,
     pks_old: &[*mut value],
 ) -> Result<ResultCode, String> {
     let ts = unsafe { (*ext_data).timestamp.to_string() };
@@ -47,30 +48,24 @@ fn after_delete(
         .get_or_create_key_via_raw_values(db, pks_old)
         .map_err(|_| "failed getting or creating lookaside key")?;
 
-    let mark_locally_deleted_stmt_ref = tbl_info
-        .get_mark_locally_deleted_stmt(db)
-        .map_err(|_e| "failed to get mark_locally_deleted_stmt")?;
-    let mark_locally_deleted_stmt = mark_locally_deleted_stmt_ref
-        .as_ref()
-        .ok_or("Failed to deref sentinel stmt")?;
-    mark_locally_deleted_stmt
-        .bind_int64(1, key)
-        .and_then(|_| mark_locally_deleted_stmt.bind_int64(2, db_version))
-        .and_then(|_| mark_locally_deleted_stmt.bind_int(3, seq))
-        .and_then(|_| mark_locally_deleted_stmt.bind_text(4, &ts, sqlite::Destructor::STATIC))
-        .map_err(|_| "failed binding to mark locally deleted stmt")?;
-    super::step_trigger_stmt(mark_locally_deleted_stmt)?;
+    let cl = mark_locally_deleted(db, tbl_info, key, db_version, seq, &ts)?;
 
-    // now actually delete the row metadata
-    let drop_clocks_stmt_ref = tbl_info
-        .get_merge_delete_drop_clocks_stmt(db)
-        .map_err(|_e| "failed to get mark_locally_deleted_stmt")?;
-    let drop_clocks_stmt = drop_clocks_stmt_ref
-        .as_ref()
-        .ok_or("Failed to deref sentinel stmt")?;
+    {
+        // now actually delete the row metadata
+        let drop_clocks_stmt_ref = tbl_info
+            .get_merge_delete_drop_clocks_stmt(db)
+            .map_err(|_e| "failed to get mark_locally_deleted_stmt")?;
+        let drop_clocks_stmt = drop_clocks_stmt_ref
+            .as_ref()
+            .ok_or("Failed to deref sentinel stmt")?;
 
-    drop_clocks_stmt
-        .bind_int64(1, key)
-        .map_err(|_e| "failed to bind pks to drop_clocks_stmt")?;
-    super::step_trigger_stmt(drop_clocks_stmt)
+        drop_clocks_stmt
+            .bind_int64(1, key)
+            .map_err(|_e| "failed to bind pks to drop_clocks_stmt")?;
+        super::step_trigger_stmt(drop_clocks_stmt)?;
+    }
+
+    tbl_info.set_cl(key, cl);
+
+    Ok(ResultCode::OK)
 }

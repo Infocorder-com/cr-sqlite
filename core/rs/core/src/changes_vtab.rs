@@ -586,6 +586,16 @@ pub extern "C" fn crsql_changes_rollback_to(vtab: *mut sqlite::vtab, _: c_int) -
             (*(*tab).pExtData).ordinalMap as *mut BTreeMap<Vec<u8>, i64>,
         ))
     };
+
+    let mut table_infos = unsafe {
+        mem::ManuallyDrop::new(Box::from_raw(
+            (*(*tab).pExtData).tableInfos as *mut Vec<TableInfo>,
+        ))
+    };
+    for tbl_info in table_infos.iter_mut() {
+        tbl_info.clear_cl_cache();
+    }
+
     ordinals.clear();
     ResultCode::OK as c_int
 }

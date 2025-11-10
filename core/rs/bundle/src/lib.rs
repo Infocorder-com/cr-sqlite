@@ -11,6 +11,8 @@ use crsql_core::sqlite3_crsqlcore_init;
 #[cfg(feature = "test")]
 pub use crsql_core::test_exports;
 use crsql_fractindex_core::sqlite3_crsqlfractionalindex_init;
+#[cfg(feature = "test")]
+use libc_print::std_name::println;
 use sqlite_nostd as sqlite;
 use sqlite_nostd::SQLite3Allocator;
 
@@ -21,9 +23,18 @@ static ALLOCATOR: SQLite3Allocator = SQLite3Allocator {};
 
 // This must be our panic handler for WASM builds. For simplicity, we make it our panic handler for
 // all builds. Abort is also more portable than unwind, enabling us to go to more embedded use cases.
+#[cfg(not(feature = "test"))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     core::intrinsics::abort()
+}
+
+// Print panic info for tests
+#[cfg(feature = "test")]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    println!("PANIC!: {}", info);
+    core::intrinsics::abort();
 }
 
 #[cfg(not(target_family = "wasm"))]

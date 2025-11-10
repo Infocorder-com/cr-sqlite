@@ -8,6 +8,7 @@ use core::{
 use sqlite_nostd::ResultCode;
 
 use crate::c::crsql_ExtData;
+use crate::tableinfo::TableInfo;
 
 #[no_mangle]
 pub unsafe extern "C" fn crsql_commit_hook(user_data: *mut c_void) -> c_int {
@@ -37,5 +38,13 @@ pub unsafe fn commit_or_rollback_reset(ext_data: *mut crsql_ExtData) {
     let mut ordinals: mem::ManuallyDrop<Box<BTreeMap<Vec<u8>, i64>>> = mem::ManuallyDrop::new(
         Box::from_raw((*ext_data).ordinalMap as *mut BTreeMap<Vec<u8>, i64>),
     );
+
+    let mut table_infos = unsafe {
+        mem::ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>))
+    };
     ordinals.clear();
+
+    for tbl_info in table_infos.iter_mut() {
+        tbl_info.clear_cl_cache();
+    }
 }

@@ -37,7 +37,7 @@ pub unsafe extern "C" fn x_crsql_after_insert(
 fn after_insert(
     db: *mut sqlite3,
     ext_data: *mut crsql_ExtData,
-    tbl_info: &TableInfo,
+    tbl_info: &mut TableInfo,
     pks_new: &[*mut value],
 ) -> Result<ResultCode, String> {
     let ts = unsafe { (*ext_data).timestamp.to_string() };
@@ -46,17 +46,27 @@ fn after_insert(
     let (create_record_existed, key_new) = tbl_info
         .get_or_create_key_for_insert(db, pks_new)
         .map_err(|_| "failed getting or creating lookaside key")?;
-    if tbl_info.non_pks.is_empty() {
+
+    let cl = if tbl_info.non_pks.is_empty() {
         let seq = bump_seq(ext_data);
         // just a sentinel record
-        return super::mark_new_pk_row_created(db, tbl_info, key_new, db_version, seq, &ts);
-    } else if create_record_existed {
-        // update the create record since it already exists.
-        let seq = bump_seq(ext_data);
-        update_create_record(db, tbl_info, key_new, db_version, seq, &ts)?;
-    }
+        let cl = super::mark_new_pk_row_created(db, tbl_info, key_new, db_version, seq, &ts)?;
+        Some(cl)
+    } else {
+        let cl = if create_record_existed {
+            // update the create record since it already exists.
+            let seq = bump_seq(ext_data);
+            update_create_record(db, tbl_info, key_new, db_version, seq, &ts)?
+        } else {
+            None
+        };
+        super::mark_locally_inserted(db, ext_data, tbl_info, key_new, db_version, &ts)?;
+        cl
+    };
 
-    super::mark_locally_inserted(db, ext_data, tbl_info, key_new, db_version, &ts)?;
+    if let Some(cl) = cl {
+        tbl_info.set_cl(key_new, cl);
+    }
 
     Ok(ResultCode::OK)
 }
@@ -68,7 +78,7 @@ fn update_create_record(
     db_version: sqlite::int64,
     seq: i32,
     ts: &str,
-) -> Result<ResultCode, String> {
+) -> Result<Option<i64>, String> {
     let update_create_record_stmt_ref = tbl_info
         .get_maybe_mark_locally_reinserted_stmt(db)
         .map_err(|_e| "failed to get update_create_record_stmt")?;
@@ -90,5 +100,16 @@ fn update_create_record(
         })
         .map_err(|_e| "failed binding to update_create_record_stmt")?;
 
-    super::step_trigger_stmt(update_create_record_stmt)
+    let res = update_create_record_stmt.step();
+    let result = match res {
+        Ok(ResultCode::ROW) => {
+            let col_version = update_create_record_stmt.column_int64(0);
+            Ok(Some(col_version))
+        }
+        Ok(ResultCode::DONE) => Ok(None),
+        _ => Err("failed to step update_create_record_stmt".to_string()),
+    };
+    super::reset_cached_stmt(update_create_record_stmt.stmt)
+        .map_err(|_e| "failed to reset cached stmt")?;
+    result
 }
