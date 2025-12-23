@@ -42,8 +42,14 @@ pub unsafe fn commit_or_rollback_reset(ext_data: *mut crsql_ExtData) {
     let mut table_infos = unsafe {
         mem::ManuallyDrop::new(Box::from_raw((*ext_data).tableInfos as *mut Vec<TableInfo>))
     };
-    ordinals.clear();
 
+    let mut last_db_versions: mem::ManuallyDrop<Box<BTreeMap<Vec<u8>, i64>>> =
+        mem::ManuallyDrop::new(Box::from_raw(
+            (*ext_data).lastDbVersions as *mut BTreeMap<Vec<u8>, i64>,
+        ));
+
+    last_db_versions.clear();
+    ordinals.clear();
     for tbl_info in table_infos.iter_mut() {
         tbl_info.clear_cl_cache();
     }
