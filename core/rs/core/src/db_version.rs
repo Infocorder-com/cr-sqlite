@@ -217,7 +217,7 @@ pub fn insert_db_version(
     insert_db_vrsn: i64,
 ) -> Result<(), ResultCode> {
     unsafe {
-        // we can get a more recent db_versio
+        // we can get a more recent db_version
         let mut last_db_versions: mem::ManuallyDrop<Box<BTreeMap<Vec<u8>, i64>>> =
             mem::ManuallyDrop::new(Box::from_raw(
                 (*ext_data).lastDbVersions as *mut BTreeMap<Vec<u8>, i64>,
