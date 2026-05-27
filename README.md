@@ -9,6 +9,12 @@ A component of the [vulcan](https://vlcn.io) project.
 
 [![](https://dcbadge.vercel.app/api/server/AtdVY6zDW3)](https://discord.gg/AtdVY6zDW3)
 
+# Infocorder fork of superfly fork of vlcn-io's cr-sqlite repo
+
+`vlcn-io` created `cr-sqlite` (https://github.com/vlcn-io/cr-sqlite) but hasn't maintained it, so `superfly` forked it and has improved on it (https://github.com/superfly/cr-sqlite).
+
+This repository is basically the `superfly` fork (currently with just one non-code difference) but maintained separately in case that repo ever disappears or makes breaking changes.
+
 # Examples
 
 Example applications using cr-sqlite to sync state.
