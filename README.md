@@ -15,6 +15,38 @@ A component of the [vulcan](https://vlcn.io) project.
 
 This repository is basically the `superfly` fork (currently with just one non-code difference) but maintained separately in case that repo ever disappears or makes breaking changes.
 
+## How to merge in commits from superfly
+
+I maintain three repos in `~/Git`:
+
+* `~/Git/cr-sqlite`: the original vlcn.io project
+* `~/Git/superfly_cr-sqlite`: superfly's fork of vlcn.io's repo
+* `~/Git/infocorder_cr-sqlite`: Infocorder.com's fork of superfly's fork
+
+In my fork (`~/Git/infocorder_cr-sqlite`), I added:
+
+```
+git remote add superfly_cr-sqlite ../superfly_cr-sqlite
+```
+
+Confirm with:
+```
+~/Git/infocorder_cr-sqlite$ git remote -v
+origin	git@github.com:Infocorder-com/cr-sqlite.git (fetch)
+origin	git@github.com:Infocorder-com/cr-sqlite.git (push)
+superfly_cr-sqlite	../superfly_cr-sqlite (fetch)
+superfly_cr-sqlite	../superfly_cr-sqlite (push)
+```
+
+To update, I:
+
+* `cd ~/Git/superfly_cr-sqlite`
+* `git pull origin main`
+* `cd ~/Git/infocorder_cr-sqlite`
+* `git fetch superfly_cr-sqlite`
+* `git merge superfly_cr-sqlite/main`
+* `git push origin main`
+
 # Examples
 
 Example applications using cr-sqlite to sync state.
