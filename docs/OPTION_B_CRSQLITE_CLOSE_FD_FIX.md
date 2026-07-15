@@ -387,3 +387,169 @@ own amalgamation, so A1/A2 pass there even if they are a no-op in production. So
   registration path is actually wired into the SQLite that runs in prod.
 - **Tier 2 (app repo — must-do for A, nice-to-have for E/B):** the FD test at pool size 5
   (§5). Only this exercises the *real* `sqlite3_close` and would expose an "A-is-a-no-op" false green.
+
+---
+
+## 10. §9.7 resolved — verified against the `silicon_brain` build (decision is now settled)
+
+§9 left two facts open (§9.7). Both have now been **verified directly against the app's build
+scripts and the vendored Exqlite NIF sources**, and they settle the ranking. Net result: **E1 is
+the fix, B1 is the complement, and A1/A2 are provably no-ops in our integration — do not spend
+effort on them.**
+
+### 10.1 §9.7 Q1 — whose `sqlite3_close` runs at runtime? → **Exqlite's, always.** (A1/A2 are dead on arrival.)
+
+Our NIF is assembled by `scripts/build_crsqlite_static.sh`. The decisive lines:
+
+- **`sqlite3.c` compiled is Exqlite's own** amalgamation, not cr-sqlite's:
+  ```
+  # build_crsqlite_static.sh
+  echo "==> Compiling sqlite3.c with -DSQLITE_EXTRA_INIT=core_init..."
+  "$CC" … -DSQLITE_EXTRA_INIT=core_init -I"$EXQLITE_SRC_DIR" \
+      -o "$TMP_BUILD/sqlite3.o" "$EXQLITE_SRC_DIR/sqlite3.c"   # deps/exqlite/c_src/sqlite3.c
+  ```
+- **cr-sqlite is linked in as a Rust *extension* archive only** (`crsqlite.a`, built
+  `--features static,omit_load_extension`), whole-archived alongside Exqlite's objects:
+  ```
+  "$CC" -o "$OUT_SO" \
+      "$TMP_BUILD/sqlite3_nif.o" \
+      "$TMP_BUILD/sqlite3.o" \            # ← Exqlite's SQLite core (owns sqlite3_close)
+      "$TMP_BUILD/exqlite_crsqlite_init.o" \
+      -Wl,--whole-archive "$CRSQLITE_A" -Wl,--no-whole-archive \   # ← cr-sqlite ext only
+      …
+  ```
+- **cr-sqlite's *own* bundled `core/src/sqlite/sqlite3.c` is never compiled into our NIF at all.**
+  cr-sqlite auto-registers via the standard hook: the overlay `monkeypatched_deps/exqlite_crsqlite_init.c`
+  defines `core_init` → `sqlite3_auto_extension(sqlite3_crsqlite_init)`, invoked from Exqlite's
+  `sqlite3_initialize()` because Exqlite's `sqlite3.c` was compiled with `-DSQLITE_EXTRA_INIT=core_init`.
+
+**Consequence:** the `sqlite3_close` / `sqlite3_close_v2` that executes in production is **Exqlite's
+amalgamation, every connection, every teardown.** §9.3's "false-green trap" is therefore **certain for
+our build**, not hypothetical:
+
+- **A1/A2 (patch cr-sqlite's `core/src/sqlite/sqlite3.c`)** would patch code we do not link. The Tier-1
+  C test in this repo would go green (it compiles cr-sqlite's amalgamation), while our shipped NIF is
+  byte-for-byte unaffected. **A1/A2 cannot fix the app leak.**
+- **E1 and B1 depend only on `sqlite3_crsqlite_init` running** — which it must, because that's what
+  provides the CRR functions — plus a standard mechanism (`SQLITE_TRACE_CLOSE` / vtab `xDisconnect`)
+  present in Exqlite's SQLite. Both are immune to the linking question. ✅
+
+### 10.2 §9.7 Q2 — is Exqlite's trace slot in use? → **No. The `SQLITE_TRACE_CLOSE` slot is free for E1.**
+
+Exqlite's NIF (`deps/exqlite/c_src/sqlite3_nif.c`) **never calls `sqlite3_trace_v2`** — the only
+occurrences of `trace_v2` in the tree are the API-struct declarations in `sqlite3ext.h` / `sqlite3.h`.
+So E1 can own the single per-connection trace callback with **zero contention today**.
+
+One caveat to carry forward (it belongs in E1's own comment): `sqlite3_trace_v2` has exactly **one
+callback slot per connection**. If the app ever enables Exqlite query tracing / `EXPLAIN` telemetry on
+these pools, it would clobber E1's close hook and the leak would silently return. That single-owner risk
+is precisely why **B1 is worth shipping alongside E1** — B1 rides vtab `xDisconnect`, independent of the
+trace slot, so it survives a future trace user (for the subset of connections that queried
+`crsql_changes`).
+
+### 10.3 Final decision (supersedes §9.6's "pending verification")
+
+With both §9.7 facts confirmed, §9.6's conditional ranking becomes unconditional:
+
+1. **E1 (`sqlite3_trace_v2` + `SQLITE_TRACE_CLOSE`) — the fix.** Register in `sqlite3_crsqlite_init`
+   beside the existing commit/rollback hooks; the callback calls `crsql_finalize(pExtData)` (reuse the
+   `closeHook` body). Set **only** the `SQLITE_TRACE_CLOSE` mask (no per-statement trace overhead).
+2. **B1 (`changesDisconnect` → `crsql_finalize(p->pExtData)`) — ship as a two-line complement**, for
+   defense-in-depth against a future trace-slot owner. Accept its coverage gap (only connections that
+   queried `crsql_changes`); E1 covers the rest.
+3. **A1/A2 — do not implement.** Proven no-ops in this integration (§10.1).
+4. **C1 dropped; D is the existing Elixir-side workaround, not this task.**
+
+Idempotency (§3.Idempotency) matters more now: `crsql_finalize` may run via **E1's trace callback,
+B1's xDisconnect, *and* the host's existing `before_disconnect: crsql_finalize`** — up to three times per
+connection. It is already idempotent (finalize + NULL, `sqlite3_finalize(NULL)` is a no-op); keep it so,
+and add a test that calls it twice in a row.
+
+### 10.4 Test plan, concretized for this integration
+
+Both tiers are required here (not "nice-to-have"), because Tier 1 alone cannot see the linking axis:
+
+- **Tier 1 — mechanism oracle (this repo):** the §4 test — use cr-sqlite, then `sqlite3_close(db)` (v1,
+  no explicit `crsql_finalize`) → `SQLITE_OK` (was `SQLITE_BUSY`). Run under `make test` + `make asan` +
+  `make valgrind` (asan/valgrind specifically to prove finalizing inside a trace-close callback trips no
+  debug assertion). **Add a second variant** that exercises E1's path with a **write-only** connection
+  (CRR writes but *no* `crsql_changes` query) to prove E1 fires where B1 would not.
+- **Tier 2 — end-to-end truth (app repo):** rebuild the NIF (§10.5) and run at **pool_size 5**:
+  - `test/silicon_brain/spoke_project_manager_large_pool_test.exs` — the "terminate_repo FD leak is
+    BOUNDED" test. **This is the acceptance gate.** Today it asserts `after_terminate - base <=
+    2*pool_size + 4`; with E1 wired in it should collapse to `after_terminate ≈ base`. If it does **not**
+    move, E1 did not reach the real `sqlite3_close` — the exact false-green Tier 1 can't detect.
+  - `test/silicon_brain/spoke_project_manager_fd_release_test.exs` — managed-pool + create! paths.
+  - Only after both are green at pool_size 5: tighten those bounds toward ~0 and drop the "bounded leak"
+    framing in `docs/CR-SQLITE-DATA-SYNC.md` §14.9 / §14.9.B.
+
+**Please also add a build-provenance marker — `crsql_build_id()`.** The app cannot otherwise tell our
+E1-carrying static NIF apart from the upstream downloaded `priv/native/crsqlite.dll` fallback: **both
+answer `crsql_db_version()` identically**, so "cr-sqlite works" is not evidence that E1 shipped. A trivial
+scalar SQL function returning a compiled-in string (e.g. the fork commit + `"E1"`) makes the live build
+identifiable at runtime on every OS — indispensable on Windows, where the packaged Burrito `.exe` can't be
+exercised by `mix test` and the two artifacts ship side-by-side. Register it beside the CRR functions in
+`sqlite3_crsqlite_init` so it rides both the static auto-extension path and the loadable-extension path.
+
+The app side is **already wired to consume it** (forward-compatible — lights up automatically once the
+function exists), which is how the fix is verified in the field without a Windows harness:
+
+- **Boot provenance log** — `SiliconBrain.Application.log_crsqlite_static_linkage_status/0` opens a raw
+  `:memory:` connection (no `:load_extensions`) and now logs
+  `[boot] cr-sqlite linkage active (static … | runtime load_extension): crsql_db_version()=<v>
+  build_id=<crsql_build_id() | absent> fallback_ext=<present|absent> crsqlite_path=<resolved>`.
+  On Windows this single line, read from the field `infocorder.log.win.*`, answers: did the NIF load,
+  is it the static build, **which build**, and is the wrong (fallback) path in play (§10.5).
+- **Teardown handle-release log** — `SiliconBrain.SpokeProjectManager.terminate_repo/1` logs, per project
+  stop, the BEAM's open handle count on that project's `infocorder.db`/`-wal` files before vs after the
+  pool teardown (Linux `/proc`; read-only, never mutates the DB). Pre-E1 → `released≈0` (the known leak);
+  post-E1 → `after≈0`. This is the Layer-D behavior signal *as a field log* on Linux. On Windows (no
+  `/proc`, and `-shm` persists until process exit regardless — §6) E1's close behavior is proven by the
+  Layer-D **file-lock test** below, not this field probe.
+
+Windows E1 acceptance test (Layer D, since `/proc` is unavailable): after `terminate_repo`, on a throwaway
+`/tmp`-equivalent DB, attempt to delete/rename the closed `.db` and `-wal` — Windows refuses to remove a
+file with an open handle, so a successful delete proves the zombie handle released (E1 worked); assert on
+`.db`/`-wal` only, never `-shm`.
+
+### 10.5 What changes in build / integration / deployment — across all OSes
+
+Modifying our cr-sqlite means bumping the pinned ref and **rebuilding the static archive on every
+target** (the change is source-in-`crsqlite.a`, so no app-side Elixir change is required to consume it):
+
+- **Pin bump.** Land E1+B1 in `Infocorder-com/cr-sqlite`, then bump `CRSQLITE_REF` in
+  `scripts/build_crsqlite_static.sh` (currently `4d9aa60487a44780e56166970dd1ba4fe7140dec`). The ref (and
+  the overlay) feed the build **stamp**, so bumping it forces a clean rebuild everywhere and won't serve a
+  stale cached NIF — but *verify* the stamp actually rebuilt; a stale artifact is itself a false green.
+- **Per-OS build** (already wired in `.github/workflows/build.yml` as
+  `build_crsqlite_static.sh --env prod --target <rust-triple>` per matrix entry):
+  - **Linux x86_64 / aarch64 — LOW risk** (gcc, ELF `.so`, `--whole-archive`). Build & validate here first.
+  - **macOS x86_64 / aarch64 — MEDIUM** (clang/xcrun, Mach-O, `-force_load`; cross-arch caveats).
+  - **Windows x86_64 — HIGHEST.** The MinGW + bindgen path (`build.yml` ~L848) is the fragile one — clang 22
+    + bindgen opaque-struct shim. E1/B1 add **no new struct/API surface** (a trace registration + a vtab
+    call), so they should not re-trigger the opaque-struct bindgen failure — confirm during the Windows
+    build. Also: `build.yml` still has a **prebuilt-`crsqlite.dll` download fallback** (~L813,
+    `download_crsqlite.sh`) pointing at an upstream `superfly/cr-sqlite` release that will **not** contain
+    E1 — ensure prod loads the **statically-linked** NIF, not that fallback, or the fix silently won't ship
+    on Windows.
+  - **`-shm` residual (Windows):** unchanged by this fix — the WAL `-shm` mmap releases only at process
+    exit regardless of finalize (§6). E1 fixes the `.db`/`-wal` FDs on all platforms; document the Windows
+    `-shm` ceiling.
+- **Deployment.** Burrito desktop builds package whatever `sqlite3_nif.<ext>` sits in
+  `_build/prod/lib/exqlite/priv/` — so a rebuilt artifact per OS is the *only* deploy change; no packaging
+  or config edits. The build script also mirrors to `_build_hub/…` for hub-mode peers, so the hub picks up
+  the same fixed NIF automatically.
+- **Rollout order (lowest risk):** (1) E1+B1 in the fork → (2) Tier-1 `make test`/asan/valgrind green →
+  (3) bump `CRSQLITE_REF`, build **Linux** locally, run Tier-2 FD tests and confirm the bound collapses to
+  ~0 → (4) only then fan out to macOS + Windows CI. This confirms the mechanism end-to-end on the *real*
+  Exqlite close before spending the Windows build's risk budget.
+
+### 10.6 TL;DR for the cr-sqlite-repo implementer
+
+Implement **E1**: in `sqlite3_crsqlite_init` (`core/src/crsqlite.c`), after `pExtData` is created,
+`sqlite3_trace_v2(db, SQLITE_TRACE_CLOSE, <cb>, pExtData)` where `<cb>` calls
+`crsql_finalize(pExtData)` and returns 0 — reusing the existing `#ifdef LIBSQL` `closeHook` body.
+Add **B1**: one line in `changesDisconnect` (`core/src/changes-vtab.c`) — `crsql_finalize(p->pExtData)`.
+**Skip A1/A2 entirely** — in the silicon_brain build, Exqlite's `sqlite3.c` (not cr-sqlite's) runs every
+close, so amalgamation patches never execute in production (§10.1). Prove it with the §10.4 two-tier
+tests; the app's pool_size-5 FD test is the real acceptance gate.
