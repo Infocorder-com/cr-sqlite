@@ -247,3 +247,143 @@ tests (these already exist and encode the expected numbers):
 - `silicon_brain` `docs/CR-SQLITE-DATA-SYNC.md` §14.9 (the leak) and §14.9.B (this option).
 - `lib/silicon_brain/spoke_project_manager.ex` — `terminate_repo/1` (graceful `Supervisor.stop`, no
   finalize fires) and `do_start_repo` (per-project pool).
+
+---
+
+## 9. Expanded solution analysis (added after code-tracing this repo)
+
+This section records a deeper brainstorm done directly against the checked-in sources
+(`core/src/sqlite/sqlite3.c`, `core/src/crsqlite.c`, `core/src/changes-vtab.c`, `core/Makefile`).
+It **adds two options the original doc didn't list**, surfaces a cross-cutting question that changes
+the ranking, and gives an analytical evaluation. Treat §3's "A recommended" as **superseded by §9.6
+below** pending the two verifications in §9.7.
+
+### 9.1 Facts verified in this repo
+
+- **Exact close path.** `sqlite3Close` (`sqlite3.c:176109`) does, in order: `sqlite3_mutex_enter`
+  (176118) → **`SQLITE_TRACE_CLOSE` dispatch (176119–176121)** → `disconnectAllVtab(db)` (176124) →
+  `sqlite3VtabRollback` (176133) → the fatal **`if(!forceZombie && connectionIsBusy(db))` gate (176138)**
+  → returns `SQLITE_BUSY`. `connectionIsBusy` inspects `db->pVdbe`; `sqlite3_finalize` removes a
+  statement from exactly that list. So **anything that finalizes cr-sqlite's statements before line
+  176138 makes the busy check pass** — and both the trace dispatch and `disconnectAllVtab` sit before it.
+- **`disconnectAllVtab` runs before the busy check** and calls `xDisconnect` on the *eponymous*
+  `crsql_changes` module via `pMod->pEpoTab`. `changesDisconnect` (`changes-vtab.c:63`) already holds
+  `p->pExtData` (set at `changes-vtab.c:44`) but deliberately does not finalize it.
+- **Trace is compiled in** for our build (`SQLITE_OMIT_TRACE` only triggers under
+  `SQLITE_OMIT_FLOATING_POINT`, which we never set); the 176119 dispatch is unconditional.
+- **`sqlite3_trace_v2` is in the extension API routines struct** (`sqlite3ext.h:283`, remapped at
+  line 620), next to the `commit_hook`/`rollback_hook` cr-sqlite already uses — so it is callable from
+  **both** the loadable-extension and static builds.
+- **Test harness makes the mechanism testable here.** `make test` compiles
+  `dist/sqlite3-extra.c` (= vendored `sqlite3.c` + `core_init.c`) with `-DSQLITE_EXTRA_INIT=core_init`;
+  `core_init` calls `sqlite3_auto_extension(sqlite3_crsqlite_init)`, so **every `sqlite3_open` in a test
+  auto-loads cr-sqlite**. `sqlite3.c` is vendored/checked-in (no regeneration on normal builds).
+
+### 9.2 The full candidate set
+
+1. **A1** — pre-close hook via new `struct sqlite3` fields + registrar (libSQL-style amalgamation patch;
+   this is §3's Approach A).
+2. **A2** — pre-close hook as a single call into `crsqlite.c` + a global `db→pExtData` registry
+   (smaller, better-delimited patch; adds a process-global map + mutex).
+3. **B1** — `changesDisconnect` calls `crsql_finalize(p->pExtData)` (no patch; rides the vtab-disconnect
+   that already runs before the busy check).
+4. **E1 (new)** — register `sqlite3_trace_v2(db, SQLITE_TRACE_CLOSE, cb, pExtData)` in `crsqlite_init`;
+   the callback calls `crsql_finalize(pExtData)`. **Zero amalgamation patch, standard public API.**
+5. **C1** — stop caching `pExtData` statements / finalize eagerly (root-cause source fix).
+6. **D** — host-side: make Exqlite run `crsql_finalize` on *every* teardown path. This is really the
+   existing Elixir-side "Option A" workaround extended; out of scope for "make cr-sqlite self-clean."
+
+### 9.3 The cross-cutting question that reshapes the ranking
+
+Approaches **A1/A2 patch cr-sqlite's vendored `sqlite3.c`**. That only helps **if the `sqlite3_close`
+executing at runtime is the one from that patched amalgamation.** In the silicon_brain integration,
+Exqlite's NIF normally carries **its own** `sqlite3.c`. If cr-sqlite is loaded into Exqlite's SQLite
+(loadable ext, or a static link where Exqlite's amalgamation wins the `sqlite3_close` symbol), then the
+patched close **never runs and Approach A does nothing end-to-end** — even though the isolated C test in
+this repo (which compiles cr-sqlite's own amalgamation) still passes. **That is a false-green trap.**
+
+**B1 and E1 are immune to this**: they rely only on cr-sqlite's `init` running (it must, to provide the
+CRR functions) plus a standard mechanism (`SQLITE_TRACE_CLOSE` / `xDisconnect`) present in *whatever*
+SQLite actually runs the close. This is the single most important axis and it flips the original "A first"
+recommendation.
+
+### 9.4 Evaluation matrix
+
+| Axis | A1 struct-hook | A2 global-registry | B1 changesDisconnect | **E1 trace_v2** | C1 no-cache |
+|---|---|---|---|---|---|
+| Fires on **every** close path | yes | yes | **only if `crsql_changes` was queried** | yes | yes |
+| Works regardless of whose amalgamation runs | **no (patched-build only)** | **no (patched-build only)** | yes | yes | yes |
+| Amalgamation patch / upgrade burden | 3 sites incl. struct layout | 1 site + global | none | **none** | none |
+| Touches only cr-sqlite's own stmts | yes | yes | yes | yes | n/a |
+| Host-callback conflict | none | none | none | **owns trace slot** | none |
+| Perf | none | none | none | none (only CLOSE bit set) | **re-prepares hot stmts** |
+| Testable in this repo's `make test` | yes | yes | yes | yes | yes |
+
+### 9.5 Per-option reasoning
+
+- **A1 (struct-field hook).** Semantically cleanest, mirrors the existing `#ifdef LIBSQL closeHook`. But a
+  three-site patch including a `struct sqlite3` layout change is the worst upgrade hygiene, and — decisively
+  — it is **patched-build-only** (see §9.3). Viable only if we control the amalgamation that runs the close.
+- **A2 (call + global registry).** Smaller, better-delimited patch than A1; costs a process-global
+  `db→pExtData` map + mutex and a lookup per close. Same fatal dependency on running the patched
+  amalgamation. No advantage over E1 unless we specifically must avoid the trace slot *and* control the
+  amalgamation.
+- **B1 (changesDisconnect).** Tiny, no patch, `p->pExtData` already in hand. Killer weakness: **coverage
+  gap** — `pMod->pEpoTab` exists only if `crsql_changes` was *queried* on that connection, but the
+  `pExtData` statements are prepared by ordinary CRR writes / the commit hook with no `crsql_changes`
+  query. A write-only pooled connection would still leak. Unreliable as the *sole* fix, but free and
+  self-owned → a reasonable **defense-in-depth complement** to E1.
+- **E1 (trace_v2 / `SQLITE_TRACE_CLOSE`).** Fires unconditionally at the top of every
+  `sqlite3_close`/`close_v2`, before the busy check, in whatever SQLite runs — so it is robust across
+  teardown paths **and** across the integration model, with **zero amalgamation patch**. Finalize runs
+  under `db->mutex` (same context Approach A's hook would use; `sqlite3_finalize` re-enters the recursive
+  mutex fine), and setting **only** the `CLOSE` mask means no per-statement trace overhead. Two honest
+  caveats: (1) cr-sqlite would own the single trace slot — if the host later calls `sqlite3_trace_v2`
+  (**Exqlite exposes an optional trace feature**), it silently clobbers the close hook and the leak
+  returns. cr-sqlite already makes this same "we own the per-connection callback" assumption for
+  commit/rollback hooks (`crsqlite.c:77` TODO), but trace is more likely to be contended. (2) Using an
+  observability callback to *do work* (finalize) is slightly off-label; the C test plus `asan`/`valgrind`
+  should confirm no debug-build assertion fires when finalizing inside the trace-close callback.
+- **C1 (no-cache).** The only option that removes the root cause, but it re-prepares hot statements
+  (`db_version` on the commit path) on every use — a measurable regression for the exact statements
+  cr-sqlite caches deliberately. Largest, riskiest change. Not recommended.
+- **D (host-side).** The cleanest host-only fix is making Exqlite run `crsql_finalize` on the connection
+  destructor path so it fires on *all* teardowns (incl. GC), touching only cr-sqlite's statements via the
+  SQL function. But it lives in the app/Exqlite repo and couples Exqlite to cr-sqlite — it is the existing
+  Option-A workaround, not this "make cr-sqlite self-clean" task.
+
+### 9.6 Updated recommendation
+
+The original "A1 first" ranking was wrong on the axis that matters most (§9.3): it silently assumes
+cr-sqlite's amalgamation runs the close, which is likely false in the Exqlite integration. Revised order:
+
+1. **Primary: E1 (`SQLITE_TRACE_CLOSE`)** — provided Exqlite's trace feature is not (and won't be) enabled
+   on these connections. Only option that is simultaneously zero-patch, fires on every teardown, and works
+   regardless of whose SQLite runs the close. Register it beside the existing hooks in `crsqlite_init`,
+   reusing the `closeHook` body.
+2. **Optional complement: B1** — a two-line safety net for connections that *did* query `crsql_changes`;
+   free and independent of E1.
+3. **Fallback: A1** — only if (a) cr-sqlite's amalgamation genuinely provides the runtime `sqlite3_close`
+   **and** (b) the trace-slot ownership is judged unacceptable. Then the libSQL-style patch is the
+   "blessed" shape, at the cost of amalgamation maintenance.
+4. **Drop C1**; treat **D** as the existing Option-A workaround, not this task.
+
+### 9.7 Two facts to verify before writing code
+
+1. **Does the app build make cr-sqlite's amalgamation the runtime `sqlite3_close`,** or does Exqlite's
+   own `sqlite3.c` win that symbol? (Inspect `build_crsqlite_static.sh` and how the artifact is linked
+   into the Exqlite NIF.) This decides whether A1/A2 are even viable end-to-end.
+2. **Is Exqlite's trace feature ever enabled on these pools?** This decides whether E1's one weakness
+   (trace-slot ownership) can bite.
+
+### 9.8 Test plan implication (important)
+
+The isolated C test **cannot distinguish A from E/B on the integration axis** — it compiles cr-sqlite's
+own amalgamation, so A1/A2 pass there even if they are a no-op in production. So testing needs two tiers:
+
+- **Tier 1 (this repo — oracle for the *mechanism*):** the v1-`sqlite3_close` → `SQLITE_OK` test in
+  `crsqlite.test.c` (per §4), run under `make test` + `make asan` + `make valgrind`. Red on unpatched,
+  green after. This proves the finalize-on-close mechanism works; it does **not** prove the chosen
+  registration path is actually wired into the SQLite that runs in prod.
+- **Tier 2 (app repo — must-do for A, nice-to-have for E/B):** the FD test at pool size 5
+  (§5). Only this exercises the *real* `sqlite3_close` and would expose an "A-is-a-no-op" false green.
