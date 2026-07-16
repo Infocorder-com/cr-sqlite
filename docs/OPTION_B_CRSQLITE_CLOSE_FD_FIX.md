@@ -617,3 +617,48 @@ Re-checked directly against the checked-in code:
       (expect `SQLITE_OK`). Then `make asan` (finalize-inside-trace trips no debug assertion).
 - [ ] **`crsql_build_id()`** scalar function (follow-up).
 - [ ] Hand off to app repo for Tier-2 (pool_size-5 FD test — the real acceptance gate, §10.4).
+
+### 11.4 App-side review of §11 (reviewed against `silicon_brain` usage)
+
+**Verdict: §11 is endorsed. Ship E1, defer B1.** The B1 mid-session-finalize hazard is real and its three
+load-bearing assumptions were verified against actual app usage:
+
+1. **No schema-resident `crsql_changes` vtab** anywhere (`grep`: no `CREATE VIRTUAL TABLE … USING
+   crsql_changes`) — we use only the eponymous form. So B1 would be safe *today*, but the silent-invariant
+   argument for deferring stands.
+2. **Exqlite SQLite tracing is never enabled** on these pools (no `sqlite3_trace_v2` call anywhere in app
+   or Exqlite NIF; the only "trace" is Erlang process tracing in `unbound_repo_tracer.ex`). So E1's sole
+   weakness (trace-slot ownership) is uncontended — E1 alone is sufficient, and B1's only marginal benefit
+   doesn't apply.
+3. **Host finalize is close-time only** (`before_disconnect: crsql_finalize_on_disconnect/2` on both
+   pools). With B1 gone, `crsql_finalize` runs at most **2×** — host `before_disconnect` + E1's trace hook,
+   both at genuine teardown — so checklist test (c) covers the idempotency fully.
+
+**One thing §11 (correctly) leaves out of scope, flagged so Tier-2 isn't misread — the Exqlite
+co-blocker.** E1 fixes the *cr-sqlite* half. But the app's own §14.9 records (and I re-confirmed in
+`deps/exqlite/c_src/sqlite3_nif.c:559`) that **`exqlite_close` calls `sqlite3_close_v2` without first
+finalizing Exqlite's OWN cached prepared statements** (comment at :555-557: "we rely on the destructors to
+later run to clean those up"). So at close the connection is a zombie held by **both** cr-sqlite's
+statements *and* Exqlite's. Crucially, the two differ in fate:
+
+- cr-sqlite's statements — **never** finalized today → this is what makes the leak *permanent* (until BEAM
+  exit). **E1 removes exactly this blocker.**
+- Exqlite's statements — finalized by the NIF `statement_type_destructor` on **GC** of each statement
+  resource (async, but it *does* happen once the torn-down pool's processes become garbage).
+
+**Therefore E1 alone converts the *permanent* leak into a *GC-latency-bounded transient*:** the zombie
+completes (FDs release) once Exqlite's last statement resource GC-finalizes — which will happen, unlike
+cr-sqlite's. **Implication for the Tier-2 FD gate (§10.4):** after `terminate_repo`, expect baseline only
+**after a forced `:erlang.garbage_collect` + settle** (the existing FD tests already do GC+settle). Do
+**not** read a synchronous post-`terminate` residual as "E1 failed" — re-measure post-GC.
+
+**Open question Tier-2 answers:** does E1 + GC/settle reliably return to baseline, or do Exqlite's
+statement resources not collect promptly/deterministically enough — in which case we *also* need the
+Exqlite-side finalize-before-close (finalize all `sqlite3_next_stmt` tracked statements in `exqlite_close`
+/ the connection destructor before `close_v2`; handoff §3 "Approach B", with its dangling-`statement_t`
+caveat) to get **deterministic** release. That is an **Exqlite NIF change, not a cr-sqlite one** — out of
+this repo's scope, but it's the known complement if the Tier-2 gate doesn't fully close on E1 alone.
+
+**Landmine recorded app-side** (`CR-SQLITE-DATA-SYNC.md` §14.9.B): E1's `SQLITE_TRACE_CLOSE` hook is now
+the *sole* FD-leak protection, so enabling Exqlite query tracing on these pools would silently clobber it
+and resurrect the leak. Documented so it isn't discovered the hard way.
