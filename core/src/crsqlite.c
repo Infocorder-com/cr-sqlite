@@ -36,6 +36,31 @@ static void closeHook(void *pUserData, sqlite3 *db) {
 }
 #endif
 
+// Finalize cr-sqlite's own cached prepared statements as soon as the connection
+// begins to close, so the OS file handles (*.db / -wal / -shm) are released
+// without the host having to call `SELECT crsql_finalize()` first.
+//
+// SQLITE_TRACE_CLOSE fires at the very top of sqlite3_close / sqlite3_close_v2,
+// *before* SQLite's "connection is busy?" check. Finalizing the pExtData
+// statements there removes the outstanding-statement blockers cr-sqlite owns, so
+// a v1 close returns SQLITE_OK and a deferred v2 close can complete instead of
+// leaking the handles until the process exits.
+//
+// Unlike libsql_close_hook this uses only the stock, public sqlite3_trace_v2
+// API, so it works in every build (loadable extension, static link, WASM) and
+// regardless of which SQLite amalgamation actually runs the close. It only ever
+// touches cr-sqlite's own statements (crsql_finalize is idempotent and NULLs
+// each pointer), runs under the connection mutex sqlite3_close already holds,
+// and requests ONLY the CLOSE event, so there is no per-statement trace
+// overhead. See docs/OPTION_B_CRSQLITE_CLOSE_FD_FIX.md (E1).
+static int crsql_close_trace_hook(unsigned traceType, void *pCtx, void *p,
+                                  void *x) {
+  if (traceType == SQLITE_TRACE_CLOSE) {
+    crsql_finalize((crsql_ExtData *)pCtx);
+  }
+  return 0;
+}
+
 void *sqlite3_crsqlrustbundle_init(sqlite3 *db, char **pzErrMsg,
                                    const sqlite3_api_routines *pApi);
 
@@ -74,8 +99,12 @@ __declspec(dllexport)
 #ifdef LIBSQL
     libsql_close_hook(db, closeHook, pExtData);
 #endif
+    // Release OS file handles on connection close without requiring the host to
+    // call crsql_finalize() first. See crsql_close_trace_hook above (E1).
+    sqlite3_trace_v2(db, SQLITE_TRACE_CLOSE, crsql_close_trace_hook, pExtData);
     // TODO: get the prior callback so we can call it rather than replace
-    // it?
+    // it? (Applies to the trace/commit/rollback hooks: cr-sqlite currently
+    // assumes it owns these per-connection callback slots.)
     sqlite3_commit_hook(db, crsql_commit_hook, pExtData);
     sqlite3_rollback_hook(db, crsql_rollback_hook, pExtData);
   }

@@ -4,10 +4,13 @@
 and possibly the **Exqlite** NIF. This doc is self-contained; it does not assume access to the
 `silicon_brain` app repo, though it references it for context.
 
-**Status:** proposed / not implemented. This is the "proper fix" for a long-standing, documented
-file-descriptor leak (`silicon_brain` `docs/CR-SQLITE-DATA-SYNC.md` §14.9 / §14.9.B). An Elixir-side
-workaround exists (run the per-project pool at size 1 in tests, 5 in prod), so this is not urgent —
-but it's the only way to make the leak actually **zero** on all teardown paths.
+**Status:** **E1 implemented & Tier-1-verified in this repo** (red→green in `make test` + `make valgrind`
+clean — see §11.4); the chosen approach is **E1**, not §3's Approach A (see §10–§11 for why). Tier-2
+app-side validation (pool_size-5 FD test) and the `crsql_build_id()` provenance marker are still pending.
+This is the "proper fix" for a long-standing, documented file-descriptor leak (`silicon_brain`
+`docs/CR-SQLITE-DATA-SYNC.md` §14.9 / §14.9.B). An Elixir-side workaround exists (run the per-project
+pool at size 1 in tests, 5 in prod), so this is not urgent — but it's the only way to make the leak
+actually **zero** on all teardown paths.
 
 ---
 
@@ -606,17 +609,39 @@ Re-checked directly against the checked-in code:
 
 ### 11.3 Implementation checklist
 
-- [ ] **E1** — `crsql_close_trace_hook` + `sqlite3_trace_v2(db, SQLITE_TRACE_CLOSE, …)` registration in
-      `sqlite3_crsqlite_init` (`core/src/crsqlite.c`).
-- [ ] **Tier-1 tests** (`core/src/crsqlite.test.c`, wired into `crsqlTestSuite`):
-      (a) use CRR + query `crsql_changes` → `sqlite3_close` (v1) → `SQLITE_OK`;
-      (b) **write-only** (CRR writes + `crsql_db_version`, *no* `crsql_changes` query) → v1 close →
-      `SQLITE_OK` (proves E1 fires where B1 would not);
-      (c) explicit `SELECT crsql_finalize()` *then* close → `SQLITE_OK` (idempotency / double-finalize).
-- [ ] Prove **red→green**: run `make test` with tests but no E1 (expect `SQLITE_BUSY`), then with E1
-      (expect `SQLITE_OK`). Then `make asan` (finalize-inside-trace trips no debug assertion).
-- [ ] **`crsql_build_id()`** scalar function (follow-up).
+- [x] **E1** — `crsql_close_trace_hook` + `sqlite3_trace_v2(db, SQLITE_TRACE_CLOSE, …)` registration in
+      `sqlite3_crsqlite_init` (`core/src/crsqlite.c:56` + `:104`).
+- [x] **Tier-1 tests** (`core/src/crsqlite.test.c`, wired into `crsqlTestSuite`):
+      (a) `testCloseReleasesCrsqlStmts` — CRR + query `crsql_changes` → `sqlite3_close` (v1) → `SQLITE_OK`;
+      (b) `testCloseReleasesWithoutChangesQuery` — **write-only** (CRR writes + `crsql_db_version`, *no*
+      `crsql_changes` query) → v1 close → `SQLITE_OK` (proves E1 fires where B1 would not);
+      (c) `testCloseAfterExplicitFinalizeIsIdempotent` — explicit `SELECT crsql_finalize()` *then* close →
+      `SQLITE_OK` (idempotency / double-finalize).
+- [x] Proved **red→green**: `make test` with tests but no E1 → aborts on `SQLITE_BUSY`
+      (`testCloseReleasesCrsqlStmts` assertion); with E1 → all three green + full suite passes.
+- [x] **Memory-safety check via `make valgrind`** → `ERROR SUMMARY: 0 errors from 0 contexts`.
+      (`make asan` was **not** usable: it panics in the cr-sqlite **Rust** bundle
+      [`slice::from_raw_parts` unsafe-precondition, flagged only by the asan build's debug-std] across
+      *unrelated* suites — `rows_impacted`, `sandbox`, `rust_integration` — and reproduces identically on
+      a **clean tree with E1 stashed**. So it is a pre-existing latent issue in the vendored Rust bundle,
+      unrelated to E1; valgrind stands in as the mem-safety oracle. Worth filing separately.)
+- [ ] **`crsql_build_id()`** scalar function (immediate follow-up).
 - [ ] Hand off to app repo for Tier-2 (pool_size-5 FD test — the real acceptance gate, §10.4).
+
+### 11.4 Verification results (this repo)
+
+| Check | Command | Result |
+|---|---|---|
+| Red baseline (no E1) | `make test` | **`SQLITE_BUSY`** — `testCloseReleasesCrsqlStmts` assertion aborts ✔ (bug reproduced) |
+| Green (with E1) | `make test` | All 3 close tests **Success**; full suite passes ✔ |
+| Memory safety | `make valgrind` | **0 errors from 0 contexts** ✔ |
+| asan | `make asan` | Pre-existing Rust-bundle panic, **unrelated to E1** (reproduced with E1 stashed) — tracked separately |
+
+Toolchain note for future builds: the Rust bundle pins `nightly-2023-10-05` via `rust-toolchain.toml`
+(uses `#![feature(concat_idents)]`, removed in Rust 1.90). Build with real `rustup` on `PATH`
+(`export PATH="$HOME/.cargo/bin:$PATH"`) so the pin is honored; `asdf`'s `cargo` shim ignores the pin and
+fails. First-time setup also needs `git submodule update --init --recursive` (for
+`core/rs/sqlite-rs-embedded`) and, for asan, `rustup component add rust-src --toolchain nightly-2023-10-05`.
 
 ### 11.4 App-side review of §11 (reviewed against `silicon_brain` usage)
 

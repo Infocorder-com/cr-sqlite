@@ -662,6 +662,116 @@ static void testPullingOnlyLocalChanges() {
 // {
 // }
 
+// Proves cr-sqlite releases its cached prepared statements on connection close
+// WITHOUT the host calling `SELECT crsql_finalize()` first. `sqlite3_close` (v1)
+// returns SQLITE_BUSY if ANY statement is still outstanding and SQLITE_OK only
+// once they are all finalized, so it is the strict oracle for the FD-release fix
+// (E1 — the SQLITE_TRACE_CLOSE hook in crsqlite.c). See
+// docs/OPTION_B_CRSQLITE_CLOSE_FD_FIX.md.
+static void testCloseReleasesCrsqlStmts() {
+  printf("CloseReleasesCrsqlStmts\n");
+
+  int rc = SQLITE_OK;
+  sqlite3 *db = 0;
+  rc = sqlite3_open(":memory:", &db);
+  assert(rc == SQLITE_OK);
+
+  rc = sqlite3_exec(db, "CREATE TABLE foo (id PRIMARY KEY NOT NULL, a);", 0, 0,
+                    0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  // Exercise cr-sqlite so it prepares + caches its internal statements.
+  rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 'x');", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT count(*) FROM crsql_changes;", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_db_version();", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+
+  // v1 close, WITHOUT calling crsql_finalize first.
+  rc = sqlite3_close(db);
+  if (rc != SQLITE_OK) {
+    sqlite3_stmt *s = sqlite3_next_stmt(db, NULL);
+    printf("\tclose returned %d; first unfinalized: %s\n", rc,
+           s ? sqlite3_expanded_sql(s) : "(none)");
+  }
+  assert(rc == SQLITE_OK);
+
+  printf("\t\e[0;32mSuccess\e[0m\n");
+}
+
+// Same proof, but the connection NEVER queries `crsql_changes`, so its eponymous
+// vtab is never connected. A changesDisconnect-based fix (B1) would not fire
+// here; E1 (trace-close) must still release the connection. Guards against
+// regressing to a crsql_changes-only fix.
+static void testCloseReleasesWithoutChangesQuery() {
+  printf("CloseReleasesWithoutChangesQuery\n");
+
+  int rc = SQLITE_OK;
+  sqlite3 *db = 0;
+  rc = sqlite3_open(":memory:", &db);
+  assert(rc == SQLITE_OK);
+
+  rc = sqlite3_exec(db, "CREATE TABLE foo (id PRIMARY KEY NOT NULL, a);", 0, 0,
+                    0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  // CRR writes + a db_version read prepare the pExtData statements, but we
+  // deliberately do NOT touch `crsql_changes`.
+  rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 'x');", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_db_version();", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+
+  rc = sqlite3_close(db);
+  if (rc != SQLITE_OK) {
+    sqlite3_stmt *s = sqlite3_next_stmt(db, NULL);
+    printf("\tclose returned %d; first unfinalized: %s\n", rc,
+           s ? sqlite3_expanded_sql(s) : "(none)");
+  }
+  assert(rc == SQLITE_OK);
+
+  printf("\t\e[0;32mSuccess\e[0m\n");
+}
+
+// The close hook must be idempotent with the host's existing
+// `before_disconnect: crsql_finalize` path: an explicit finalize followed by a
+// close (which runs crsql_finalize AGAIN via the trace hook) must still succeed.
+static void testCloseAfterExplicitFinalizeIsIdempotent() {
+  printf("CloseAfterExplicitFinalizeIsIdempotent\n");
+
+  int rc = SQLITE_OK;
+  sqlite3 *db = 0;
+  rc = sqlite3_open(":memory:", &db);
+  assert(rc == SQLITE_OK);
+
+  rc = sqlite3_exec(db, "CREATE TABLE foo (id PRIMARY KEY NOT NULL, a);", 0, 0,
+                    0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_as_crr('foo');", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "INSERT INTO foo VALUES (1, 'x');", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "SELECT crsql_db_version();", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+
+  // Explicit finalize (the host's before_disconnect path) ...
+  rc = sqlite3_exec(db, "SELECT crsql_finalize();", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  // ... then close, which finalizes a second time via the trace hook.
+  rc = sqlite3_close(db);
+  if (rc != SQLITE_OK) {
+    sqlite3_stmt *s = sqlite3_next_stmt(db, NULL);
+    printf("\tclose returned %d; first unfinalized: %s\n", rc,
+           s ? sqlite3_expanded_sql(s) : "(none)");
+  }
+  assert(rc == SQLITE_OK);
+
+  printf("\t\e[0;32mSuccess\e[0m\n");
+}
+
 void crsqlTestSuite() {
   printf("\e[47m\e[1;30mSuite: crsql\e[0m\n");
 
@@ -672,6 +782,9 @@ void crsqlTestSuite() {
   testLamportCondition();
   noopsDoNotMoveClocks();
   testPullingOnlyLocalChanges();
+  testCloseReleasesCrsqlStmts();
+  testCloseReleasesWithoutChangesQuery();
+  testCloseAfterExplicitFinalizeIsIdempotent();
 
   // testIdempotence();
   // testColumnAdds();
