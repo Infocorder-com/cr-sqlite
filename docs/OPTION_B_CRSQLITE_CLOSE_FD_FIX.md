@@ -553,3 +553,67 @@ Add **B1**: one line in `changesDisconnect` (`core/src/changes-vtab.c`) — `crs
 **Skip A1/A2 entirely** — in the silicon_brain build, Exqlite's `sqlite3.c` (not cr-sqlite's) runs every
 close, so amalgamation patches never execute in production (§10.1). Prove it with the §10.4 two-tier
 tests; the app's pool_size-5 FD test is the real acceptance gate.
+
+---
+
+## 11. Implementation plan & status (re-analysis of §10, then build)
+
+This section is the actual work log for landing the fix in this repo. It starts from an
+**independent re-verification** of §10's claims against the sources, records **one deliberate divergence
+from §10 (B1 is deferred, not shipped alongside E1)**, and tracks implementation status.
+
+### 11.1 Re-verification of §10 (done — all confirmed, plus one new hazard)
+
+Re-checked directly against the checked-in code:
+
+- **E1 mechanism — confirmed.** `sqlite3Close` dispatches `SQLITE_TRACE_CLOSE` at `sqlite3.c:176119`,
+  *before* `disconnectAllVtab` (176124) and the `connectionIsBusy` gate (176138). `connectionIsBusy`
+  reads `db->pVdbe`; `sqlite3_finalize` unlinks from exactly that list. Trace is compiled in;
+  `sqlite3_trace_v2` + `SQLITE_TRACE_CLOSE` are reachable from `crsqlite.c` (via `sqlite3ext.h`), and
+  `crsql_finalize` is declared in `ext-data.h` (already included). ✅
+- **Q2 (trace slot free) — consistent with §10.2.** cr-sqlite registers the CLOSE-only mask; setting a
+  non-CLOSE-free `mTrace` adds no per-statement cost because the STMT/PROFILE/ROW bits stay clear. ✅
+- **NEW hazard found for B1 (this is the divergence).** The `pExtData` statements are prepared **once,
+  eagerly**, in `crsql_newExtData` (`ext-data.c:19`), and consumers use them **without a lazy re-prepare
+  guard** — e.g. `crsql_fetchPragmaSchemaVersion` (`ext-data.c:210`) steps `pPragmaSchemaVersionStmt`
+  directly. So `crsql_finalize` is **only safe to call when the connection is truly going away** (its own
+  header comment says as much). E1 satisfies this — `SQLITE_TRACE_CLOSE` fires *only* from
+  `sqlite3_close`. **B1 does not obviously satisfy it:** `changesDisconnect` runs on *every* vtab
+  disconnect. For the *eponymous* `crsql_changes`, disconnect is close-only (`disconnectAllVtab`'s
+  `pMod->pEpoTab` loop at `sqlite3.c:176080`; eponymous connect is created-once at `152359`), so B1 is
+  *probably* safe **today**. But it silently depends on the invariant "no one ever does
+  `CREATE VIRTUAL TABLE … USING crsql_changes` (a schema-resident instance, which disconnects
+  mid-session on schema changes) and the module is never re-registered." If that invariant is ever
+  violated, B1 finalizes live statements mid-session → next CRR op steps a NULL stmt → `SQLITE_MISUSE`
+  / silent corruption — **worse than the leak it guards.**
+
+### 11.2 Decision (divergence from §10.3/§10.6, with reason)
+
+- **Ship E1 now.** Unambiguously safe (fires only at real close), covers **all** teardown paths
+  regardless of whether `crsql_changes` was queried, and needs no amalgamation patch. This is the fix.
+- **Defer B1.** Its only marginal benefit over E1 is surviving a *future* Exqlite trace-slot owner, and
+  only for connections that queried `crsql_changes` — a hypothetical. Against that sits the mid-session
+  finalize hazard in §11.1. Net: not worth shipping blind. **Revisit B1 only if** (a) the app actually
+  enables Exqlite tracing on these pools, *and* (b) we first make the statement consumers re-prepare
+  lazily (guard each use with `if (stmt == 0) prepare`), which would make `crsql_finalize` safe to call
+  any time and retire the hazard. That lazy-re-prepare change is the more robust underlying fix and is
+  the right prerequisite for B1.
+- **A1/A2 stay dropped** (§10.1 — patch code that doesn't run in prod). **C1 dropped. D is the existing
+  Elixir workaround.**
+- **`crsql_build_id()` provenance marker (§10.4): planned as the immediate follow-up** to E1, once the
+  E1 mechanism is green here. Low risk (a scalar SQL function returning a compile-time string); it's how
+  the app confirms the E1-carrying NIF actually shipped, especially on Windows.
+
+### 11.3 Implementation checklist
+
+- [ ] **E1** — `crsql_close_trace_hook` + `sqlite3_trace_v2(db, SQLITE_TRACE_CLOSE, …)` registration in
+      `sqlite3_crsqlite_init` (`core/src/crsqlite.c`).
+- [ ] **Tier-1 tests** (`core/src/crsqlite.test.c`, wired into `crsqlTestSuite`):
+      (a) use CRR + query `crsql_changes` → `sqlite3_close` (v1) → `SQLITE_OK`;
+      (b) **write-only** (CRR writes + `crsql_db_version`, *no* `crsql_changes` query) → v1 close →
+      `SQLITE_OK` (proves E1 fires where B1 would not);
+      (c) explicit `SELECT crsql_finalize()` *then* close → `SQLITE_OK` (idempotency / double-finalize).
+- [ ] Prove **red→green**: run `make test` with tests but no E1 (expect `SQLITE_BUSY`), then with E1
+      (expect `SQLITE_OK`). Then `make asan` (finalize-inside-trace trips no debug assertion).
+- [ ] **`crsql_build_id()`** scalar function (follow-up).
+- [ ] Hand off to app repo for Tier-2 (pool_size-5 FD test — the real acceptance gate, §10.4).
