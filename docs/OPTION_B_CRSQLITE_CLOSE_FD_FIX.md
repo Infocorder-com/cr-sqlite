@@ -694,3 +694,59 @@ this repo's scope, but it's the known complement if the Tier-2 gate doesn't full
 **Landmine recorded app-side** (`CR-SQLITE-DATA-SYNC.md` §14.9.B): E1's `SQLITE_TRACE_CLOSE` hook is now
 the *sole* FD-leak protection, so enabling Exqlite query tracing on these pools would silently clobber it
 and resurrect the leak. Documented so it isn't discovered the hard way.
+
+---
+
+## 12. Pre-deployment skeptical review (this repo's changes)
+
+An adversarial pass over the E1 + `crsql_build_id()` changes, assuming we broke something. The C/Rust
+code held up under the scary scenarios; the residual risk is entirely at the integration boundary
+(unverifiable in this repo) and is called out as app-side must-checks.
+
+### 12.1 Actively audited and found SAFE (with evidence)
+
+- **Rollback/commit fired *during* close does NOT touch the finalized statements.** `sqlite3Close` calls
+  `sqlite3VtabRollback` (`sqlite3.c:176133`) after our trace hook (176119) has NULLed the pExtData
+  statements. But `crsql_commit_hook`/`crsql_rollback_hook` bodies (`rs/core/src/commit.rs`,
+  `commit_or_rollback_reset`) touch only pExtData *fields* (`pendingDbVersion`, `seq`, the maps) — **never
+  the prepared statements**. No use-after-NULL. (Our `:memory:` tests never open a txn at close, so they
+  would NOT have caught this — the code is safe by construction, not by luck.)
+- **Idempotent finalize across up to three callers** — the trace hook, `crsql_freeExtData` at final
+  teardown, and the host's explicit `before_disconnect`. `crsql_finalize` finalizes + NULLs; `crsql_free`
+  re-finalizes NULLs (`sqlite3_finalize(NULL)` no-op) then frees. Test (c) exercises double-finalize.
+- **`crsql_build_id()` string is memory-safe.** `result_text_static` passes `text.len()` explicitly with
+  `Destructor::STATIC` (`nostd.rs:852`), so the non-NUL-terminated Rust `concat!` `&'static str` is fine —
+  identical pattern to the existing `crsql_sha`.
+- **Trace callback ABI is correct.** Signature `int(unsigned,void*,void*,void*)` matches
+  `sqlite3ext.h:283`; the dispatch `db->trace.xV2(SQLITE_TRACE_CLOSE, db->pTraceArg, db, 0)` (176120)
+  passes our `pExtData` as arg2 (`pCtx`) — which is what we read. Confirmed against the amalgamation.
+- **No new SQLite-version floor.** `trace_v2` needs host SQLite >= 3.14; cr-sqlite **already** requires
+  >= 3.20 via `sqlite3_prepare_v3` (`ext-data.c`). So the higher api-routines struct index of `trace_v2`
+  introduces **no** new ABI/minimum-version risk beyond what cr-sqlite already assumes.
+- **Thread-safety.** pExtData is per-connection; the hook runs under `db->mutex` (held by `sqlite3Close`).
+- **Build hygiene.** Clean rebuild (`rm dist/test`), no warnings on `crsqlite.c`, genuine red→green
+  (`SQLITE_BUSY` without E1 → `SQLITE_OK` with it); `make valgrind` = 0 errors. No stale-artifact green.
+
+### 12.2 Residual risks — all at the integration boundary (MUST verify app-side)
+
+1. **LINCHPIN — Exqlite's amalgamation must have tracing compiled in.** Everything here was verified
+   against *cr-sqlite's* bundled `sqlite3.c`, but §10.1 established that **Exqlite's** `sqlite3.c` runs the
+   actual close. If Exqlite is built with `SQLITE_OMIT_TRACE`, E1 is a **silent no-op** and **no Tier-1
+   test here can detect it**. → **Action:** grep Exqlite's build flags / `sqlite3_nif` Makefile for
+   `SQLITE_OMIT_TRACE` (expected absent — it also breaks Exqlite's own trace feature); ultimately the
+   Tier-2 FD test is the gate that would expose it.
+2. **Nothing here observes a real FD release, the v2 path, or deferred completion.** All Tier-1 tests use
+   `:memory:` + `sqlite3_close` **v1**. Production is a real file + `close_v2` + GC-deferred completion
+   (§11.x). Tier-1 green is **necessary, not sufficient** — do not read it as "prod proven."
+3. **Single trace slot (already landmined app-side, §14.9.B).** Enabling Exqlite query tracing on these
+   pools clobbers E1 and silently resurrects the leak.
+4. **`crsql_build_id()` depends on the app build exporting `CRSQLITE_COMMIT_SHA`.** Effectively
+   guaranteed (sha.rs `env!` fails to compile otherwise, and `crsql_sha` already relies on it), but
+   confirm the app's `build_crsqlite_static.sh` sets it.
+
+### 12.3 Honest scope statement
+
+What is proven in THIS repo: the E1 *mechanism* (a `SQLITE_TRACE_CLOSE` hook finalizes cr-sqlite's
+statements before the busy check, flipping v1-close from BUSY to OK) and the `crsql_build_id()` marker.
+What is NOT proven here and gates real deployment: that Exqlite's runtime SQLite honors it and that real
+FDs return to baseline post-GC at pool_size 5 (Tier-2, §10.4).

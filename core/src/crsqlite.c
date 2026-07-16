@@ -47,11 +47,21 @@ static void closeHook(void *pUserData, sqlite3 *db) {
 // leaking the handles until the process exits.
 //
 // Unlike libsql_close_hook this uses only the stock, public sqlite3_trace_v2
-// API, so it works in every build (loadable extension, static link, WASM) and
-// regardless of which SQLite amalgamation actually runs the close. It only ever
-// touches cr-sqlite's own statements (crsql_finalize is idempotent and NULLs
-// each pointer), runs under the connection mutex sqlite3_close already holds,
-// and requests ONLY the CLOSE event, so there is no per-statement trace
+// API, so it works whether cr-sqlite is a loadable extension or statically
+// linked, and regardless of which SQLite amalgamation actually runs the close
+// (e.g. the host's copy, not cr-sqlite's bundled one).
+//
+// Preconditions (silent no-op / FDs leak as before if not met):
+//   - the SQLite running the close must have tracing compiled in (the default;
+//     disabled only by SQLITE_OMIT_TRACE), and be >= 3.14 for SQLITE_TRACE_CLOSE
+//     -- already implied by cr-sqlite's use of sqlite3_prepare_v3 (>= 3.20);
+//   - no other code registers a sqlite3_trace_v2 callback on the same
+//     connection -- there is ONE trace slot per connection, so a later host
+//     trace registration would clobber this hook.
+//
+// It only ever touches cr-sqlite's own statements (crsql_finalize is idempotent
+// and NULLs each pointer), runs under the connection mutex sqlite3_close already
+// holds, and requests ONLY the CLOSE event, so there is no per-statement trace
 // overhead. See docs/OPTION_B_CRSQLITE_CLOSE_FD_FIX.md (E1).
 static int crsql_close_trace_hook(unsigned traceType, void *pCtx, void *p,
                                   void *x) {
