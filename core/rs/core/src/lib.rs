@@ -388,6 +388,23 @@ pub extern "C" fn sqlite3_crsqlcore_init(
 
     let rc = db
         .create_function_v2(
+            "crsql_build_id",
+            0,
+            sqlite::UTF8 | sqlite::INNOCUOUS | sqlite::DETERMINISTIC,
+            None,
+            Some(x_crsql_build_id),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return null_mut();
+    }
+
+    let rc = db
+        .create_function_v2(
             "crsql_increment_and_get_seq",
             0,
             sqlite::UTF8 | sqlite::INNOCUOUS,
@@ -1206,6 +1223,14 @@ unsafe extern "C" fn x_crsql_version(
     _argv: *mut *mut sqlite::value,
 ) {
     ctx.result_int64(consts::CRSQLITE_VERSION as i64);
+}
+
+unsafe extern "C" fn x_crsql_build_id(
+    ctx: *mut sqlite::context,
+    _argc: i32,
+    _argv: *mut *mut sqlite::value,
+) {
+    ctx.result_text_static(sha::BUILD_ID);
 }
 
 unsafe extern "C" fn x_free_connection_ext_data(data: *mut c_void) {

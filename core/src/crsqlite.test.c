@@ -772,6 +772,31 @@ static void testCloseAfterExplicitFinalizeIsIdempotent() {
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
+// crsql_build_id() is the fork's build-provenance marker (see sha.rs / §10.4).
+// Its presence + value let the host confirm the E1-carrying NIF actually shipped.
+static void testBuildIdReportsFeatureMarker() {
+  printf("BuildIdReportsFeatureMarker\n");
+
+  int rc = SQLITE_OK;
+  sqlite3 *db = 0;
+  rc = sqlite3_open(":memory:", &db);
+  assert(rc == SQLITE_OK);
+
+  sqlite3_stmt *pStmt = 0;
+  rc = sqlite3_prepare_v2(db, "SELECT crsql_build_id()", -1, &pStmt, 0);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_step(pStmt);
+  assert(rc == SQLITE_ROW);
+  const char *buildId = (const char *)sqlite3_column_text(pStmt, 0);
+  assert(buildId != 0);
+  // The feature tag must be present so the host can verify the FD-close fix.
+  assert(strstr(buildId, "e1-fd-close") != 0);
+  sqlite3_finalize(pStmt);
+
+  assert(crsql_close(db) == SQLITE_OK);
+  printf("\t\e[0;32mSuccess\e[0m\n");
+}
+
 void crsqlTestSuite() {
   printf("\e[47m\e[1;30mSuite: crsql\e[0m\n");
 
@@ -785,6 +810,7 @@ void crsqlTestSuite() {
   testCloseReleasesCrsqlStmts();
   testCloseReleasesWithoutChangesQuery();
   testCloseAfterExplicitFinalizeIsIdempotent();
+  testBuildIdReportsFeatureMarker();
 
   // testIdempotence();
   // testColumnAdds();

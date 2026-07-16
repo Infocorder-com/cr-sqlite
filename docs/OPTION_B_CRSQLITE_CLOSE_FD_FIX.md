@@ -4,9 +4,9 @@
 and possibly the **Exqlite** NIF. This doc is self-contained; it does not assume access to the
 `silicon_brain` app repo, though it references it for context.
 
-**Status:** **E1 implemented & Tier-1-verified in this repo** (red→green in `make test` + `make valgrind`
-clean — see §11.4); the chosen approach is **E1**, not §3's Approach A (see §10–§11 for why). Tier-2
-app-side validation (pool_size-5 FD test) and the `crsql_build_id()` provenance marker are still pending.
+**Status:** **E1 + `crsql_build_id()` implemented & Tier-1-verified in this repo** (red→green in
+`make test` + `make valgrind` clean — see §11.4); the chosen approach is **E1**, not §3's Approach A
+(see §10–§11 for why). Only Tier-2 app-side validation (pool_size-5 FD test) remains.
 This is the "proper fix" for a long-standing, documented file-descriptor leak (`silicon_brain`
 `docs/CR-SQLITE-DATA-SYNC.md` §14.9 / §14.9.B). An Elixir-side workaround exists (run the per-project
 pool at size 1 in tests, 5 in prod), so this is not urgent — but it's the only way to make the leak
@@ -625,8 +625,15 @@ Re-checked directly against the checked-in code:
       *unrelated* suites — `rows_impacted`, `sandbox`, `rust_integration` — and reproduces identically on
       a **clean tree with E1 stashed**. So it is a pre-existing latent issue in the vendored Rust bundle,
       unrelated to E1; valgrind stands in as the mem-safety oracle. Worth filing separately.)
-- [ ] **`crsql_build_id()`** scalar function (immediate follow-up).
-- [ ] Hand off to app repo for Tier-2 (pool_size-5 FD test — the real acceptance gate, §10.4).
+- [x] **`crsql_build_id()`** scalar function — registered in the Rust bundle beside `crsql_sha` /
+      `crsql_version` (`rs/core/src/lib.rs`; marker string in `rs/core/src/sha.rs`), so it rides both the
+      static auto-extension and loadable-extension paths. Returns `"e1-fd-close <commit-sha>"`. Its mere
+      presence proves the fork build (upstream has no such function → app reads "absent"); the `e1-fd-close`
+      tag confirms the FD-close feature set. Test `testBuildIdReportsFeatureMarker` asserts the tag is
+      present. **Verified:** returns e.g. `e1-fd-close 192d4807…`; `make test` green; `make valgrind` clean.
+- [ ] Hand off to app repo for Tier-2 (pool_size-5 FD test — the real acceptance gate, §10.4). The app is
+      already wired to consume `crsql_build_id()` (§10.4) — it lights up automatically now the function
+      exists.
 
 ### 11.4 Verification results (this repo)
 
