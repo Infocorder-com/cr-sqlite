@@ -750,3 +750,33 @@ What is proven in THIS repo: the E1 *mechanism* (a `SQLITE_TRACE_CLOSE` hook fin
 statements before the busy check, flipping v1-close from BUSY to OK) and the `crsql_build_id()` marker.
 What is NOT proven here and gates real deployment: that Exqlite's runtime SQLite honors it and that real
 FDs return to baseline post-GC at pool_size 5 (Tier-2, §10.4).
+
+### 12.4 App-side verification of §12.2 must-checks (done in `silicon_brain`)
+
+Both integration-boundary linchpins the cr-sqlite review handed back are **satisfied** — verified against
+the app build scripts:
+
+- **§12.2 #1 (LINCHPIN — trace compiled into the runtime SQLite): PASS.** `scripts/build_crsqlite_static.sh`
+  compiles **Exqlite's** `sqlite3.c` (the amalgamation that runs the close, per §10.1) with a flag list that
+  contains **no `SQLITE_OMIT_TRACE`** (only `SQLITE_OMIT_DEPRECATED`); Exqlite's own headers merely *mention*
+  the macro in a doc comment. So `sqlite3_trace_v2`/`SQLITE_TRACE_CLOSE` are live in the shipped NIF — E1 is
+  not a silent no-op. (Final proof still the Tier-2 FD gate, as noted.)
+- **§12.2 #4 (`CRSQLITE_COMMIT_SHA` exported): PASS — and not a new dependency.** `build_crsqlite_static.sh`
+  builds the archive via cr-sqlite's **`make static`**, and cr-sqlite's `core/Makefile` exports
+  `CRSQLITE_COMMIT_SHA = $(shell git rev-parse HEAD)` on the static target. The *old* pinned ref already uses
+  `env!("CRSQLITE_COMMIT_SHA")` (for `crsql_sha`) and builds cleanly today, so bumping `CRSQLITE_REF` to the
+  E1 commit will not break the build; `crsql_build_id()` compiles and returns `e1-fd-close <sha>`.
+
+**Remaining app-side steps to close Tier-2** (unchanged by the above — just now unblocked):
+
+1. **Bump `CRSQLITE_REF`** in `scripts/build_crsqlite_static.sh` from `4d9aa604…` → the E1 fork HEAD
+   (`3229339a…`), and rebuild the static NIF per-OS.
+2. **Confirm E1 actually shipped AND is the live provider**, per-platform, from the boot provenance log
+   (relocated to fire unconditionally at boot): expect `mode=static (NIF auto-extension)` **and**
+   `build_id=e1-fd-close 3229339a…`. If a platform shows `mode=runtime load_extension`, it is serving
+   cr-sqlite from the upstream **fallback** (`priv/native/crsqlite.*`, no E1) and E1 is NOT live there —
+   a cross-platform risk (highest on Windows, lower on macOS, lowest on Linux; see app memory).
+3. **Run the Tier-2 gate**: `spoke_project_manager_large_pool_test.exs` at pool_size 5 — expect
+   `after_terminate ≈ base` **after** the existing GC+settle (do not read a synchronous residual as failure;
+   §11.4). If it does not converge post-GC, the Exqlite finalize-before-close complement (§11.4 open
+   question) is the next lever.
