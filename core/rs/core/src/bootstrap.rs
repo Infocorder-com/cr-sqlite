@@ -1,10 +1,70 @@
-use core::ffi::{c_char, c_int};
+use core::ffi::{c_char, c_int, c_void};
 
+use crate::c::{crsql_finish_ext_data_init, crsql_initSiteIdExt, crsql_ExtData};
 use crate::{consts, tableinfo::TableInfo};
 use alloc::{ffi::CString, format};
 use core::slice;
 use sqlite::{sqlite3, Connection, Destructor, ResultCode};
 use sqlite_nostd as sqlite;
+
+// silicon_brain Approach B (lazy init): run the deferred DB bootstrap exactly
+// once per connection, on first actual cr-sqlite use — AFTER the page-encryption
+// key (if any) is set. Creates the bookkeeping tables/triggers, loads the site
+// id into ext_data, and prepares the table-dependent statements (via the C
+// crsql_finish_ext_data_init). Guarded by ext_data.bootstrapped so callers can
+// invoke it unconditionally and cheaply.
+#[no_mangle]
+pub extern "C" fn crsql_ensure_bootstrapped(
+    db: *mut sqlite3,
+    ext_data: *mut crsql_ExtData,
+) -> c_int {
+    unsafe {
+        if (*ext_data).bootstrapped != 0 {
+            return ResultCode::OK as c_int;
+        }
+        // Optimistic set BEFORE the work below, so any re-entrant call from a
+        // bootstrapped-guarded entry point sees it as done and does not recurse.
+        (*ext_data).bootstrapped = 1;
+    }
+
+    let rc = crsql_init_peer_tracking_table(db);
+    if rc != ResultCode::OK as c_int {
+        return rc;
+    }
+    let rc = crsql_init_db_versions_table(db);
+    if rc != ResultCode::OK as c_int {
+        return rc;
+    }
+    let mut err_msg: *mut c_char = core::ptr::null_mut();
+    let rc = crsql_maybe_update_db(db, &mut err_msg as *mut *mut c_char);
+    if rc != ResultCode::OK as c_int {
+        return rc;
+    }
+
+    let site_id_buffer =
+        sqlite::malloc((consts::SITE_ID_LEN as usize) * core::mem::size_of::<*const c_char>());
+    let rc = crsql_init_site_id(db, site_id_buffer);
+    if rc != ResultCode::OK as c_int {
+        sqlite::free(site_id_buffer as *mut c_void);
+        return rc;
+    }
+    // Ownership of site_id_buffer transfers to ext_data (freed in crsql_freeExtData).
+    let rc = unsafe { crsql_initSiteIdExt(db, ext_data, site_id_buffer as *mut c_char) };
+    if rc != ResultCode::OK as c_int {
+        return rc;
+    }
+
+    if create_site_id_triggers(db).is_err() {
+        return ResultCode::ERROR as c_int;
+    }
+
+    let rc = unsafe { crsql_finish_ext_data_init(db, ext_data) };
+    if rc != ResultCode::OK as c_int {
+        return rc;
+    }
+
+    ResultCode::OK as c_int
+}
 
 fn uuid() -> [u8; 16] {
     let mut blob: [u8; 16] = [0; 16];

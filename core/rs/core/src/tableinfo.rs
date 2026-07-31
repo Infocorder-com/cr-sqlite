@@ -875,6 +875,15 @@ pub extern "C" fn crsql_ensure_table_infos_are_up_to_date(
     ext_data: *mut crsql_ExtData,
     err: *mut *mut c_char,
 ) -> c_int {
+    // silicon_brain Approach B (lazy init): bootstrap on first use (after key).
+    unsafe {
+        if (*ext_data).bootstrapped == 0 {
+            let rc = crate::bootstrap::crsql_ensure_bootstrapped(db, ext_data);
+            if rc != ResultCode::OK as c_int {
+                return rc;
+            }
+        }
+    }
     let already_updated = unsafe { (*ext_data).updatedTableInfosThisTx == 1 };
     if already_updated {
         return ResultCode::OK as c_int;

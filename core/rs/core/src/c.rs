@@ -74,6 +74,8 @@ pub struct crsql_ExtData {
     pub mergeEqualValues: ::core::ffi::c_int,
     pub timestamp: ::core::ffi::c_ulonglong,
     pub ordinalMap: *mut ::core::ffi::c_void,
+    // silicon_brain Approach B (lazy init) — see ext-data.h.
+    pub bootstrapped: ::core::ffi::c_int,
 }
 
 #[repr(C)]
@@ -110,6 +112,11 @@ extern "C" {
         pExtData: *mut crsql_ExtData,
     ) -> c_int;
     pub fn crsql_newExtData(db: *mut sqlite::sqlite3) -> *mut crsql_ExtData;
+    // silicon_brain Approach B: deferred DB-touching half of ext-data init.
+    pub fn crsql_finish_ext_data_init(
+        db: *mut sqlite::sqlite3,
+        pExtData: *mut crsql_ExtData,
+    ) -> c_int;
     pub fn crsql_initSiteIdExt(
         db: *mut sqlite::sqlite3,
         pExtData: *mut crsql_ExtData,
@@ -271,7 +278,7 @@ fn bindgen_test_layout_crsql_ExtData() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::core::mem::size_of::<crsql_ExtData>(),
-        168usize,
+        176usize,
         concat!("Size of: ", stringify!(crsql_ExtData))
     );
     assert_eq!(

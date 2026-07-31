@@ -122,6 +122,13 @@ pub fn fill_db_version_if_needed(
     ext_data: *mut crsql_ExtData,
 ) -> Result<ResultCode, String> {
     unsafe {
+        // silicon_brain Approach B (lazy init): bootstrap on first use (after key).
+        if (*ext_data).bootstrapped == 0 {
+            let rc = crate::bootstrap::crsql_ensure_bootstrapped(db, ext_data);
+            if rc != ResultCode::OK as c_int {
+                return Err("failed to lazily bootstrap cr-sqlite".to_string());
+            }
+        }
         let rc = crsql_fetchPragmaDataVersion(db, ext_data);
         if rc == -1 {
             return Err("failed to fetch PRAGMA data_version".to_string());

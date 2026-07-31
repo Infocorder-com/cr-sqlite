@@ -15,38 +15,86 @@ void crsql_drop_last_db_versions_map(crsql_ExtData *pExtData);
 // void crsql_init_table_info_vec(crsql_ExtData *pExtData);
 // void crsql_drop_table_info_vec(crsql_ExtData *pExtData);
 
-// The initialization here is incomplete! We need to call crsql_initSiteIdExt after this.
+// silicon_brain Approach B (lazy init): crsql_newExtData is now DB-FREE. It only
+// allocates + zero-initializes the struct and its in-memory maps/vecs. All
+// statement preparation, the crsql_master config read, and the PRAGMA
+// data_version probe are DEFERRED to crsql_finish_ext_data_init(), which
+// crsql_ensure_bootstrapped() calls on first actual use — AFTER the page
+// encryption key (if any) is set and the bookkeeping tables exist. This is what
+// lets sqlite3_crsqlite_init() touch NO database pages at sqlite3_open().
+// We need to call crsql_initSiteIdExt + crsql_finish_ext_data_init after this.
 crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   crsql_ExtData *pExtData = sqlite3_malloc(sizeof *pExtData);
+  if (pExtData == 0) {
+    return 0;
+  }
 
+  pExtData->bootstrapped = 0;
   pExtData->siteId = 0;
+  pExtData->pPragmaSchemaVersionStmt = 0;
+  pExtData->pPragmaDataVersionStmt = 0;
+  pExtData->pSetSyncBitStmt = 0;
+  pExtData->pClearSyncBitStmt = 0;
+  pExtData->pSetSiteIdOrdinalStmt = 0;
+  pExtData->pSelectSiteIdOrdinalStmt = 0;
+  pExtData->pSelectClockTablesStmt = 0;
+  pExtData->dbVersion = -1;
+  pExtData->pendingDbVersion = -1;
+  pExtData->pSetDbVersionStmt = 0;
+  pExtData->seq = 0;
+  pExtData->pragmaSchemaVersion = -1;
+  pExtData->pragmaDataVersion = -1;
+  pExtData->pragmaSchemaVersionForTableInfos = -1;
+  pExtData->pDbVersionStmt = 0;
+  pExtData->tableInfos = 0;
+  pExtData->lastDbVersions = 0;
+  pExtData->ordinalMap = 0;
+  pExtData->rowsImpacted = 0;
+  pExtData->updatedTableInfosThisTx = 0;
+  pExtData->mergeEqualValues = 0;
+  pExtData->timestamp = 0;
+  crsql_init_table_info_vec(pExtData);
+  crsql_init_last_db_versions_map(pExtData);
+  crsql_init_ordinal_map(pExtData);
+
+  return pExtData;
+}
+
+// Deferred DB-touching half of ext-data init: prepare all table-dependent
+// persistent statements + read the crsql_master config + probe PRAGMA
+// data_version. Must be called AFTER the bookkeeping tables exist (i.e. from
+// crsql_ensure_bootstrapped, after crsql_maybe_update_db / init tables). Returns
+// SQLITE_OK on success. Idempotent-safe: it re-finalizes any already-prepared
+// pointers so a double call cannot leak (in practice guarded by ext_data.bootstrapped).
+int crsql_finish_ext_data_init(sqlite3 *db, crsql_ExtData *pExtData) {
+  sqlite3_finalize(pExtData->pPragmaSchemaVersionStmt);
   pExtData->pPragmaSchemaVersionStmt = 0;
   int rc = sqlite3_prepare_v3(db, "PRAGMA schema_version", -1,
                               SQLITE_PREPARE_PERSISTENT,
                               &(pExtData->pPragmaSchemaVersionStmt), 0);
+
+  sqlite3_finalize(pExtData->pPragmaDataVersionStmt);
   pExtData->pPragmaDataVersionStmt = 0;
   rc += sqlite3_prepare_v3(db, "PRAGMA data_version", -1,
                            SQLITE_PREPARE_PERSISTENT,
                            &(pExtData->pPragmaDataVersionStmt), 0);
+
+  sqlite3_finalize(pExtData->pSetSyncBitStmt);
   pExtData->pSetSyncBitStmt = 0;
   rc += sqlite3_prepare_v3(db, SET_SYNC_BIT, -1, SQLITE_PREPARE_PERSISTENT,
                            &(pExtData->pSetSyncBitStmt), 0);
+
+  sqlite3_finalize(pExtData->pClearSyncBitStmt);
   pExtData->pClearSyncBitStmt = 0;
   rc += sqlite3_prepare_v3(db, CLEAR_SYNC_BIT, -1, SQLITE_PREPARE_PERSISTENT,
                            &(pExtData->pClearSyncBitStmt), 0);
 
-  pExtData->pSetSiteIdOrdinalStmt = 0;
-
-  pExtData->pSelectSiteIdOrdinalStmt = 0;
-
+  sqlite3_finalize(pExtData->pSelectClockTablesStmt);
   pExtData->pSelectClockTablesStmt = 0;
-  rc +=
-      sqlite3_prepare_v3(db, CLOCK_TABLES_SELECT, -1, SQLITE_PREPARE_PERSISTENT,
-                         &(pExtData->pSelectClockTablesStmt), 0);
+  rc += sqlite3_prepare_v3(db, CLOCK_TABLES_SELECT, -1, SQLITE_PREPARE_PERSISTENT,
+                           &(pExtData->pSelectClockTablesStmt), 0);
 
-  pExtData->dbVersion = -1;
-  pExtData->pendingDbVersion = -1;
-
+  sqlite3_finalize(pExtData->pSetDbVersionStmt);
   pExtData->pSetDbVersionStmt = 0;
   rc += sqlite3_prepare_v3(
       db,
@@ -56,68 +104,43 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
       "WHERE crsql_db_versions.db_version < excluded.db_version RETURNING db_version",
       -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pSetDbVersionStmt), 0);
 
-  // printf("instantiated pSetDbVersionStmt, rc: %d\n", rc);
-
-  pExtData->seq = 0;
-  pExtData->pragmaSchemaVersion = -1;
-  pExtData->pragmaDataVersion = -1;
-  pExtData->pragmaSchemaVersionForTableInfos = -1;
+  sqlite3_finalize(pExtData->pDbVersionStmt);
   pExtData->pDbVersionStmt = 0;
   rc += sqlite3_prepare_v3(
-      db,
-      "SELECT db_version FROM crsql_db_versions WHERE site_id = ?",
+      db, "SELECT db_version FROM crsql_db_versions WHERE site_id = ?",
       -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pDbVersionStmt), 0);
-  pExtData->tableInfos = 0;
-  pExtData->lastDbVersions = 0;
-  pExtData->ordinalMap = 0;
-  pExtData->rowsImpacted = 0;
-  pExtData->updatedTableInfosThisTx = 0;
-  crsql_init_table_info_vec(pExtData);
-  crsql_init_last_db_versions_map(pExtData);
-  crsql_init_ordinal_map(pExtData);
 
   sqlite3_stmt *pStmt;
-
-
   rc += sqlite3_prepare_v2(db,
                            "SELECT ltrim(key, 'config.'), value FROM "
                            "crsql_master WHERE key LIKE 'config.%';",
                            -1, &pStmt, 0);
-
   if (rc != SQLITE_OK) {
-    crsql_freeExtData(pExtData);
-    return 0;
+    return rc == SQLITE_OK ? SQLITE_ERROR : rc;
   }
 
-  // set defaults!
   pExtData->mergeEqualValues = 0;
-
   while (sqlite3_step(pStmt) == SQLITE_ROW) {
     const unsigned char *name = sqlite3_column_text(pStmt, 0);
     int colType = sqlite3_column_type(pStmt, 1);
 
     if (strcmp("merge-equal-values", (char *)name) == 0) {
       if (colType == SQLITE_INTEGER) {
-        const int value = sqlite3_column_int(pStmt, 1);
-        pExtData->mergeEqualValues = value;
+        pExtData->mergeEqualValues = sqlite3_column_int(pStmt, 1);
       } else {
-        // broken setting...
-        crsql_freeExtData(pExtData);
-        return 0;
+        sqlite3_finalize(pStmt);
+        return SQLITE_ERROR;
       }
-    } else {
-      // unhandled config setting
     }
   }
-
   sqlite3_finalize(pStmt);
+
   int pv = crsql_fetchPragmaDataVersion(db, pExtData);
-  if (pv == -1 || rc != SQLITE_OK) {
-    crsql_freeExtData(pExtData);
-    return 0;
+  if (pv == -1) {
+    return SQLITE_ERROR;
   }
 
-  return pExtData;
+  return SQLITE_OK;
 }
 
 int crsql_initSiteIdExt(sqlite3 *db, crsql_ExtData *pExtData, unsigned char *siteIdBuffer) {

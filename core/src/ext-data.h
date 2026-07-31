@@ -49,9 +49,21 @@ struct crsql_ExtData {
   int mergeEqualValues;
   unsigned long long timestamp;
   void *ordinalMap;
+
+  // silicon_brain Approach B (lazy init): 0 until crsql_ensure_bootstrapped()
+  // has created the bookkeeping tables/triggers AND crsql_finish_ext_data_init()
+  // has prepared the table-dependent statements + read config. This lets
+  // sqlite3_crsqlite_init() be side-effect-free at sqlite3_open(), so cr-sqlite
+  // can be statically auto-registered on a page-encrypted DB whose key is only
+  // set AFTER open. NOTE: mirrored in c.rs (and the layout test there).
+  int bootstrapped;
 };
 
 crsql_ExtData *crsql_newExtData(sqlite3 *db);
+// Deferred DB-touching half of ext-data init (prepares table-dependent
+// statements + reads crsql_master config). Called lazily by
+// crsql_ensure_bootstrapped after the bootstrap tables exist and the key is set.
+int crsql_finish_ext_data_init(sqlite3 *db, crsql_ExtData *pExtData);
 int crsql_initSiteIdExt(sqlite3 *db, crsql_ExtData *pExtData, unsigned char *siteIdBuffer);
 void crsql_freeExtData(crsql_ExtData *pExtData);
 int crsql_fetchPragmaSchemaVersion(sqlite3 *db, crsql_ExtData *pExtData,

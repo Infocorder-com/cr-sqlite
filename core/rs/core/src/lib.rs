@@ -197,15 +197,13 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
-    let rc = crate::bootstrap::crsql_init_peer_tracking_table(db);
-    if rc != ResultCode::OK as c_int {
-        return null_mut();
-    }
-
-    let rc = crate::bootstrap::crsql_init_db_versions_table(db);
-    if rc != ResultCode::OK as c_int {
-        return null_mut();
-    }
+    // silicon_brain Approach B (lazy init): the bookkeeping tables
+    // (crsql_tracked_peers, crsql_db_versions), crsql_maybe_update_db, the
+    // site-id table + triggers, and the table-dependent statement prep are all
+    // DEFERRED to crsql_ensure_bootstrapped() (first actual use). This keeps
+    // sqlite3_crsqlite_init() side-effect-free at sqlite3_open() so cr-sqlite
+    // can be statically auto-registered on a page-encrypted DB whose key is set
+    // AFTER open. See core/src/ext-data.c + bootstrap.rs.
 
     let sync_bit_ptr = sqlite::malloc(mem::size_of::<c_int>()) as *mut c_int;
     unsafe {
@@ -229,13 +227,12 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
-    let rc = crate::bootstrap::crsql_maybe_update_db(db, err_msg);
-    if rc != ResultCode::OK as c_int {
-        return null_mut();
-    }
+    // crsql_maybe_update_db is deferred to crsql_ensure_bootstrapped (lazy init).
 
     // allocate ext data earlier in the init process because we need its
     // pointer to be available for the crsql_update_site_id function.
+    // NOTE: crsql_newExtData is now DB-free (Approach B); the DB-touching half
+    // runs in crsql_finish_ext_data_init via crsql_ensure_bootstrapped.
     let ext_data = unsafe { crsql_newExtData(db) };
     if ext_data.is_null() {
         return null_mut();
@@ -258,31 +255,12 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
-    // TODO: convert this function to a proper rust function
-    // and have rust free:
-    // 1. site_id_buffer
-    // 2. ext_data
-    // automatically.
-
-    let site_id_buffer =
-        sqlite::malloc((consts::SITE_ID_LEN as usize) * mem::size_of::<*const c_char>());
-    let rc = crate::bootstrap::crsql_init_site_id(db, site_id_buffer);
-    if rc != ResultCode::OK as c_int {
-        sqlite::free(site_id_buffer as *mut c_void);
-        unsafe { crsql_freeExtData(ext_data) };
-        return null_mut();
-    }
-
-    let rc = unsafe { crsql_initSiteIdExt(db, ext_data, site_id_buffer as *mut c_char) };
-    if rc != ResultCode::OK as c_int {
-        unsafe { crsql_freeExtData(ext_data) };
-        return null_mut();
-    }
-
-    if let Err(_) = crate::bootstrap::create_site_id_triggers(db) {
-        sqlite::free(site_id_buffer as *mut c_void);
-        return null_mut();
-    }
+    // silicon_brain Approach B (lazy init): site-id table creation + load into
+    // ext_data (crsql_init_site_id / crsql_initSiteIdExt) and the site-id
+    // triggers are deferred to crsql_ensure_bootstrapped(). ext_data.siteId stays
+    // NULL until then; every function that reads it (x_crsql_site_id,
+    // fill_db_version_if_needed, crsql_ensure_table_infos_are_up_to_date) calls
+    // crsql_ensure_bootstrapped() first.
 
     let rc = db
         .create_function_v2(
@@ -442,7 +420,10 @@ pub extern "C" fn sqlite3_crsqlcore_init(
             "crsql_as_crr",
             -1,
             sqlite::UTF8 | sqlite::DETERMINISTIC,
-            None,
+            // silicon_brain Approach B: pass ext_data so x_crsql_as_crr can lazily
+            // bootstrap here (a safe SELECT/DDL context), BEFORE any DML whose
+            // trigger path would otherwise try DDL mid-statement (SQLITE_BUSY).
+            Some(ext_data as *mut c_void),
             Some(x_crsql_as_crr),
             None,
             None,
@@ -717,6 +698,14 @@ unsafe extern "C" fn x_crsql_site_id(
     _argv: *mut *mut sqlite::value,
 ) {
     let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    let db = ctx.db_handle();
+    if (*ext_data).bootstrapped == 0 {
+        let rc = crate::bootstrap::crsql_ensure_bootstrapped(db, ext_data);
+        if rc != ResultCode::OK as c_int {
+            ctx.result_error("failed to bootstrap cr-sqlite");
+            return;
+        }
+    }
     let site_id = (*ext_data).siteId;
     sqlite::result_blob(ctx, site_id, consts::SITE_ID_LEN, Destructor::STATIC);
 }
@@ -783,6 +772,18 @@ unsafe extern "C" fn x_crsql_as_crr(
     };
 
     let db = ctx.db_handle();
+
+    // silicon_brain Approach B (lazy init): bootstrap now, in this SELECT/DDL-safe
+    // context, so the CRR's DML triggers never trigger DDL mid-statement.
+    let ext_data = ctx.user_data() as *mut c::crsql_ExtData;
+    if (*ext_data).bootstrapped == 0 {
+        let rc = crate::bootstrap::crsql_ensure_bootstrapped(db, ext_data);
+        if rc != ResultCode::OK as c_int {
+            ctx.result_error("failed to bootstrap cr-sqlite");
+            return;
+        }
+    }
+
     let mut err_msg = null_mut();
     let rc = db.exec_safe("SAVEPOINT as_crr");
     if rc.is_err() {
