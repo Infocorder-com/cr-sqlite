@@ -54,7 +54,10 @@ fn test_ensure_table_infos_are_up_to_date() {
     .expect("made foo clock");
 
     let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db) };
-    let rc = unsafe { test_exports::c::crsql_initSiteIdExt(raw_db, ext_data, make_site()) };
+    // Lazy-init: crsql_newExtData is DB-free now; bootstrap creates the
+    // bookkeeping tables + loads a site id + prepares statements (was:
+    // crsql_initSiteIdExt, which assumed open eagerly created the tables).
+    let rc = test_exports::bootstrap::crsql_ensure_bootstrapped(raw_db, ext_data);
     assert_eq!(rc, 0);
     test_exports::tableinfo::crsql_ensure_table_infos_are_up_to_date(raw_db, ext_data, err);
 
@@ -351,6 +354,15 @@ fn test_leak_condition() {
     c1.exec_safe("INSERT INTO foo VALUES (1, 2)")
         .expect("inserted into foo");
     c1.exec_safe("UPDATE FOO set b = 3").expect("updated foo");
+    // Lazy-init contract: c2's FIRST cr-sqlite op below is a WRITE to a
+    // pre-existing CRR. cr-sqlite now bootstraps its bookkeeping tables on first
+    // use; if that first use is a write, the bootstrap DDL runs inside the INSERT
+    // trigger and fails with SQLITE_BUSY. So force bootstrap with a cheap read
+    // first (the "read before write-first" caller contract; production wires this
+    // as an after_connect hook). Absent a fork-side pre-statement bootstrap hook,
+    // this line is required for a write-first connection.
+    c2.exec_safe("SELECT crsql_db_version()")
+        .expect("bootstrap c2 before write-first");
     c2.exec_safe("INSERT INTO foo VALUES (2, 3)")
         .expect("inserted into foo");
     c2.exec_safe("CREATE TABLE bar (a)").expect("created bar");

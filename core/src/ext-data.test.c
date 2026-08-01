@@ -10,13 +10,23 @@
 
 int crsql_close(sqlite3 *db);
 
+// Lazy-init (page-encryption coexistence): crsql_newExtData is now DB-free and
+// the bookkeeping tables / site-id / statement prep are deferred to
+// crsql_ensure_bootstrapped (bootstrap.rs). See crsql_ensure_bootstrapped below.
+extern int crsql_ensure_bootstrapped(sqlite3 *db, crsql_ExtData *pExtData);
+
 crsql_ExtData *crsqlExtDataInit(sqlite3 *db, unsigned char *siteIdBuffer) {
   crsql_ExtData *pExtData = crsql_newExtData(db);
   if (pExtData == 0) {
     fprintf(stderr, "crsql_newExtData returned NULL: %s\n", sqlite3_errmsg(db));
     assert(0);
   }
-  int rc = crsql_initSiteIdExt(db, pExtData, siteIdBuffer);
+  // Was: crsql_initSiteIdExt(db, pExtData, siteIdBuffer). With lazy-init the
+  // site-id table does not exist yet at this point, so bootstrap it (which also
+  // loads a site id + prepares the deferred statements). ensure_bootstrapped
+  // allocates its own site-id buffer, so free the caller's here.
+  sqlite3_free(siteIdBuffer);
+  int rc = crsql_ensure_bootstrapped(db, pExtData);
   assert(rc == 0);
   return pExtData;
 }

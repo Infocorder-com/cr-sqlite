@@ -32,7 +32,10 @@ fn test_fetch_db_version_from_storage() -> Result<ResultCode, String> {
     let site_id = get_site_id(raw_db);
 
     let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db) };
-    let rc = unsafe { test_exports::c::crsql_initSiteIdExt(raw_db, ext_data, site_id) };
+    // Lazy-init: bootstrap deferred bookkeeping/site-id/statements on first use
+    // (was: crsql_initSiteIdExt with a pre-created site-id table).
+    let rc = test_exports::bootstrap::crsql_ensure_bootstrapped(raw_db, ext_data);
+    let _ = site_id;
     assert_eq!(rc, 0);
 
     test_exports::db_version::fetch_db_version_from_storage(raw_db, ext_data)?;
@@ -85,7 +88,8 @@ fn test_next_db_version() -> Result<(), String> {
     let db = &c.db;
     let raw_db = db.db;
     let ext_data = unsafe { test_exports::c::crsql_newExtData(raw_db) };
-    let rc = unsafe { test_exports::c::crsql_initSiteIdExt(raw_db, ext_data, make_site()) };
+    // Lazy-init: bootstrap on first use (was: crsql_initSiteIdExt).
+    let rc = test_exports::bootstrap::crsql_ensure_bootstrapped(raw_db, ext_data);
     assert_eq!(rc, 0);
 
     // is current + 1
