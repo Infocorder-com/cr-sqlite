@@ -13,7 +13,31 @@ A component of the [vulcan](https://vlcn.io) project.
 
 `vlcn-io` created `cr-sqlite` (https://github.com/vlcn-io/cr-sqlite) but hasn't maintained it, so `superfly` forked it and has improved on it (https://github.com/superfly/cr-sqlite).
 
-This repository is basically the `superfly` fork (currently with just one non-code difference) but maintained separately in case that repo ever disappears or makes breaking changes.
+> ⚠️ **This repository is NOT a drop-in replacement for the original `vlcn-io` project or the `superfly` fork.**
+
+This repository is an **extension AND SPECIALIZATION** of the `superfly` fork that addresses two specific changes we wanted for [Infocorder](https://infocorder.com)'s hub-and-spoke SQLite sync that do **not** generalize to all use cases. If you just want vanilla cr-sqlite, use `vlcn-io/cr-sqlite` or `superfly/cr-sqlite` instead — this fork deliberately diverges from both. The two changes are:
+
+### 1. Finalize-on-close: release OS file descriptors when a connection closes (already shipped)
+
+Stock cr-sqlite keeps its internal prepared statements (in `crsql_ExtData`) alive for the life of a connection and never finalizes them on close, so — unless the host explicitly calls `SELECT crsql_finalize()` first — `sqlite3_close` / `sqlite3_close_v2` leaves the connection a "zombie" and the OS file handles (`*.db`, `*-wal`, `*-shm`) leak until the process exits. This fork makes cr-sqlite finalize its *own* internal statements as part of connection teardown, so the handles are released without the host having to call `crsql_finalize()` first. It also adds `crsql_build_id()` as a build/provenance marker. See [`docs/OPTION_B_CRSQLITE_CLOSE_FD_FIX.md`](docs/OPTION_B_CRSQLITE_CLOSE_FD_FIX.md).
+
+- **Benefit:** long-lived processes that open and close *many* connections (e.g. a server holding one SQLite database per project/tenant) no longer leak file descriptors, and no app-side `crsql_finalize()` dance is required on every teardown path.
+- **Cost / who should be careful:** it changes connection-teardown behavior (cr-sqlite now hooks close to finalize its cached statements). Hosts that deliberately rely on stock close/finalize semantics, or that already call `crsql_finalize()` themselves, should confirm the new path suits them. And, like any fork change, it makes tracking upstream exactly harder.
+
+### 2. `crsql_changes` table-filter pushdown (about to be made)
+
+Stock cr-sqlite's `crsql_changes` virtual table treats `WHERE "table" = ?` as a *post-scan* filter: it scans the entire `UNION ALL` over **every** table's change-clock and discards non-matching rows afterward, so a table-scoped read costs O(total change rows across the whole database), independent of the target table's size. This fork patches the vtab's `xBestIndex` so a `"table" = ?` (or `"table" IN (...)`) constraint is pushed into the union and prunes the scan to the one matching `<table>__crsql_clock`. See [`docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md`](docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md).
+
+- **Benefit:** bounded table-scoped change reads — O(rows in that table), not O(total). Anything that syncs, backfills, reconciles, audits or inspects *specific* tables via `crsql_changes` stays cheap as the rest of the database grows.
+- **Cost / who should be careful:** the pushed-down predicate is compared *without* TEXT affinity, so the result is **not** byte-identical to stock cr-sqlite for a CRR table whose name is purely numeric — `WHERE "table" = 5` against a table literally named `5` returns rows in stock cr-sqlite but **none** after the pushdown (an intrinsic quirk, present regardless of the `omit` flag). It also needs a planner cost-model tuning. All of Infocorder's table names are ordinary identifiers, so this never bites us; a consumer that names CRR tables with digits and reads them through `crsql_changes` would be affected.
+
+### Especially poor fits for this fork
+
+- You want a **drop-in, binary-compatible** replacement for stock cr-sqlite, or need to **track `vlcn-io` / `superfly` upstream exactly** — this fork intentionally diverges and is maintained for Infocorder's needs, not general parity.
+- You have (or might create) **CRR tables with purely-numeric names** and query them by `"table" = <n>` through `crsql_changes` — change 2 alters those results.
+- You depend on stock cr-sqlite's **connection-close / finalize semantics** — change 1 alters those.
+
+For everyone else, this fork is effectively a superset of `superfly`'s behavior: unfiltered and identifier-named-table `crsql_changes` reads, the on-disk format, the wire/changeset format, and the public API are all unchanged.
 
 ## How to merge in commits from superfly
 

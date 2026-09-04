@@ -134,24 +134,47 @@ recursive CTE, and no `RIGHT`/`FULL` join above the subquery.
    constraint_usage[i].omit = if matches!(col, Some(CrsqlChangesColumn::Tbl)) { 0 } else { 1 };
    ```
 
-   This is the single most important detail, and it is why this change is safe. See
-   [Why `omit = 0`](#why-omit--0) — it buys exact, provably unchanged semantics for the price of one
-   redundant comparison per *returned* row.
+   `omit = 0` is the strictly-safer choice — never worse than `omit = 1` — for the price of one redundant
+   comparison per *returned* row. It does **not**, however, buy exact parity with the pre-patch vtab in
+   every case: see [Why `omit = 0`](#why-omit--0) for the one shape (a numerically-named CRR table) where
+   the pushdown itself diverges regardless of `omit`.
 
-3. **Cost model** — record a `Tbl` bit in `idxNum` and give tbl-constrained plans a distinctly lower
-   `estimatedCost` than the unconstrained tier:
+3. **Cost model** — recording a `Tbl` bit in `idxNum` is *necessary but not sufficient*; the cost
+   **cascade** has to gain a branch that reads it. Recording the bit —
 
    ```rust
    Some(CrsqlChangesColumn::Tbl) => idx_num |= 1,
    ```
 
-   Today the `else` branch reports `2147483647.0` for *both* "no constraints" and "table only". When
-   `crsql_changes` appears in a join and the right-hand side of `"table" = x` depends on another table,
-   SQLite calls `xBestIndex` once with the constraint usable and once without; with identical costs
-   there is nothing to prefer the pushdown, and SQLite may pick the full scan. Give it its own tier
-   (e.g. `estimatedCost = 1000.0`, `estimatedRows = 1000` for tbl-only; scale the
-   `db_version`/`site_id` tiers down proportionally when the tbl bit is also set). The absolute numbers
-   are already hand-picked guesses; only the *ordering* between tiers matters.
+   — does nothing on its own. Today the cascade's terminal `else` reports `estimatedCost = 2147483647.0`
+   for *both* "no usable constraints" and "table only", and setting `idx_num |= 1` leaves that `else`
+   untouched, so a table-only plan **still** costs `2147483647.0`. You must add an explicit branch to the
+   cost cascade that inspects the new bit and assigns the lower tier:
+
+   ```rust
+   // after the db_version / site_id tiers, ahead of the unconstrained fallback:
+   } else if idx_num & 1 != 0 {
+       // table-only: one table's clock, not the whole union
+       estimated_cost = 1000.0;
+       estimated_rows = 1000;
+   } else {
+       estimated_cost = 2147483647.0;
+       // ...
+   }
+   ```
+
+   Why it matters: when `crsql_changes` appears in a join and the right-hand side of `"table" = x`
+   depends on another table, SQLite calls `xBestIndex` once with the constraint usable and once without;
+   with two identical `2147483647.0` costs there is nothing to prefer the pushdown, and SQLite may pick
+   the full scan. A distinctly lower tbl-only tier fixes that. (A plain literal `WHERE "table" = ?` with a
+   bound param pushes down regardless of cost — the cost tier only decides the *join* case.)
+
+   **The combined `tbl + db_version` plan also needs tuning.** When both constraints are usable, `idxNum`
+   is `3` (bit 0 = tbl, bit 1 = db_version) and the cascade currently matches the `db_version` tier
+   **first**, so `"table" = ? AND db_version > ?` is costed as an un-pruned `db_version` scan even though
+   the tbl bit will confine it to one table's clock. Scale the `db_version` / `site_id` tiers **down** when
+   the tbl bit is *also* set (e.g. multiply their cost by a small factor), so the estimate reflects the
+   pruning. The absolute numbers are hand-picked guesses; only the *ordering* between tiers matters.
 
 `xFilter` and `changes_union_query` are untouched. `pExtData.tbl_infos` is untouched — the cursor's
 `tbl_infos.iter().position(...)` lookup and `slab_rowid` bookkeeping keep working exactly as before.
@@ -181,32 +204,45 @@ Only if measurement shows that matters:
   is probably the better investment; the two compose well, since a pruned statement is small and
   table-specific.
 
-## Why `omit = 0`
+## Why `omit = 0` (and the one shape where the pushdown still diverges)
 
-With `omit = 1`, SQLite stops applying `"table" = ?` itself and the vtab becomes solely responsible for
-it. That is *almost* always equivalent, but not exactly:
+Set `omit = 0` for the `table` constraint, so SQLite keeps applying `"table" = ?` itself *in addition to*
+the vtab's pushed-down pruning. This is the safe default — never worse than `omit = 1`. But be precise
+about what it does and does **not** buy, because an earlier draft of this doc overclaimed here.
 
-- `[table]` is declared `TEXT NOT NULL`, so the outer comparison `"table" = ?` applies **TEXT affinity**
-  to the bound value: integer `5` is converted to `'5'` before comparison.
+**It does not buy exact parity with the pre-patch vtab for a numerically-named table.** The divergence
+below is *intrinsic to the pushdown itself* and is present under `omit = 0` and `omit = 1` **alike** —
+`omit = 0` does not fix it:
+
+- `[table]` is declared `TEXT NOT NULL`, so the pre-patch comparison `"table" = ?` applies **TEXT
+  affinity** to the bound value: integer `5` is converted to `'5'` before comparison.
 - SQLite does **not** apply affinity to values handed to `xFilter` — there is no `OP_Affinity` before
   `OP_VFilter` (`core/src/sqlite/sqlite3.c:154596`). The raw value arrives.
-- Inside the union, `tbl` is a bare string literal, an expression with affinity NONE. So `tbl = ?1`
-  compares integer `5` against `'items'` with no conversion.
+- Inside the union, `tbl` is a bare string literal, an expression with affinity NONE. So the pushed-down
+  `tbl = ?1` compares integer `5` against `'5'` with **no** conversion — false — and the arm for a table
+  literally named `5` is pruned *before it emits a row*.
 
-For every realistic table name the two agree (both false, both true). They diverge only for a CRR table
-whose name is numeric — `SELECT ... WHERE "table" = 5` against a table literally named `5` returns rows
-today and would return none with `omit = 1`. Obscure, but `py/correctness/tests/test_crsql_changes_filters.py:75`
-already probes `[table] = 0..4`, so the shape is not hypothetical.
+So `SELECT ... FROM crsql_changes WHERE "table" = 5` against a table named `5` returns its rows in the
+pre-patch vtab and returns **none** after the pushdown. `omit = 0` does not rescue this: the row was
+already dropped inside the union, so SQLite's outer `"table" = 5` re-check (which *would* apply TEXT
+affinity) has nothing left to re-admit. `omit = 0` and `omit = 1` yield the **identical**, diverging
+result set in this case. The shape is not purely hypothetical —
+`py/correctness/tests/test_crsql_changes_filters.py:75` probes `[table] = 0..4` — so a consumer that
+relies on numeric right-hand sides matching numerically-named CRR tables through `crsql_changes` is a
+poor fit for this patch as written.
 
-Leaving `omit = 0` sidesteps the whole question: SQLite keeps applying the constraint with correct
-affinity and collation, the predicate inside the union is a pure *optimization*, and the result set is
-**provably byte-identical** to today in every case, including ones nobody thought of. The cost is one
-redundant integer/string comparison per row that survives the filter — unmeasurable next to the page
-reads it saves.
+**What `omit = 0` does buy:** it is strictly the safer of the two, so there is no reason to prefer
+`omit = 1`. Wherever the pushdown *does* return a row, SQLite still re-applies `"table" = ?` with correct
+TEXT affinity and collation as a belt-and-suspenders check — so any hypothetical case where the vtab's
+pruning were too *loose* is caught by SQLite rather than leaking. The cost is one redundant comparison per
+returned row, unmeasurable next to the page reads the pushdown saves.
 
-If someone later wants `omit = 1`, the affinity semantics can be emulated
-(`tbl = CASE WHEN typeof(?) IN ('integer','real') THEN CAST(? AS TEXT) ELSE ? END`), but that costs
-three bind slots and readability for no measurable gain.
+**For every realistic (identifier) table name there is no divergence at all.** `'items' = 5` is false
+both ways; `'items' = 'items'` is true both ways. The numeric-name case above is the *only* result-level
+difference, and only for callers who name a CRR table with digits. If exact parity for such names is ever
+required, apply TEXT affinity inside the union predicate
+(`tbl = CASE WHEN typeof(?) IN ('integer','real') THEN CAST(? AS TEXT) ELSE ? END`) — that fixes the
+divergence at its source, independent of `omit`, at the cost of three bind slots and readability.
 
 ## Correctness considerations
 
@@ -250,11 +286,16 @@ three bind slots and readability for no measurable gain.
 - **Correctness A/B:** assert equality of the full result set with and without the change, across all
   column types (incl. `NULL` and empty string), a delete sentinel, a pk-only (insert-sentinel) row, a
   composite primary key, a table spanning multiple `db_version`s, `"table" = ?` combined with
-  `db_version > ?` and `site_id IS NOT ?`, and `"table" IN (...)`. With `omit = 0` this should be
-  unconditional, which is the point.
+  `db_version > ?` and `site_id IS NOT ?`, and `"table" IN (...)`. For **identifier** table names this
+  equality holds unconditionally. The one documented exception is a **numerically-named** CRR table with a
+  numeric right-hand side (see [Why `omit = 0`](#why-omit--0)): the pushdown diverges there regardless of
+  `omit`, so either exclude that shape from the A/B or assert the *known* diverging result for it — do not
+  expect equality.
 - **Existing tests:** `py/correctness/tests/test_crsql_changes_filters.py::test_table_filter` already
-  exercises `=` and `!=` on `[table]` (with integer right-hand sides). It must keep passing unchanged.
-  Add a case with a text right-hand side that actually matches a table, and one that matches nothing.
+  exercises `=` and `!=` on `[table]` (with integer right-hand sides). If it asserts that a numeric
+  `[table] = n` matches a numerically-named table, that assertion changes under the pushdown — update it
+  to the new (pruned) result rather than treating the change as a regression. Add a case with a text
+  right-hand side that actually matches a table, and one that matches nothing.
 - **Regression:** existing `db_version`/`site_id`-filtered and unfiltered `crsql_changes` queries, and
   `ORDER BY` consumers, are unchanged.
 
