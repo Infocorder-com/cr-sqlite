@@ -1,10 +1,9 @@
 # Pushing the table filter down in the `crsql_changes` virtual table
 
 **Status:** Proposal / design. Revised after measuring SQLite's actual behaviour against the SQL this
-vtab generates. Measurements were taken with the bundled `core/dist/sqlite3` **shell** (3.42.0) and
-re-checked on 3.50.2; note the statically-*linked* library is a different version (the static bundle's
-bindgen reports SQLITE_VERSION 3.45.0). The pushdown, affinity, and collation semantics relied on here
-are identical across 3.42–3.50, so the version spread does not affect any conclusion.
+vtab generates, using the bundled `core/dist/sqlite3` shell (3.42.0 — the engine this tree actually
+ships) and re-checked on 3.50.2. See
+[Which SQLite is actually in play](#which-sqlite-is-actually-in-play).
 **Area:** `crsql_changes` virtual table — `xBestIndex` / `xFilter`.
 **Compatibility:** No schema change, no wire/format change, no new C ABI. Purely a query-planner
 improvement. Result sets are unchanged for every query **provided** the predicate is emitted as
@@ -333,7 +332,8 @@ init block after the top-level `Halt`, reached once via `Init`/`Goto`:
 **Does the outer term also run per row? Not in the statement this vtab generates.** SQLite's push-down
 *copies* a WHERE term into the subquery arms rather than moving it (`sqlite3ExprDup` in
 `pushDownWhereTerms`), so in principle the original outer copy could be re-evaluated per row. A
-per-row form does reproduce in a *degenerate literal-only* union:
+per-row form does reproduce in a *reduced* union — fewer select-list columns, no `LEFT JOIN`s — which
+does not flatten, leaving an outer co-routine consumer loop:
 
 ```
  28   InitCoroutine 1  0  2
@@ -343,16 +343,26 @@ per-row form does reproduce in a *degenerate literal-only* union:
  39   Goto  0  29
 ```
 
-But that is **not the shape this vtab emits.** The real arms each carry `<table>__crsql_clock`, the
-`__crsql_pks` join, the `crsql_site_id` LEFT JOIN, the `__crsql_del` self-join, and the compound
-`ORDER BY db_vrsn, seq` — which routes the plan through SQLite's compound-`ORDER BY`
-multi-coroutine-merge path. Reproducing the *exact* generated statement, the only `Cast` opcodes land in
-the run-once init block (addr 254/258 with ORDER BY, 195/199 without); there is **no** per-row outer
-`Cast`+`Ne`, and pruning happens entirely at the per-arm `Ne … goto` guard ahead of each `OpenRead`. So
-for the shipping statement the `CAST` is once-per-statement, consistent with the "realistic shape" excerpt
-above. Either way the cost is immaterial (a per-row copy, where it occurs at all, adds at most one opcode
-per *returned* row over bare `tbl = ?`, and returned rows are only the target table's), but the accurate
-description for the vtab's own SQL is "once per statement, in the init block," not "per row."
+But that is **not the shape this vtab emits**, and the difference is not the literals — it is whether the
+subquery flattens. The real arms each carry `<table>__crsql_clock`, the `__crsql_pks` join, the
+`crsql_site_id` LEFT JOIN, and a self-join back onto `<table>__crsql_clock` for the insert sentinel
+(there is no `__crsql_del` table; the fourth join is `t2` on the clock itself). With the full ten-column
+select list, that subquery flattens into the outer query, turning the outer `ORDER BY db_vrsn, seq` into
+a *compound* `ORDER BY` — so SQLite plans it as one co-routine plus sorter **per arm**, merged
+(`InitCoroutine`/`SorterOpen` per arm, then a `Gosub`/`Yield` merge loop). There is no outer co-routine
+consumer loop for a retained term to live in.
+
+Verified by reproducing the exact generated statement for both a 1-arm and a 2-arm union: **every**
+`Cast` lands after the top-level `Halt`, i.e. in the run-once init block, and there is no per-row
+`Cast`+`Ne`. Pruning happens entirely at the per-arm `Ne … goto` guard ahead of each `OpenRead`.
+
+This shape is stable rather than lucky: `idx_str` only ever contributes `WHERE` terms and an `ORDER BY`
+(a user `LIMIT` is applied by SQLite *above* the vtab, never inside the generated SQL), and the
+`ORDER BY` clause is never empty — `changes_best_index` appends `ORDER BY db_vrsn, seq ASC` when the
+user supplies none. Either way the cost would be immaterial (a per-row copy, where it occurs at all,
+adds at most one opcode per *returned* row over bare `tbl = ?`, and returned rows are only the target
+table's), but the accurate description for the vtab's own SQL is "once per statement, in the init
+block," not "per row."
 
 Implement it by mapping `CrsqlChangesColumn::Tbl` to `CAST(tbl AS TEXT)` rather than `tbl`. Nothing else
 changes: still one `?`, still one `argvIndex`, still aligned with `changes_filter`'s positional
@@ -502,6 +512,23 @@ throughout `changes_best_index`, but `CAST(tbl AS TEXT) = ?` is exact, shorter, 
   `pk`-index access path would require broader vtab changes.
 - No change to `crsql_changes` columns, the clock schema, or the merge/apply path.
 - Statement caching for `xFilter` is called out as adjacent, not included.
+
+## Which SQLite is actually in play
+
+`core/src/sqlite/sqlite3.c` (`SQLITE_VERSION 3.42.0`) is the **only** SQLite implementation in this tree.
+It is what `core/dist/sqlite3` is built from and what both the loadable extension and the static bundle
+compile against, so the measurements in this document are on the shipping engine rather than a proxy.
+
+The `3.45.0` at `core/rs/sqlite-rs-embedded/sqlite3_capi/deps/sqlite3.h` is **not** a linked library —
+that directory holds headers only, `sqlite3_capi/wrapper.h` includes just `deps/sqlite3ext.h`, and the
+crate compiles no amalgamation. The version there only shapes the Rust FFI *declarations* bindgen emits.
+
+It is worth knowing for an unrelated reason. For a loadable extension, `sqlite3ext.h` defines the
+`sqlite3_api_routines` dispatch struct, so generating bindings from a **newer** header than the engine
+actually in use means a function added after the engine's version would be dispatched past the end of the
+host's struct. This is benign today — the struct is append-only and nothing here calls a post-3.42
+function — and both APIs this document suggests are comfortably older: `sqlite3_vtab_collation` (3.37)
+and `sqlite3_vtab_in` (3.38). Check that floor before reaching for anything newer.
 
 ## Note on reproducing this locally
 
