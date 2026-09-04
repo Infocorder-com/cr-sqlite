@@ -555,7 +555,7 @@ Option 1 is the right first move. Revisit only if a spot-check shows one of the 
 This was downgraded to "drop" on the grounds that `sqlite3_vtab_collation` has no callable wrapper and
 adding one meant forking a submodule owned by the unmaintained `vlcn-io` upstream. That premise no
 longer holds: a fork of `superfly/sqlite-rs-embedded` already exists under this org, and the submodule
-is being repointed at it regardless (see [Note on reproducing this locally](#note-on-reproducing-this-locally)).
+is being repointed at it regardless (see [Building locally](#building-locally-and-the-toolchain-floor)).
 Adding a wrapper alongside the existing `pub fn vtab_distinct(index_info: *mut index_info)` is then the
 four lines it originally looked like:
 
@@ -594,32 +594,77 @@ host's struct. This is benign today — the struct is append-only and nothing he
 function — and both APIs this document suggests are comfortably older: `sqlite3_vtab_collation` (3.37)
 and `sqlite3_vtab_in` (3.38). Check that floor before reaching for anything newer.
 
-## Note on reproducing this locally
+## Building locally, and the toolchain floor
 
-`cd core && make loadable` fails **in the analysis environment used for this document**, and the
-attribution matters. `sqlite3_capi/src/lib.rs` carries `#![feature(concat_idents)]`, removed in Rust
-1.90 — a hard error on any toolchain. The crates pin `nightly-2023-10-05` in `rust-toolchain.toml`, but
-that machine has no `rustup`, so the pins are inert and the system stable compiler (1.95.0) is used.
-The production static build is **not** broken this way: it pins a nightly explicitly
-(`SB_CRSQLITE_NIGHTLY` in `build_crsqlite_static.sh`) and `sed`-deletes the `concat_idents` gate. The
-upside below is therefore not "unbreak the build" — it is **dropping the nightly requirement and the
-`sed` workarounds**, which is worthwhile on its own but separable from this pushdown.
+**This builds.** Verified on 2026-09-04, producing `core/dist/crsqlite.so`:
 
-**Sequence it *after* the pushdown, not before.** The pushdown builds fine on the existing pinned
-nightly and has no dependency on this port: the `vtab_collation` wrapper needs only the submodule pin
-(already landed), and `stable_trap` is not linked unless `core/rs/bundle/Cargo.toml` adds it. Porting
-first would entangle a three-platform toolchain migration — panic handling, `eh_personality`, linking,
-with Windows/MinGW the long pole — with a vtab logic change in one rebuild, making a cross-platform
-failure hard to bisect.
+```bash
+cd core
+export PATH="$HOME/.cargo/bin:$PATH"   # rustup proxies ahead of any asdf shims
+export RUSTUP_TOOLCHAIN=nightly        # must be >= 1.93 — see below
+make loadable
+```
 
-The fix exists upstream, and is proven — but it is **not** on `superfly/cr-sqlite`'s `main`, which still
-pins the same `aba5628` submodule commit we do, still points `.gitmodules` at `vlcn-io`, and still
-carries every nightly gate. The stable-rust work lives on the unmerged branch
+```
+sqlite> SELECT crsql_version(), crsql_build_id();
+170000|e1-fd-close b8d8e4a3649941381fb19994af2bacc1d9b4bb1b
+```
+
+### The toolchain bump is mandatory, not deferrable
+
+The submodule pin at `a8e12fa` **cannot** be built with `nightly-2023-10-05`. This is not a preference
+and not a local-environment artifact; it is a hard floor, and it was measured:
+
+- `rustc-hash v2.1.3`, pulled in transitively by `bindgen 0.72.1`, "requires rustc 1.77 or newer, while
+  the currently active rustc version is 1.75.0-nightly".
+- More fundamentally, pinning that dependency down only exposes the real wall: `sqlite_nostd` fails with
+  five `E0658`s — `use of unstable library feature 'error_in_core'` and `'vec_into_raw_parts'`.
+  `1872f70` **removed** those `#![feature]` gates because both APIs are stable in 1.93. On an older
+  toolchain the code cannot compile at all.
+- `sqlite-rs-embedded/rust-toolchain.toml` declares `channel = "1.93.0"` and means it.
+
+So the floor is **Rust ≥ 1.93**. The cheapest way to clear it is not the stable-rust port: bump
+`SB_CRSQLITE_NIGHTLY` to any nightly ≥ 1.93 and change **no code**. Verified on `1.97.0-nightly`.
+cr-sqlite's own `#![feature]` gates keep working because it is still a nightly.
+
+**Correction to an earlier version of this document.** It claimed the stable-rust work was "separable
+from this pushdown" and could be sequenced afterwards. That is only half right, and the wrong half was
+load-bearing:
+
+- The **stable-rust port** (dropping nightly entirely) *is* separable, and sequencing it after the
+  pushdown is correct — it is a three-platform toolchain migration touching panic handling,
+  `eh_personality` and linking, with Windows/MinGW the long pole, and entangling it with a vtab logic
+  change in one rebuild makes a cross-platform failure hard to bisect.
+- The **toolchain bump** is *not* separable. It is already forced by the submodule pin on `main`, and
+  it must land before the next build of any kind, pushdown or not.
+
+The `rust-toolchain.toml` files in `core/rs/{core,bundle,bundle_static,fractindex-core,integration_check}`
+still say `nightly-2023-10-05` and are now actively misleading. Repin them in the same commit.
+
+### Lockfile hazards
+
+- `core/rs/bundle_static/Cargo.lock` must move `bindgen 0.68.1 -> 0.72.1`; the new submodule's
+  `Cargo.toml` requires it. The file stays at lockfile `version = 3`, so it remains readable by older
+  cargo.
+- **Any cargo invocation with a modern toolchain rewrites lockfiles to `version = 4`**, which older
+  cargo rejects outright (`lock file version 4 requires -Znext-lockfile-bump`). Put the intended
+  toolchain on `PATH` *before* running anything, and check `git diff` on `Cargo.lock` afterwards. This
+  bit during the work that produced this document.
+
+### Historical note
+
+The original blocker was different: `sqlite3_capi/src/lib.rs` carried `#![feature(concat_idents)]`,
+removed in Rust 1.90 and therefore a hard error on any newer toolchain. The production static build was
+never broken this way — it pins a nightly explicitly and `sed`-deletes that gate. The pin to `a8e12fa`
+removes the gate at the source, so that `sed` is now a no-op; confirm it does not *assert* the pattern
+was found, or it will fail on a pattern that no longer exists.
+
+### The deferred stable-rust port
+
+The recipe is proven and lives on `superfly/cr-sqlite`'s unmerged branch
 `gorbak/replace-submodule-with-subrepo` (`f347c8d9`, 2026-01-27), paired with
-`superfly/sqlite-rs-embedded` `1872f70`. Verified locally: with that submodule, `sqlite3_capi`,
-`sqlite3_allocator`, `sqlite_nostd` and `crsql_core` all build on stable 1.95.
-
-The recipe, from `f347c8d9`:
+`superfly/sqlite-rs-embedded` `1872f70`. It is **not** on superfly's `main`, which still pins
+`aba5628`, still points `.gitmodules` at `vlcn-io`, and still carries every nightly gate.
 
 | File | Change |
 |---|---|
@@ -631,8 +676,12 @@ The recipe, from `f347c8d9`:
 | 5 × `rust-toolchain.toml` | repin off `nightly-2023-10-05` |
 
 The `eh_personality` step is the non-obvious one: rather than declaring a lang item (nightly-only), it
-defines the symbol the linker asks for directly.
+defines the symbol the linker asks for directly. Verified separately: with the `a8e12fa` submodule and
+the first two deletions, `crsql_core` builds on **stable** 1.95.
 
-Until that lands, the measurements in this document were taken by running the vtab's generated SQL
-directly against the bundled engine, which is sufficient — the pruning happens entirely inside the
-statement `xFilter` prepares.
+### A note on the measurements in this document
+
+The planner measurements above were taken by running the vtab's generated SQL directly against the
+bundled engine rather than through the built extension. That remains the right method — the pruning
+happens entirely inside the statement `xFilter` prepares — but now that the extension builds, the
+`EXPLAIN`-based assertions in the [Validation plan](#validation-plan) can be run against the real vtab.
