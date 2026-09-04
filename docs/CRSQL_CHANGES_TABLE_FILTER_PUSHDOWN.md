@@ -605,6 +605,13 @@ The production static build is **not** broken this way: it pins a nightly explic
 upside below is therefore not "unbreak the build" — it is **dropping the nightly requirement and the
 `sed` workarounds**, which is worthwhile on its own but separable from this pushdown.
 
+**Sequence it *after* the pushdown, not before.** The pushdown builds fine on the existing pinned
+nightly and has no dependency on this port: the `vtab_collation` wrapper needs only the submodule pin
+(already landed), and `stable_trap` is not linked unless `core/rs/bundle/Cargo.toml` adds it. Porting
+first would entangle a three-platform toolchain migration — panic handling, `eh_personality`, linking,
+with Windows/MinGW the long pole — with a vtab logic change in one rebuild, making a cross-platform
+failure hard to bisect.
+
 The fix exists upstream, and is proven — but it is **not** on `superfly/cr-sqlite`'s `main`, which still
 pins the same `aba5628` submodule commit we do, still points `.gitmodules` at `vlcn-io`, and still
 carries every nightly gate. The stable-rust work lives on the unmerged branch
