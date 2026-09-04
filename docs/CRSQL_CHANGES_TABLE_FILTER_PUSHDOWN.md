@@ -4,7 +4,9 @@
 vtab generates (bundled SQLite 3.42.0).
 **Area:** `crsql_changes` virtual table — `xBestIndex` / `xFilter`.
 **Compatibility:** No schema change, no wire/format change, no new C ABI. Purely a query-planner
-improvement; existing queries are unaffected.
+improvement. Result sets are unchanged for every query **provided the predicate is emitted as
+`CAST(tbl AS TEXT) = ?`** (see [Emitting the predicate with TEXT affinity](#emitting-the-predicate-with-text-affinity));
+a bare `tbl = ?` silently changes results for numerically-named CRR tables.
 
 ## Summary
 
@@ -135,11 +137,17 @@ recursive CTE, and no `RIGHT`/`FULL` join above the subquery.
    ```
 
    `omit = 0` is the strictly-safer choice — never worse than `omit = 1` — for the price of one redundant
-   comparison per *returned* row. It does **not**, however, buy exact parity with the pre-patch vtab in
-   every case: see [Why `omit = 0`](#why-omit--0) for the one shape (a numerically-named CRR table) where
-   the pushdown itself diverges regardless of `omit`.
+   comparison per *returned* row. But be clear about what it does **not** buy: it does not, on its own,
+   give parity with the pre-patch vtab, because the pushdown prunes the arm *before* SQLite's re-check can
+   see the row. Affinity parity comes from step 3, not from `omit`. Keep `omit = 0` anyway as cheap
+   insurance — it costs nothing measurable and guards against a future pruning predicate that is looser
+   than SQLite's own check.
 
-3. **Cost model** — recording a `Tbl` bit in `idxNum` is *necessary but not sufficient*; the cost
+3. **Emit the predicate as `CAST(tbl AS TEXT) = ?`, not `tbl = ?`.** This is what actually preserves
+   semantics, and it is one token. See
+   [Emitting the predicate with TEXT affinity](#emitting-the-predicate-with-text-affinity).
+
+4. **Cost model** — recording a `Tbl` bit in `idxNum` is *necessary but not sufficient*; the cost
    **cascade** has to gain a branch that reads it. Recording the bit —
 
    ```rust
@@ -163,11 +171,23 @@ recursive CTE, and no `RIGHT`/`FULL` join above the subquery.
    }
    ```
 
-   Why it matters: when `crsql_changes` appears in a join and the right-hand side of `"table" = x`
-   depends on another table, SQLite calls `xBestIndex` once with the constraint usable and once without;
-   with two identical `2147483647.0` costs there is nothing to prefer the pushdown, and SQLite may pick
-   the full scan. A distinctly lower tbl-only tier fixes that. (A plain literal `WHERE "table" = ?` with a
-   bound param pushes down regardless of cost — the cost tier only decides the *join* case.)
+   Why it matters, in **two** cases — not one:
+
+   - **Joins.** When `crsql_changes` appears in a join and the right-hand side of `"table" = x` depends on
+     another table, SQLite calls `xBestIndex` once with the constraint usable and once without; with two
+     identical `2147483647.0` costs there is nothing to prefer the pushdown, and SQLite may pick the full
+     scan.
+   - **`IN`.** `whereLoopAddVirtual` explicitly re-calls `xBestIndex` "with `IN(...)` terms disabled"
+     (`core/src/sqlite/sqlite3.c:162020`) and compares the two plans. Worse, when the vtab *does* consume
+     an `IN` constraint SQLite force-clears `orderByConsumed`
+     (`core/src/sqlite/sqlite3.c:161754`), so the `IN` plan must add a sorter that the non-`IN` plan does
+     not need. At equal cost the `IN` pushdown therefore **loses**, and
+     `WHERE "table" IN (...)` — the headline "multi-table reconciliation" benefit — silently does not
+     materialise. The cost tier is what makes it win.
+
+   A plain `WHERE "table" = ?` with a bound-parameter RHS is the one case that does *not* depend on the
+   cost tier: the term has no prerequisites and no `IN`, so `whereLoopAddVirtual` makes no further
+   `xBestIndex` calls and the single plan is used regardless of cost.
 
    **The combined `tbl + db_version` plan also needs tuning.** When both constraints are usable, `idxNum`
    is `3` (bit 0 = tbl, bit 1 = db_version) and the cascade currently matches the `db_version` tier
@@ -175,6 +195,14 @@ recursive CTE, and no `RIGHT`/`FULL` join above the subquery.
    the tbl bit will confine it to one table's clock. Scale the `db_version` / `site_id` tiers **down** when
    the tbl bit is *also* set (e.g. multiply their cost by a small factor), so the estimate reflects the
    pruning. The absolute numbers are hand-picked guesses; only the *ordering* between tiers matters.
+   Two cautions: the existing `1.0` / `10.0` tiers are already low enough to beat any competing plan, so
+   this particular tuning is closer to hygiene than to a fix; and resist driving `estimatedRows` toward
+   `1`, since that number feeds join-cardinality estimates elsewhere and the existing `estimatedRows = 1`
+   on the top tier is already an aggressive fiction.
+
+   Note the snippet above uses `estimated_cost` / `estimated_rows` locals; today each branch writes
+   `(*index_info).estimatedCost` directly inside its own `unsafe` block, so this is a (small, welcome)
+   refactor rather than a drop-in insertion.
 
 `xFilter` and `changes_union_query` are untouched. `pExtData.tbl_infos` is untouched — the cursor's
 `tbl_infos.iter().position(...)` lookup and `slab_rowid` bookkeeping keep working exactly as before.
@@ -204,45 +232,88 @@ Only if measurement shows that matters:
   is probably the better investment; the two compose well, since a pruned statement is small and
   table-specific.
 
-## Why `omit = 0` (and the one shape where the pushdown still diverges)
+## Emitting the predicate with TEXT affinity
 
-Set `omit = 0` for the `table` constraint, so SQLite keeps applying `"table" = ?` itself *in addition to*
-the vtab's pushed-down pruning. This is the safe default — never worse than `omit = 1`. But be precise
-about what it does and does **not** buy, because an earlier draft of this doc overclaimed here.
+A bare `tbl = ?` is *not* semantically equivalent to what the pre-patch vtab does, and `omit = 0` does
+not fix it. `CAST(tbl AS TEXT) = ?` does, for one token and one bind slot.
 
-**It does not buy exact parity with the pre-patch vtab for a numerically-named table.** The divergence
-below is *intrinsic to the pushdown itself* and is present under `omit = 0` and `omit = 1` **alike** —
-`omit = 0` does not fix it:
+### Why bare `tbl = ?` diverges
 
-- `[table]` is declared `TEXT NOT NULL`, so the pre-patch comparison `"table" = ?` applies **TEXT
-  affinity** to the bound value: integer `5` is converted to `'5'` before comparison.
-- SQLite does **not** apply affinity to values handed to `xFilter` — there is no `OP_Affinity` before
-  `OP_VFilter` (`core/src/sqlite/sqlite3.c:154596`). The raw value arrives.
-- Inside the union, `tbl` is a bare string literal, an expression with affinity NONE. So the pushed-down
-  `tbl = ?1` compares integer `5` against `'5'` with **no** conversion — false — and the arm for a table
-  literally named `5` is pruned *before it emits a row*.
+- `[table]` is declared `TEXT NOT NULL`, so the pre-patch comparison `"table" = ?` — performed by SQLite
+  against the vtab column — applies **TEXT affinity** to the bound value: integer `5` becomes `'5'`.
+- SQLite does **not** apply affinity to values handed to `xFilter`; there is no `OP_Affinity` before
+  `OP_VFilter` (`core/src/sqlite/sqlite3.c:154596`). The raw integer arrives.
+- Inside the union, `tbl` is a bare string literal. A literal is not a column reference, so it carries
+  **no affinity**, and neither does a subquery column derived from one. So `tbl = ?1` compares integer
+  `5` against `'5'` with no conversion — false.
 
-So `SELECT ... FROM crsql_changes WHERE "table" = 5` against a table named `5` returns its rows in the
-pre-patch vtab and returns **none** after the pushdown. `omit = 0` does not rescue this: the row was
-already dropped inside the union, so SQLite's outer `"table" = 5` re-check (which *would* apply TEXT
-affinity) has nothing left to re-admit. `omit = 0` and `omit = 1` yield the **identical**, diverging
-result set in this case. The shape is not purely hypothetical —
-`py/correctness/tests/test_crsql_changes_filters.py:75` probes `[table] = 0..4` — so a consumer that
-relies on numeric right-hand sides matching numerically-named CRR tables through `crsql_changes` is a
-poor fit for this patch as written.
+Measured on the bundled shell (`core/dist/sqlite3`, 3.42.0):
 
-**What `omit = 0` does buy:** it is strictly the safer of the two, so there is no reason to prefer
-`omit = 1`. Wherever the pushdown *does* return a row, SQLite still re-applies `"table" = ?` with correct
-TEXT affinity and collation as a belt-and-suspenders check — so any hypothetical case where the vtab's
-pruning were too *loose* is caught by SQLite rather than leaking. The cost is one redundant comparison per
-returned row, unmeasurable next to the page reads the pushdown saves.
+```
+sqlite> SELECT '5' = 5;                                             -- 0
+sqlite> SELECT count(*) FROM (SELECT '5' AS tbl) WHERE tbl = 5;     -- 0
+sqlite> CREATE TABLE decl(a TEXT); INSERT INTO decl VALUES ('5');
+sqlite> SELECT count(*) FROM decl WHERE a = 5;                      -- 1
+```
 
-**For every realistic (identifier) table name there is no divergence at all.** `'items' = 5` is false
-both ways; `'items' = 'items'` is true both ways. The numeric-name case above is the *only* result-level
-difference, and only for callers who name a CRR table with digits. If exact parity for such names is ever
-required, apply TEXT affinity inside the union predicate
-(`tbl = CASE WHEN typeof(?) IN ('integer','real') THEN CAST(? AS TEXT) ELSE ? END`) — that fixes the
-divergence at its source, independent of `omit`, at the cost of three bind slots and readability.
+`omit = 0` cannot rescue this: the arm is pruned *inside* the union, so SQLite's outer re-check — which
+would apply TEXT affinity — has no row left to re-admit. `omit = 0` and `omit = 1` yield the identical,
+diverging result set. (The divergence is only ever in the *stricter* direction — the pruning predicate
+is provably a subset of SQLite's own check — which is why `omit = 0` is free insurance but not a fix.)
+
+### The fix: `CAST(tbl AS TEXT) = ?`
+
+`CAST(x AS TEXT)` has TEXT affinity (unlike a literal), so the comparison acquires TEXT affinity and
+the bound value is converted exactly as SQLite would convert it. Verified against the pre-patch
+behaviour (a declared-`TEXT` column) across every storage class:
+
+| RHS | pre-patch (`decl.a = ?`) | bare `tbl = ?` | `CAST(tbl AS TEXT) = ?` |
+|---|---|---|---|
+| `5` vs table `5` | match | **no match** | match |
+| `5.0` vs table `5.0` | match | **no match** | match |
+| `'items'` vs table `items` | match | match | match |
+| `x'35'` vs table `5` | no match | no match | no match |
+| `0` vs table `0` | match | **no match** | match |
+
+**Pruning is fully preserved.** After push-down and substitution the term becomes
+`CAST('items' AS TEXT) = ?1`, still loop-invariant, so SQLite still hoists it above the arm's cursor
+opens. `EXPLAIN` of the realistic union shape with `CAST(tbl AS TEXT) = :t` on 3.42.0 shows the same
+guards in the same places as the bare form:
+
+```
+  3   Ne    6   64   5   BINARY-8  82    <-- guards arm 'a', before its OpenReads
+  4   OpenRead  5  2  0  7
+ 82   Ne    6  143  34   BINARY-8  82    <-- guards arm 'b', before its OpenReads
+ 83   OpenRead  1  4  0  7
+184   Cast  5   66   0                   <-- evaluated once, in the prologue
+```
+
+The `Cast` lands in the once-only prologue alongside the parameter load, so it costs one opcode per
+*statement*, not per arm and not per row.
+
+Implement it in `get_clock_table_col_name` (or at the point the predicate text is built) by mapping
+`CrsqlChangesColumn::Tbl` to `CAST(tbl AS TEXT)` rather than `tbl`. Nothing else changes: still one
+`?`, still one `argvIndex`, still aligned with `changes_filter`'s positional `bind_value` loop.
+
+### Why not the `CASE`/`typeof` form
+
+An earlier draft proposed emulating affinity with
+`tbl = CASE WHEN typeof(?) IN ('integer','real') THEN CAST(? AS TEXT) ELSE ? END`. That form is
+semantically right but **not implementable as written**: it emits *three* anonymous `?` for a single
+constraint, while `changes_best_index` increments `arg_v_index` by one and `changes_filter` binds
+positionally —
+
+```rust
+for (i, arg) in args.iter().enumerate() {
+    stmt.bind_value(i as i32 + 1, *arg)?;   // changes_vtab.rs:295
+}
+```
+
+— so parameters 2 and 3 would be left unbound (i.e. `NULL`), making the predicate `tbl = NULL` and
+returning **zero rows for every query**, silently. Any later constraint's `argvIndex` would collide with
+the extra placeholders as well. It could be salvaged by emitting numbered parameters (`?1` repeated)
+throughout `changes_best_index`, but `CAST(tbl AS TEXT) = ?` is exact, shorter, and needs no such change.
+
 
 ## Correctness considerations
 
@@ -258,7 +329,12 @@ divergence at its source, independent of `omit`, at the cost of three bind slots
   every arm is skipped at run time; the statement steps straight to `DONE`, the cursor finalizes, and
   `xEof` reports EOF. No special case needed.
 - **Zero CRRs.** Unchanged: `changes_filter` returns early when `tbl_infos` is empty.
-- **`ORDER BY` consumption and `db_version`/`site_id` pushdown** are additive and untouched.
+- **`ORDER BY` consumption is *not* untouched for `IN`.** When the vtab consumes an `IN` constraint,
+  SQLite force-clears `orderByConsumed` (`core/src/sqlite/sqlite3.c:161754`) because IN-value order does
+  not imply output order. So `WHERE "table" IN (...) ORDER BY db_version, seq` gains a sorter that it
+  does not have today. Results are unchanged and the scan is still bounded, but the "free" in
+  "multi-table reconciliation for free" now costs a sort. Plain `=` is unaffected.
+- **`db_version`/`site_id` pushdown** is additive and untouched.
 - **Writes.** `xUpdate` / `crsql_merge_insert` never consult `idxNum` or `idx_str`; the merge path is
   unaffected.
 
@@ -266,11 +342,13 @@ divergence at its source, independent of `omit`, at the cost of three bind slots
 
 - **Bounded table-scoped change reads.** `WHERE "table" = ?` costs O(rows in that table) instead of
   O(total change rows). A small table stays cheap regardless of how large the rest of the database gets.
-- **Efficient multi-table reconciliation.** `WHERE "table" IN (...)` becomes one bounded probe per table.
+- **Efficient multi-table reconciliation.** `WHERE "table" IN (...)` becomes one bounded probe per table
+  — provided the cost tier is added, and accepting an added sorter (see Correctness considerations).
 - **Better selective sync and tooling.** Anything that syncs, backfills, reconciles, audits or inspects
   specific tables via `crsql_changes` benefits, increasingly so as the database grows.
 - **No cost to anyone else.** Queries that do not constrain `"table"` are planned exactly as before.
   No schema migration, no format change, no ABI change.
+- **No result changes at all**, for any table name, given `CAST(tbl AS TEXT) = ?`.
 - **Tiny diff.** Roughly ten lines in one function plus a cost tier, with no new state and no new
   invariants to maintain.
 
@@ -286,16 +364,18 @@ divergence at its source, independent of `omit`, at the cost of three bind slots
 - **Correctness A/B:** assert equality of the full result set with and without the change, across all
   column types (incl. `NULL` and empty string), a delete sentinel, a pk-only (insert-sentinel) row, a
   composite primary key, a table spanning multiple `db_version`s, `"table" = ?` combined with
-  `db_version > ?` and `site_id IS NOT ?`, and `"table" IN (...)`. For **identifier** table names this
-  equality holds unconditionally. The one documented exception is a **numerically-named** CRR table with a
-  numeric right-hand side (see [Why `omit = 0`](#why-omit--0)): the pushdown diverges there regardless of
-  `omit`, so either exclude that shape from the A/B or assert the *known* diverging result for it — do not
-  expect equality.
+  `db_version > ?` and `site_id IS NOT ?`, and `"table" IN (...)`. With `CAST(tbl AS TEXT) = ?` this
+  equality is unconditional. **Include the affinity cases explicitly** — a CRR table named `5` queried
+  with `"table" = 5`, `= 5.0`, `= '5'` and `= x'35'` — as the direct regression test for the predicate
+  form; with a bare `tbl = ?` these are exactly the assertions that fail.
 - **Existing tests:** `py/correctness/tests/test_crsql_changes_filters.py::test_table_filter` already
-  exercises `=` and `!=` on `[table]` (with integer right-hand sides). If it asserts that a numeric
-  `[table] = n` matches a numerically-named table, that assertion changes under the pushdown — update it
-  to the new (pruned) result rather than treating the change as a regression. Add a case with a text
-  right-hand side that actually matches a table, and one that matches nothing.
+  exercises `=` and `!=` on `[table]` with integer right-hand sides `0..4`, against a table named `item`.
+  Those all evaluate false both before and after, so the test passes either way — it will **not** catch a
+  bare-`tbl = ?` affinity regression. Add the numerically-named-table cases above, plus a text
+  right-hand side that matches a table and one that matches nothing.
+- **`IN` plan selection:** assert that `WHERE "table" IN (...)` actually reaches the pushdown. Without
+  the cost tier, SQLite prefers the non-`IN` plan (which keeps `orderByConsumed`), and the optimisation
+  silently does not happen — a passing correctness suite will not reveal this.
 - **Regression:** existing `db_version`/`site_id`-filtered and unfiltered `crsql_changes` queries, and
   `ORDER BY` consumers, are unchanged.
 
