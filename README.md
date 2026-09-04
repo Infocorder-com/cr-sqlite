@@ -26,17 +26,32 @@ Stock cr-sqlite keeps its internal prepared statements (in `crsql_ExtData`) aliv
 
 ### 2. `crsql_changes` table-filter pushdown (about to be made)
 
-Stock cr-sqlite's `crsql_changes` virtual table treats `WHERE "table" = ?` as a *post-scan* filter: it scans the entire `UNION ALL` over **every** table's change-clock and discards non-matching rows afterward, so a table-scoped read costs O(total change rows across the whole database), independent of the target table's size. This fork patches the vtab's `xBestIndex` so a `"table" = ?` (or `"table" IN (...)`) constraint is pushed into the union and prunes the scan to the one matching `<table>__crsql_clock`. The predicate is emitted as `CAST(tbl AS TEXT) = ?`, which preserves SQLite's normal TEXT-affinity comparison, so **result sets are byte-identical to stock cr-sqlite for every table name** — this is a pure query-planner improvement, not a behavioral change. See [`docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md`](docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md).
+Stock cr-sqlite's `crsql_changes` virtual table treats `WHERE "table" = ?` as a *post-scan* filter: it scans the entire `UNION ALL` over **every** table's change-clock and discards non-matching rows afterward, so a table-scoped read costs O(total change rows across the whole database), independent of the target table's size. This fork patches the vtab's `xBestIndex` so a `"table" = ?` (or `"table" IN (...)`) constraint is pushed into the union and prunes the scan to the one matching `<table>__crsql_clock`. The predicate is emitted as `CAST(tbl AS TEXT) = ?`, which preserves SQLite's normal TEXT-affinity comparison, so **result sets are byte-identical to stock cr-sqlite for every table name**, including numeric ones. See [`docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md`](docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md).
 
 - **Benefit:** bounded table-scoped change reads — O(rows in that table), not O(total). Anything that syncs, backfills, reconciles, audits or inspects *specific* tables via `crsql_changes` stays cheap as the rest of the database grows.
-- **Cost / who should be careful:** there is no result-level cost — output is unchanged for every query. The only caveats are the usual fork ones: it is a divergence from upstream (so tracking `vlcn-io`/`superfly` exactly is harder), and the patch carries a planner cost-model tier that `"table" IN (...)` pushdown depends on. No schema, wire-format, or ABI change.
+- **Cost / who should be careful:** output is unchanged for every ordinary query. One narrow exception is planned to be closed before this ships: a query that puts an explicit non-`BINARY` collation on the comparison — `WHERE "table" = 'ITEMS' COLLATE NOCASE` — would match in stock cr-sqlite but not after the pushdown, because SQLite hands such constraints to the virtual table without filtering on collation. (Stock cr-sqlite already behaves this way for `WHERE cid = ... COLLATE ...`.) Otherwise the caveats are the usual fork ones: it is a divergence from upstream, and the patch carries a planner cost-model tier that `"table" IN (...)` pushdown depends on. No schema, wire-format, or ABI change.
 
 ### Especially poor fits for this fork
 
 - You want a **drop-in, binary-compatible** replacement for stock cr-sqlite, or need to **track `vlcn-io` / `superfly` upstream exactly** — this fork intentionally diverges and is maintained for Infocorder's needs, not general parity.
 - You depend on stock cr-sqlite's **connection-close / finalize semantics** — change 1 alters those.
+- You need to **keep receiving upstream fixes and features** — see the drift warning below.
 
 For everyone else, this fork is effectively a superset of `superfly`'s behavior: `crsql_changes` result sets (change 2 is byte-identical, just faster for table-scoped reads), the on-disk format, the wire/changeset format, and the public API are all unchanged.
+
+### ⚠️ Upstream drift is the biggest risk of depending on this repo
+
+**Assume this repository will _not_ track `vlcn-io/cr-sqlite` or `superfly/cr-sqlite` going forward.** It is maintained for [Infocorder](https://infocorder.com)'s needs. Merging upstream commits is a manual, best-effort exercise (see [How to merge in commits from superfly](#how-to-merge-in-commits-from-superfly)) that happens only when we happen to need something from upstream — there is no schedule, no automation, no CI gate on upstream parity, and no commitment to do it at all.
+
+What that means for you, concretely:
+
+- **You will likely miss upstream bug fixes**, including correctness fixes to the CRDT merge logic and fixes to bugs neither we nor upstream have found yet. This is the one that should worry you most: a convergence bug fixed upstream stays broken here until someone notices and ports it.
+- **You will likely miss upstream features and performance work.** Anything `superfly` or `vlcn-io` add after our last merge simply will not be here.
+- **The gap widens over time**, and every one of our local changes touching `xBestIndex`, the changes vtab, and connection teardown makes the *next* merge harder — so the practical cost of catching up grows the longer we go without doing it.
+- **Security and upgrade response is on you.** We do not promise timely rebases onto upstream, and we do not track upstream advisories.
+- **The bundled SQLite may lag**, since upgrading it is an upstream-driven change we would have to pull through ourselves.
+
+If any of that is unacceptable — and for most users it should be — depend on [`superfly/cr-sqlite`](https://github.com/superfly/cr-sqlite) directly. If you specifically need the two changes above, the healthier pattern is to take them as patches applied on top of a current upstream checkout, rather than depending on this fork as a long-lived source. We would rather you carry a two-patch delta you control than inherit our drift.
 
 ## How to merge in commits from superfly
 

@@ -4,9 +4,11 @@
 vtab generates (bundled SQLite 3.42.0).
 **Area:** `crsql_changes` virtual table — `xBestIndex` / `xFilter`.
 **Compatibility:** No schema change, no wire/format change, no new C ABI. Purely a query-planner
-improvement. Result sets are unchanged for every query **provided the predicate is emitted as
-`CAST(tbl AS TEXT) = ?`** (see [Emitting the predicate with TEXT affinity](#emitting-the-predicate-with-text-affinity));
-a bare `tbl = ?` silently changes results for numerically-named CRR tables.
+improvement. Result sets are unchanged for every query **provided** the predicate is emitted as
+`CAST(tbl AS TEXT) = ?` **and** the constraint is accepted only under `BINARY` collation (see
+[Emitting the predicate with TEXT affinity](#emitting-the-predicate-with-text-affinity)). A bare
+`tbl = ?` silently changes results for numerically-named CRR tables; skipping the collation gate
+silently changes results for `... = ? COLLATE NOCASE`.
 
 ## Summary
 
@@ -206,6 +208,23 @@ recursive CTE, and no `RIGHT`/`FULL` join above the subquery.
    toward `1`, since that number feeds join-cardinality estimates elsewhere and the existing
    `estimatedRows = 1` on the top tier is already an aggressive fiction.
 
+   **Those two pulls are in tension, so do not assume a factor — verify.** Breaking the tie requires the
+   cost reduction to exceed the *sort* cost SQLite adds to the `IN` path, and `rSortCost` scales with
+   `estimatedRows`; lowering rows helps win the tie but degrades join estimates. There is no factor that
+   is provably right a priori. Treat "`EXPLAIN QUERY PLAN` confirms `WHERE "table" IN (...)` reaches the
+   pushdown" as an explicit acceptance test, not an assumption.
+
+   **Better, if the `IN` case matters enough:** opt into `sqlite3_vtab_in()` for the `Tbl` constraint.
+   The `orderByConsumed` clearing is in the `else` branch of an `mHandleIn` test
+   (`core/src/sqlite/sqlite3.c:161746`), so a constraint the vtab handles via the `IN` iterator keeps
+   `ORDER BY` consumption — which removes the sorter, removes the tie-break entirely, and collapses N
+   `xFilter` calls (and N re-prepares of the whole union) into one. `sqlite3_vtab_in` /
+   `sqlite3_vtab_in_first` / `sqlite3_vtab_in_next` need SQLite ≥ 3.38 (bundled is 3.42) and are present
+   in `sqlite3ext.h`, though **not** currently re-exported by `sqlite3_capi/src/capi.rs`, so this needs a
+   binding addition plus real `xFilter` work (iterate the value list and prune the union to those tables).
+   It is strictly more work than the cost tier; it is also the only option that makes the `IN` win
+   robust rather than contingent on hand-tuned estimates.
+
    Note the snippet above uses `estimated_cost` / `estimated_rows` locals; today each branch writes
    `(*index_info).estimatedCost` directly inside its own `unsafe` block, so this is a (small, welcome)
    refactor rather than a drop-in insertion.
@@ -294,11 +313,36 @@ guards in the same places as the bare form:
 184   Cast  5   66   0                   <-- evaluated once, in the prologue
 ```
 
-The EXPLAIN excerpt above shows a single `Cast` for brevity; a real N-arm union actually emits **one
-`Cast` per CRR table** (arm `'a'` casts `'a'`, arm `'b'` casts `'b'`, …). The material point holds either
-way: every one of them lands in the run-once init block ahead of the main loop (after the top-level
-`Halt`, reached once via `Init`/`Goto`), so the cost is one opcode per CRR table **per statement
-execution** — never per row. Do not "optimise" it as if it were per-row work.
+The EXPLAIN excerpt above shows a single `Cast` for brevity; a real N-arm union emits **one `Cast` per
+CRR table** (arm `'a'` casts `'a'`, arm `'b'` casts `'b'`, …), and each of those lands in the run-once
+init block after the top-level `Halt`, reached once via `Init`/`Goto`:
+
+```
+ 47   Halt
+ 49   String8  0  2  0  'a'
+ 51   Cast     2  66  0          <-- arm 'a' literal, once per statement
+ 52   Variable 1  3  0  :t
+ 53   String8  0  9  0  'b'
+ 55   Cast     9  66  0          <-- arm 'b' literal, once per statement
+ 56   Goto     0  1
+```
+
+**There is also one `Cast` per output row, and the doc previously denied this.** SQLite's push-down
+*copies* a WHERE term into the subquery arms; it does not move it. The original term is retained at the
+outer level of the vtab's own generated statement and re-evaluated per row yielded by the co-routine:
+
+```
+ 28   InitCoroutine 1  0  2
+ 29     Yield ...                <-- next row from the union
+ 31     Cast  11  66  0          <-- per row
+ 32     Ne     3  39  11         <-- per row
+ 39   Goto  0  29
+```
+
+This is not a scaling concern and is not a reason to avoid the `CAST`: those rows are only the ones that
+survived arm pruning — i.e. the target table's rows, which is the whole point — and the bare `tbl = ?`
+form pays the same per-row `Copy`+`Ne` there anyway, so the `CAST` adds at most one opcode per returned
+row. But it is per-row work, so describe it accurately.
 
 Implement it by mapping `CrsqlChangesColumn::Tbl` to `CAST(tbl AS TEXT)` rather than `tbl`. Nothing else
 changes: still one `?`, still one `argvIndex`, still aligned with `changes_filter`'s positional
@@ -310,6 +354,42 @@ path, not only the `WHERE` predicate. If you make the substitution there, `ORDER
 stays BINARY, and `ORDER BY` consumption remains valid — but it is a wider blast radius than the fix needs.
 If you prefer to leave `ORDER BY` byte-for-byte unchanged, inject the `CAST` only at the point the
 `WHERE`-predicate text is built and leave `get_clock_table_col_name` alone for the sort key.
+
+### The remaining parity gap: explicit `COLLATE`
+
+`CAST(tbl AS TEXT) = ?` closes the *affinity* gap. It does **not** close the *collation* gap, and that
+gap is the same shape: prune-before-recheck, so `omit = 0` does not help.
+
+`allocateIndexInfo` applies **no** collation filter to constraints — its only collation check is in the
+`ORDER BY` loop, not the constraint loop. SQLite therefore hands
+`WHERE "table" = 'ITEMS' COLLATE NOCASE` to `xBestIndex` as an ordinary `EQ` constraint, and expects the
+vtab to ask about the collation itself; the API docs are explicit that "the collating sequence of
+constraints does not matter" only "for most real-world virtual tables". cr-sqlite never calls
+`sqlite3_vtab_collation()`. So the generated predicate compares under `BINARY`, prunes the arm, and
+returns nothing — while stock cr-sqlite (which applies the constraint itself, under `NOCASE`) returns the
+rows.
+
+This is not novel to `table`: the vtab already pushes down `cid`, another `TEXT` column, so the same
+divergence is reachable today via `WHERE cid = 'X' COLLATE NOCASE`. But for `"table"` it is *newly*
+introduced by this patch, so it belongs in the parity ledger.
+
+**Fix — gate on `BINARY`.** In `constraint_is_usable` (or in `changes_best_index`, where the index is in
+hand), accept the `Tbl` constraint only when the comparison collation is `BINARY`, and otherwise fall
+back to today's behaviour of letting SQLite apply it:
+
+```rust
+// `sqlite3_vtab_collation` is already re-exported by the bindings:
+//   sqlite3_capi/src/capi.rs:74 -> `sqlite3_vtab_collation as vtab_collation`
+//   sqlite_nostd/src/nostd.rs:19 -> `pub use sqlite3_capi::*;`
+let coll = unsafe { CStr::from_ptr(sqlite::vtab_collation(index_info, i)) };
+let binary = coll.to_bytes().eq_ignore_ascii_case(b"BINARY");
+```
+
+Only a constraint that is both `INDEX_CONSTRAINT_EQ` *and* `BINARY`-collated gets an `argvIndex`. Note
+this check needs the `index_info` pointer and the constraint index, which `constraint_is_usable` does not
+currently receive — either pass them in or do the check inline in the `changes_best_index` loop. With
+this gate plus `CAST(tbl AS TEXT) = ?`, "result sets are unchanged for every query" is an unqualified
+claim rather than a nearly-true one.
 
 ### Why not the `CASE`/`typeof` form
 
@@ -364,7 +444,8 @@ throughout `changes_best_index`, but `CAST(tbl AS TEXT) = ?` is exact, shorter, 
   specific tables via `crsql_changes` benefits, increasingly so as the database grows.
 - **No cost to anyone else.** Queries that do not constrain `"table"` are planned exactly as before.
   No schema migration, no format change, no ABI change.
-- **No result changes at all**, for any table name, given `CAST(tbl AS TEXT) = ?`.
+- **No result changes at all**, for any table name, given `CAST(tbl AS TEXT) = ?` plus the `BINARY`
+  collation gate.
 - **Tiny diff.** Roughly ten lines in one function plus a cost tier, with no new state and no new
   invariants to maintain.
 
@@ -383,7 +464,9 @@ throughout `changes_best_index`, but `CAST(tbl AS TEXT) = ?` is exact, shorter, 
   `db_version > ?` and `site_id IS NOT ?`, and `"table" IN (...)`. With `CAST(tbl AS TEXT) = ?` this
   equality is unconditional. **Include the affinity cases explicitly** — a CRR table named `5` queried
   with `"table" = 5`, `= 5.0`, `= '5'` and `= x'35'` — as the direct regression test for the predicate
-  form; with a bare `tbl = ?` these are exactly the assertions that fail.
+  form; with a bare `tbl = ?` these are exactly the assertions that fail. **Add a collation case too** —
+  `WHERE "table" = 'ITEMS' COLLATE NOCASE` against a table named `items` — which fails without the
+  `BINARY` gate.
 - **Existing tests:** `py/correctness/tests/test_crsql_changes_filters.py::test_table_filter` already
   exercises `=` and `!=` on `[table]` with integer right-hand sides `0..4`, against a table named `item`.
   Those all evaluate false both before and after, so the test passes either way — it will **not** catch a
