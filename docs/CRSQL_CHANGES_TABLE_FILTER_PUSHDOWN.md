@@ -1,7 +1,10 @@
 # Pushing the table filter down in the `crsql_changes` virtual table
 
 **Status:** Proposal / design. Revised after measuring SQLite's actual behaviour against the SQL this
-vtab generates (bundled SQLite 3.42.0).
+vtab generates. Measurements were taken with the bundled `core/dist/sqlite3` **shell** (3.42.0) and
+re-checked on 3.50.2; note the statically-*linked* library is a different version (the static bundle's
+bindgen reports SQLITE_VERSION 3.45.0). The pushdown, affinity, and collation semantics relied on here
+are identical across 3.42–3.50, so the version spread does not affect any conclusion.
 **Area:** `crsql_changes` virtual table — `xBestIndex` / `xFilter`.
 **Compatibility:** No schema change, no wire/format change, no new C ABI. Purely a query-planner
 improvement. Result sets are unchanged for every query **provided** the predicate is emitted as
@@ -327,22 +330,29 @@ init block after the top-level `Halt`, reached once via `Init`/`Goto`:
  56   Goto     0  1
 ```
 
-**There is also one `Cast` per output row, and the doc previously denied this.** SQLite's push-down
-*copies* a WHERE term into the subquery arms; it does not move it. The original term is retained at the
-outer level of the vtab's own generated statement and re-evaluated per row yielded by the co-routine:
+**Does the outer term also run per row? Not in the statement this vtab generates.** SQLite's push-down
+*copies* a WHERE term into the subquery arms rather than moving it (`sqlite3ExprDup` in
+`pushDownWhereTerms`), so in principle the original outer copy could be re-evaluated per row. A
+per-row form does reproduce in a *degenerate literal-only* union:
 
 ```
  28   InitCoroutine 1  0  2
- 29     Yield ...                <-- next row from the union
+ 29     Yield ...                <-- next row
  31     Cast  11  66  0          <-- per row
  32     Ne     3  39  11         <-- per row
  39   Goto  0  29
 ```
 
-This is not a scaling concern and is not a reason to avoid the `CAST`: those rows are only the ones that
-survived arm pruning — i.e. the target table's rows, which is the whole point — and the bare `tbl = ?`
-form pays the same per-row `Copy`+`Ne` there anyway, so the `CAST` adds at most one opcode per returned
-row. But it is per-row work, so describe it accurately.
+But that is **not the shape this vtab emits.** The real arms each carry `<table>__crsql_clock`, the
+`__crsql_pks` join, the `crsql_site_id` LEFT JOIN, the `__crsql_del` self-join, and the compound
+`ORDER BY db_vrsn, seq` — which routes the plan through SQLite's compound-`ORDER BY`
+multi-coroutine-merge path. Reproducing the *exact* generated statement, the only `Cast` opcodes land in
+the run-once init block (addr 254/258 with ORDER BY, 195/199 without); there is **no** per-row outer
+`Cast`+`Ne`, and pruning happens entirely at the per-arm `Ne … goto` guard ahead of each `OpenRead`. So
+for the shipping statement the `CAST` is once-per-statement, consistent with the "realistic shape" excerpt
+above. Either way the cost is immaterial (a per-row copy, where it occurs at all, adds at most one opcode
+per *returned* row over bare `tbl = ?`, and returned rows are only the target table's), but the accurate
+description for the vtab's own SQL is "once per statement, in the init block," not "per row."
 
 Implement it by mapping `CrsqlChangesColumn::Tbl` to `CAST(tbl AS TEXT)` rather than `tbl`. Nothing else
 changes: still one `?`, still one `argvIndex`, still aligned with `changes_filter`'s positional
@@ -390,6 +400,14 @@ this check needs the `index_info` pointer and the constraint index, which `const
 currently receive — either pass them in or do the check inline in the `changes_best_index` loop. With
 this gate plus `CAST(tbl AS TEXT) = ?`, "result sets are unchanged for every query" is an unqualified
 claim rather than a nearly-true one.
+
+`sqlite3_vtab_collation` returns the *effective comparison* collation, so a plain `"table" = ?` (no
+explicit `COLLATE`) reports `BINARY` and is accepted — the gate keeps the scan win for the common case
+and only sheds the pushdown for an explicit non-`BINARY` comparison. This relies on the `[table]` column
+being declared with `BINARY` collation, which it is (plain `TEXT NOT NULL`). If it were ever redeclared
+`COLLATE NOCASE`, a bare `"table" = ?` would report `NOCASE` and the gate would (correctly) fall back to
+post-scan — losing the pushdown but never correctness. Worth keeping in mind if the vtab's column
+declarations change.
 
 ### Why not the `CASE`/`typeof` form
 

@@ -41,7 +41,7 @@ For everyone else, this fork is effectively a superset of `superfly`'s behavior:
 
 ### ⚠️ Upstream drift is the biggest risk of depending on this repo
 
-**Assume this repository will _not_ track `vlcn-io/cr-sqlite` or `superfly/cr-sqlite` going forward.** It is maintained for [Infocorder](https://infocorder.com)'s needs. Merging upstream commits is a manual, best-effort exercise (see [How to merge in commits from superfly](#how-to-merge-in-commits-from-superfly)) that happens only when we happen to need something from upstream — there is no schedule, no automation, no CI gate on upstream parity, and no commitment to do it at all.
+**This repository has drifted from and will likely _not_ track `vlcn-io/cr-sqlite` or `superfly/cr-sqlite` going forward.** It is maintained for [Infocorder](https://infocorder.com)'s needs. Merging upstream commits is a manual, best-effort exercise (see [How to merge in commits from superfly](#how-to-merge-in-commits-from-superfly)) that happens only when we happen to need something from upstream — there is no schedule, no automation, no CI gate on upstream parity, and no commitment to do it at all.
 
 What that means for you, concretely:
 
