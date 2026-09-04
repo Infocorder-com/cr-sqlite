@@ -596,10 +596,14 @@ and `sqlite3_vtab_in` (3.38). Check that floor before reaching for anything newe
 
 ## Note on reproducing this locally
 
-`cd core && make loadable` fails in this tree. `sqlite3_capi/src/lib.rs` carries
-`#![feature(concat_idents)]`, **removed** in Rust 1.90 — a hard error on any toolchain. The crates pin
-`nightly-2023-10-05` in `rust-toolchain.toml`, but `rustup` is not installed on this machine, so the
-pins are inert and the system stable compiler (1.95.0) is used.
+`cd core && make loadable` fails **in the analysis environment used for this document**, and the
+attribution matters. `sqlite3_capi/src/lib.rs` carries `#![feature(concat_idents)]`, removed in Rust
+1.90 — a hard error on any toolchain. The crates pin `nightly-2023-10-05` in `rust-toolchain.toml`, but
+that machine has no `rustup`, so the pins are inert and the system stable compiler (1.95.0) is used.
+The production static build is **not** broken this way: it pins a nightly explicitly
+(`SB_CRSQLITE_NIGHTLY` in `build_crsqlite_static.sh`) and `sed`-deletes the `concat_idents` gate. The
+upside below is therefore not "unbreak the build" — it is **dropping the nightly requirement and the
+`sed` workarounds**, which is worthwhile on its own but separable from this pushdown.
 
 The fix exists upstream, and is proven — but it is **not** on `superfly/cr-sqlite`'s `main`, which still
 pins the same `aba5628` submodule commit we do, still points `.gitmodules` at `vlcn-io`, and still
