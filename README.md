@@ -51,7 +51,7 @@ What that means for you, concretely:
 - **Security and upgrade response is on you.** We do not promise timely rebases onto upstream, and we do not track upstream advisories.
 - **The bundled SQLite may lag**, since upgrading it is an upstream-driven change we would have to pull through ourselves.
 
-If any of that is unacceptable — and for most users it should be — depend on [`superfly/cr-sqlite`](https://github.com/superfly/cr-sqlite) directly. If you specifically need the two changes above, the healthier pattern is to take them as patches applied on top of a current upstream checkout, rather than depending on this fork as a long-lived source. We would rather you carry a two-patch delta you control than inherit our drift.
+If any of that is unacceptable, depend on [`superfly/cr-sqlite`](https://github.com/superfly/cr-sqlite) directly. If you specifically need the two changes above, the healthier pattern is to take them as patches applied on top of a current upstream checkout, rather than depending on this fork as a long-lived source. We would rather you carry a two-patch delta you control than inherit our drift.
 
 ## How to merge in commits from superfly
 
