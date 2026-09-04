@@ -1,136 +1,275 @@
 # Pushing the table filter down in the `crsql_changes` virtual table
 
-**Status:** Proposal / design.
+**Status:** Proposal / design. Revised after measuring SQLite's actual behaviour against the SQL this
+vtab generates (bundled SQLite 3.42.0).
 **Area:** `crsql_changes` virtual table — `xBestIndex` / `xFilter`.
 **Compatibility:** No schema change, no wire/format change, no new C ABI. Purely a query-planner
 improvement; existing queries are unaffected.
 
 ## Summary
 
-`crsql_changes` is a virtual table that presents every row of every CRR table's clock as a uniform
-change-set. It is implemented as a `UNION ALL` over one subquery per CRR table (each reading that
-table's `<table>__crsql_clock`). Today, a `WHERE "table" = ?` (or `WHERE "table" IN (...)`) constraint
-is **not** pushed down: the planner is told the constraint is unusable, so SQLite scans **every**
-table's clock and applies the `"table"` filter afterward. Reading the changes for a single table
-therefore costs O(total change rows across *all* tables), not O(rows in the target table).
+`crsql_changes` presents every row of every CRR table's clock as a uniform change-set. It is
+implemented as a `UNION ALL` over one subquery per CRR table (each reading that table's
+`<table>__crsql_clock`), wrapped as `SELECT ... FROM ( <union> ) <idx_str>`, where `idx_str` is the
+`WHERE`/`ORDER BY` text that `xBestIndex` built from the pushed-down constraints.
 
-This proposal makes an equality constraint on the `"table"` column **usable** in `xBestIndex` and prunes
-the `UNION ALL` to the matching table's subquery in `xFilter`. The result: a table-scoped change read
-becomes bounded by that table's own clock, independent of how large the rest of the database is. The
-emitted rows are byte-identical to today.
+Today a `WHERE "table" = ?` constraint is **not** pushed down: `constraint_is_usable` reports it
+unusable, so it never reaches `idx_str`. SQLite therefore scans **every** table's clock and applies the
+`"table"` filter itself, one row at a time, at the vtab layer. Reading the changes for a single table
+costs O(total change rows across *all* tables).
+
+**The fix is much smaller than it first appears.** The union arms each select a *constant* table name
+(`'items' AS tbl`). Once `tbl = ?` appears in the wrapper's `WHERE`, SQLite's WHERE-clause push-down
+optimization copies that term into every compound arm, and — because the term is constant with respect
+to each arm's loop — hoists it *above* the arm's cursor opens. Non-matching arms are then skipped
+outright at run time: no `OpenRead`, no `Rewind`, no rows.
+
+So the work is confined to `xBestIndex`. **No change to `changes_union_query` is required** to get the
+scan win. See [Evidence](#evidence-that-sqlite-already-prunes-the-arms) below.
 
 ## The current limitation
 
-The vtab exposes columns `table`, `pk`, `cid`, `val`, `col_version`, `db_version`, `site_id`, `cl`, `seq`
-(and `ts`). In `xBestIndex`, `constraint_is_usable` explicitly refuses the `table`, `pk`, and `value`
-columns:
+The vtab exposes columns `table`, `pk`, `cid`, `val`, `col_version`, `db_version`, `site_id`, `cl`,
+`seq`, `ts` (declared in `core/src/changes-vtab.c:28`; `[table]` is `TEXT NOT NULL`). In `xBestIndex`,
+`constraint_is_usable` refuses the `table`, `pk` and `val` columns:
 
 ```rust
-// constraint_is_usable (core/rs/core/src/changes_vtab.rs)
-!matches!(col, CrsqlChangesColumn::Tbl | CrsqlChangesColumn::Pk | CrsqlChangesColumn::Cval)
+// constraint_is_usable  (core/rs/core/src/changes_vtab.rs:185)
+!matches!(
+    col,
+    CrsqlChangesColumn::Tbl | CrsqlChangesColumn::Pk | CrsqlChangesColumn::Cval
+)
 ```
 
-So for `SELECT ... FROM crsql_changes WHERE "table" = ?`, the `table = ?` constraint is skipped: it is
-never assigned an `argvIndex`, never contributes to `idxNum`/`idxStr`, and the plan falls into the
-"no usable constraints" branch (`estimatedCost = i64::MAX`). SQLite then does a full scan of the vtab
-and filters `"table" = ?` itself. `EXPLAIN QUERY PLAN` shows `SCAN crsql_changes VIRTUAL TABLE INDEX 0`.
+For `SELECT ... FROM crsql_changes WHERE "table" = ?` the constraint is skipped entirely: no
+`argvIndex`, no `omit`, no contribution to `idxNum`, and no `tbl = ?` text in `idx_str`. The plan lands
+in the "no usable constraints" branch (`estimatedCost = 2147483647.0`).
 
-`xFilter` builds the full union unconditionally:
+Note that the machinery to emit the predicate **already exists** and is generic:
+`get_clock_table_col_name` (`changes_vtab.rs:200`) already maps `CrsqlChangesColumn::Tbl -> "tbl"`, and
+the clock-union subqueries already expose `'<name>' as tbl` (`changes_vtab_read.rs:28`). The only thing
+standing between today's behaviour and a pruned scan is the `constraint_is_usable` veto.
 
-```rust
-// changes_filter -> changes_union_query (core/rs/core/src/changes_vtab_read.rs)
-// one subquery per TableInfo in pExtData, joined by UNION ALL, wrapped as
-//   SELECT ... FROM ( <union of all tables> ) <idx_str>
+**Consequence.** The cost of a table-scoped change read grows with the *whole database's* change volume.
+A small table cannot be read cheaply once other tables accumulate changes. This penalises exactly the
+workloads that read `crsql_changes` per table: selective sync, per-table backfill or reconciliation,
+per-table auditing, and tooling that inspects one table's history.
+
+## Evidence that SQLite already prunes the arms
+
+Reproduced against the bundled SQLite shell (`core/dist/sqlite3`, 3.42.0) and re-checked on 3.50.2,
+using the *exact* SQL shape `changes_union_query` generates: the same wrapper column list, two clock
+tables, the `__crsql_pks` join, both `LEFT JOIN`s, a bound parameter, and the default
+`ORDER BY db_vrsn, seq ASC`. With `WHERE tbl = :t` in the wrapper, `EXPLAIN` shows, at the top of each
+compound arm:
+
+```
+  3   Ne         6   64   5   BINARY-8  80    if r[5]!=r[6] goto 64    <-- r[5]='a', r[6]=:t
+  4   OpenRead   5    2   0   7               a__crsql_clock
+  5   OpenRead   6    3   0   0               a__crsql_pks
+  ...
+ 82   Ne         6  143  34   BINARY-8  80    if r[34]!=r[6] goto 143  <-- r[34]='b'
+ 83   OpenRead   1    4   0   7               b__crsql_clock
+ 84   OpenRead   2    5   0   0               b__crsql_pks
 ```
 
-`idx_str` carries the pushed-down `db_version` / `site_id` predicates and the `ORDER BY`, but it filters
-the *outer* query — it does **not** reduce which clocks are scanned.
+The comparison is evaluated **once per arm, before the arm's tables are opened**. A non-matching arm
+contributes zero page reads. Timing (3.50.2 shell, warm cache) on 50,000 clock rows in table
+`a` and 3 in table `b`:
 
-**Consequence.** The cost of any table-scoped change read grows with the *whole database's* change
-volume. A tiny table's changes cannot be read cheaply once the database accumulates changes in *other*
-tables. This is O(total-clock) where it should be O(rows-in-table). It penalizes exactly the workloads
-that read `crsql_changes` for a specific table: targeted/selective sync, per-table backfill or
-reconciliation, per-table auditing, and any tooling that inspects one table's history. It also makes a
-`WHERE "table" IN (t1, ..., tN)` reconciliation of N tables cost N × O(total-clock).
+| query | rows | time |
+|---|---|---|
+| union with no `tbl` predicate (today's shape) | 50,003 | 7.0 ms |
+| same union with `WHERE tbl = 'b'` in the wrapper | 3 | 0.066 ms |
+
+This is the mechanism the vtab *already* relies on for `db_version`: `pushDownWhereTerms`
+(`core/src/sqlite/sqlite3.c:144127`) copies wrapper terms into each `UNION ALL` arm. The preconditions
+it requires all hold here — the compound is all `UNION ALL`, there is no `LIMIT` inside the subquery
+(user `LIMIT`s are applied by SQLite *above* the vtab, never inside `idx_str`), no window functions, no
+recursive CTE, and no `RIGHT`/`FULL` join above the subquery.
+
+> The original draft of this document asserted that `idx_str` "filters the *outer* query — it does not
+> reduce which clocks are scanned." That is true for `db_version`/`site_id` in the sense that every arm
+> must still be opened, but it is **false** for `tbl`, whose per-arm value is a compile-time constant.
+> The corrected premise is what shrinks this proposal from three changes to one.
 
 ## The change
 
-Make the `table`-column **equality** constraint usable and honor it by pruning the union:
+### Required: `xBestIndex` accepts an equality constraint on `table`
 
-1. **`constraint_is_usable`** — allow `CrsqlChangesColumn::Tbl` **only** for `INDEX_CONSTRAINT_EQ`
-   (SQLite also reports `IN` as `EQ` here). Keep `Pk` and `Cval` unusable (they are genuinely
-   post-scan predicates and not the subject of this change).
+1. **`constraint_is_usable`** — allow `CrsqlChangesColumn::Tbl` for `INDEX_CONSTRAINT_EQ` only (SQLite
+   reports the `IN` operator as `EQ` here, so `IN` comes along for free). Keep `Pk` and `Cval`
+   unusable: `pk` is a packed blob produced by `crsql_pack_columns` and `val` is materialised from the
+   base table *after* the scan, so neither can be evaluated inside the union.
 
-2. **`changes_best_index`** — for that constraint, assign an `argvIndex`, set `omit = 1`, and record its
-   argument position in a new `idxNum` bit. Continue to emit the `table = ?` text into the wrapper
-   predicate as well (belt-and-suspenders: the vtab still applies the filter, so correctness never
-   depends solely on the pruning). Leave the existing `db_version`/`site_id` pushdowns and the
-   `ORDER BY` consumption untouched.
+   ```rust
+   fn constraint_is_usable(constraint: &sqlite::index_constraint) -> bool {
+       if constraint.usable == 0 {
+           return false;
+       }
+       match CrsqlChangesColumn::from_i32(constraint.iColumn) {
+           // `pk` is packed and `val` is materialized after the scan; neither
+           // exists in a form the clock union can filter on.
+           Some(CrsqlChangesColumn::Pk) | Some(CrsqlChangesColumn::Cval) => false,
+           // `tbl` is a constant literal in each union arm, so an equality
+           // predicate lets SQLite skip non-matching arms before opening them.
+           Some(CrsqlChangesColumn::Tbl) => {
+               constraint.op == sqlite::INDEX_CONSTRAINT_EQ as u8
+           }
+           Some(_) => true,
+           None => false,
+       }
+   }
+   ```
 
-3. **`changes_filter` / `changes_union_query`** — decode the `idxNum` bit, read the bound table name
-   from `argv`, and build the union over **only** the matching `TableInfo`. If no table matches (e.g. a
-   non-CRR name), short-circuit to an empty result. **Do not mutate** the `tbl_infos` vector held in
-   `pExtData` — the cursor advance and rowid logic still index the full vector by name; only the SQL
-   string built for this scan is pruned.
+   No other code has to change for the predicate to appear in `idx_str`: the existing loop in
+   `changes_best_index` already resolves `Tbl -> "tbl"`, appends `tbl = ?`, and assigns the next
+   `argvIndex`. `changes_filter` already binds `args` positionally in that same order.
 
-Because SQLite decomposes `"table" IN (a, b, c)` into repeated `xFilter` calls (one per value) when the
-constraint is usable + omitted and the vtab does not opt into `sqlite3_vtab_in()`, an `IN` over N tables
-automatically becomes N bounded per-table probes — no additional code.
+2. **Do *not* set `omit = 1` for the `table` constraint.** The loop currently sets `omit = 1`
+   unconditionally; special-case `Tbl` to leave it at `0`:
 
-### Why the output is unchanged
+   ```rust
+   constraint_usage[i].argvIndex = arg_v_index;
+   constraint_usage[i].omit = if matches!(col, Some(CrsqlChangesColumn::Tbl)) { 0 } else { 1 };
+   ```
 
-Pruning changes only *which subqueries appear in the union*, not how any row is produced. Each per-table
-subquery (`crsql_changes_query_for_table`) and the cursor's column materialization (packed `pk` via
-`crsql_pack_columns`, `val` from the base table, `site_id` resolved from the site-id table, `cl` from the
-sentinel self-join, `seq`, `ts`) are identical. For any `WHERE "table" = ?` query, the result set is
-exactly the same rows either way — the pushdown only avoids reading clocks that could not have
-contributed. This is verifiable as a byte-for-byte A/B: the same query with and without the pushdown
-must return identical rows.
+   This is the single most important detail, and it is why this change is safe. See
+   [Why `omit = 0`](#why-omit--0) — it buys exact, provably unchanged semantics for the price of one
+   redundant comparison per *returned* row.
+
+3. **Cost model** — record a `Tbl` bit in `idxNum` and give tbl-constrained plans a distinctly lower
+   `estimatedCost` than the unconstrained tier:
+
+   ```rust
+   Some(CrsqlChangesColumn::Tbl) => idx_num |= 1,
+   ```
+
+   Today the `else` branch reports `2147483647.0` for *both* "no constraints" and "table only". When
+   `crsql_changes` appears in a join and the right-hand side of `"table" = x` depends on another table,
+   SQLite calls `xBestIndex` once with the constraint usable and once without; with identical costs
+   there is nothing to prefer the pushdown, and SQLite may pick the full scan. Give it its own tier
+   (e.g. `estimatedCost = 1000.0`, `estimatedRows = 1000` for tbl-only; scale the
+   `db_version`/`site_id` tiers down proportionally when the tbl bit is also set). The absolute numbers
+   are already hand-picked guesses; only the *ordering* between tiers matters.
+
+`xFilter` and `changes_union_query` are untouched. `pExtData.tbl_infos` is untouched — the cursor's
+`tbl_infos.iter().position(...)` lookup and `slab_rowid` bookkeeping keep working exactly as before.
+
+### Optional follow-up: prune the generated SQL text
+
+The scan is bounded after the change above, but `changes_filter` still calls `db.prepare_v2` on a SQL
+string containing **one subquery per CRR table**, on **every** `xFilter` call — the statement is never
+cached (`changes_vtab.rs:294`; finalized in `changes_crsr_finalize`). For a database with many CRRs, or
+for a `WHERE "table" IN (t1..tN)` that SQLite decomposes into N separate `xFilter` calls, parse cost
+becomes the dominant term for small result sets.
+
+Only if measurement shows that matters:
+
+- Encode the `table` constraint's argument position in the high bits of `idxNum`
+  (`idx_num |= arg_v_index << 8`) — a single bit cannot carry a position, which the original draft
+  overlooked. Un-ignore the `_idx_num` parameter of `crsql_changes_filter`.
+- In `changes_filter`, read `args[pos-1].text()` and pass an optional filter to `changes_union_query`
+  so it emits only the matching `TableInfo`'s subquery.
+- **Keep `tbl = ?` in `idx_str` regardless.** It is load-bearing twice over: it keeps the positional
+  `bind_value` loop aligned, and it keeps the vtab's filtering exact.
+- If no `TableInfo` matches (a non-CRR name), return early from `changes_filter` leaving
+  `pChangesStmt` null — `crsql_changes_eof` then reports EOF, exactly like the existing
+  `tbl_infos.len() == 0` path. Do **not** let `changes_union_query` emit `FROM ()`, which fails to
+  prepare.
+- Caching prepared change statements (keyed by `idx_str`) would address the same cost more broadly and
+  is probably the better investment; the two compose well, since a pruned statement is small and
+  table-specific.
+
+## Why `omit = 0`
+
+With `omit = 1`, SQLite stops applying `"table" = ?` itself and the vtab becomes solely responsible for
+it. That is *almost* always equivalent, but not exactly:
+
+- `[table]` is declared `TEXT NOT NULL`, so the outer comparison `"table" = ?` applies **TEXT affinity**
+  to the bound value: integer `5` is converted to `'5'` before comparison.
+- SQLite does **not** apply affinity to values handed to `xFilter` — there is no `OP_Affinity` before
+  `OP_VFilter` (`core/src/sqlite/sqlite3.c:154596`). The raw value arrives.
+- Inside the union, `tbl` is a bare string literal, an expression with affinity NONE. So `tbl = ?1`
+  compares integer `5` against `'items'` with no conversion.
+
+For every realistic table name the two agree (both false, both true). They diverge only for a CRR table
+whose name is numeric — `SELECT ... WHERE "table" = 5` against a table literally named `5` returns rows
+today and would return none with `omit = 1`. Obscure, but `py/correctness/tests/test_crsql_changes_filters.py:75`
+already probes `[table] = 0..4`, so the shape is not hypothetical.
+
+Leaving `omit = 0` sidesteps the whole question: SQLite keeps applying the constraint with correct
+affinity and collation, the predicate inside the union is a pure *optimization*, and the result set is
+**provably byte-identical** to today in every case, including ones nobody thought of. The cost is one
+redundant integer/string comparison per row that survives the filter — unmeasurable next to the page
+reads it saves.
+
+If someone later wants `omit = 1`, the affinity semantics can be emulated
+(`tbl = CASE WHEN typeof(?) IN ('integer','real') THEN CAST(? AS TEXT) ELSE ? END`), but that costs
+three bind slots and readability for no measurable gain.
 
 ## Correctness considerations
 
-- **Exactness with `omit = 1`.** With `omit`, SQLite stops applying `table = ?` itself; the vtab must
-  enforce it. Pruning on exact table-name equality does so, and retaining `table = ?` in the wrapper is
-  a redundant guarantee.
-- **Existing pushdowns preserved.** The `db_version` / `site_id` constraint handling and the
-  `ORDER BY db_version, seq` consumption are additive and unchanged.
-- **`pk` / `value` stay post-scan.** A `pk IN (...)` filter remains a post-scan predicate — but now over
-  a single pruned table's clock rather than the whole union, which is the intended win for pk-targeted
-  reads.
-- **Vector integrity.** `pExtData.tbl_infos` must remain the full set; only the generated union SQL is
-  narrowed. Mutating the shared vector would break cursor/rowid bookkeeping.
-- **Non-CRR / unknown table name.** Must yield an empty result (no matching subquery), not a malformed
-  `FROM ()`.
+- **`IN` decomposition.** With `argvIndex` assigned and `sqlite3_vtab_in()` not used, SQLite loops over
+  the `IN` values and calls `xFilter` once per value. Each call is a bounded probe. This is free in
+  code, but *not* free in prepare cost — see the optional follow-up above.
+- **Non-EQ operators on `table`.** `!=`, `LIKE`, `IS`, `IS NULL` stay unusable and are applied by
+  SQLite as today. (`LIKE`/`GLOB` on a constant `tbl` would in principle prune arms too, but `omit`
+  semantics for `LIKE` are hint-only and `case_sensitive_like` interacts; not worth it.)
+- **`pk` / `val` stay post-scan** — but now over one pruned table's clock instead of the whole union,
+  which is the real win for pk-targeted reads.
+- **Empty / non-CRR table name.** With the required change alone, the union is still built in full and
+  every arm is skipped at run time; the statement steps straight to `DONE`, the cursor finalizes, and
+  `xEof` reports EOF. No special case needed.
+- **Zero CRRs.** Unchanged: `changes_filter` returns early when `tbl_infos` is empty.
+- **`ORDER BY` consumption and `db_version`/`site_id` pushdown** are additive and untouched.
+- **Writes.** `xUpdate` / `crsql_merge_insert` never consult `idxNum` or `idx_str`; the merge path is
+  unaffected.
 
-## Benefits to cr-sqlite users
+## Benefits
 
-- **Bounded table-scoped change reads.** `SELECT ... FROM crsql_changes WHERE "table" = ?` costs
-  O(rows-in-that-table) instead of O(total change rows). A small table stays cheap to read no matter how
-  large the rest of the database grows.
-- **Efficient multi-table reconciliation.** `WHERE "table" IN (...)` becomes one bounded probe per
-  table, for free.
-- **Better scaling for selective sync and tooling.** Any application that syncs, backfills, reconciles,
-  audits, or inspects specific tables via `crsql_changes` — rather than draining the whole change
-  stream — benefits directly, and increasingly so as the database grows.
-- **No cost to anyone else.** Queries that do not constrain `"table"` are planned exactly as before; the
-  change is opt-in by query shape. No schema migration, no format change, no ABI change.
+- **Bounded table-scoped change reads.** `WHERE "table" = ?` costs O(rows in that table) instead of
+  O(total change rows). A small table stays cheap regardless of how large the rest of the database gets.
+- **Efficient multi-table reconciliation.** `WHERE "table" IN (...)` becomes one bounded probe per table.
+- **Better selective sync and tooling.** Anything that syncs, backfills, reconciles, audits or inspects
+  specific tables via `crsql_changes` benefits, increasingly so as the database grows.
+- **No cost to anyone else.** Queries that do not constrain `"table"` are planned exactly as before.
+  No schema migration, no format change, no ABI change.
+- **Tiny diff.** Roughly ten lines in one function plus a cost tier, with no new state and no new
+  invariants to maintain.
 
 ## Validation plan
 
-- **Planner:** `EXPLAIN QUERY PLAN` for `SELECT ... FROM crsql_changes WHERE "table" = ?` before/after.
-- **Scaling benchmark:** measure the read cost of one small table's changes while an *unrelated* table
-  grows; before, the cost scales with the unrelated growth; after, it stays flat (bounded by the target
-  table).
-- **Correctness A/B:** for a populated table, assert byte-for-byte equality of the full result set with
-  vs. without the pushdown, across: all column types (incl. `NULL` and empty string), a deleted row
-  (delete sentinel), a composite primary key, and a table spanning multiple `db_version`s; plus paging
-  boundaries (exactly-`LIMIT`, empty table) if a `LIMIT`/cursor is used.
-- **Regression:** the existing `db_version`/`site_id`-filtered and unfiltered `crsql_changes` queries,
-  and `ORDER BY` consumers, are unchanged.
+- **Planner:** `EXPLAIN QUERY PLAN` / `EXPLAIN` for `SELECT ... FROM crsql_changes WHERE "table" = ?`.
+  The load-bearing assertion is not the `idxNum` in the `SCAN crsql_changes VIRTUAL TABLE INDEX ...`
+  line but the presence of the per-arm `Ne ... goto` guard ahead of each arm's `OpenRead` in the
+  statement the vtab prepares. A debug hook that logs the generated union SQL is the practical way to
+  check this from a test.
+- **Scaling benchmark:** read one small table's changes while an *unrelated* table grows. Before, cost
+  scales with the unrelated growth; after, it stays flat.
+- **Correctness A/B:** assert equality of the full result set with and without the change, across all
+  column types (incl. `NULL` and empty string), a delete sentinel, a pk-only (insert-sentinel) row, a
+  composite primary key, a table spanning multiple `db_version`s, `"table" = ?` combined with
+  `db_version > ?` and `site_id IS NOT ?`, and `"table" IN (...)`. With `omit = 0` this should be
+  unconditional, which is the point.
+- **Existing tests:** `py/correctness/tests/test_crsql_changes_filters.py::test_table_filter` already
+  exercises `=` and `!=` on `[table]` (with integer right-hand sides). It must keep passing unchanged.
+  Add a case with a text right-hand side that actually matches a table, and one that matches nothing.
+- **Regression:** existing `db_version`/`site_id`-filtered and unfiltered `crsql_changes` queries, and
+  `ORDER BY` consumers, are unchanged.
 
 ## Scope / non-goals
 
-- Only the `table`-column **equality** (and `IN`) path is pushed down. `pk`- and `value`-column
-  predicates remain post-scan (a `pk`-index access path would require broader vtab changes and is out of
-  scope here).
-- No change to `crsql_changes` columns, to the clock schema, or to the merge/apply path.
+- Only the `table`-column equality (and `IN`) path. `pk` and `val` predicates remain post-scan; a
+  `pk`-index access path would require broader vtab changes.
+- No change to `crsql_changes` columns, the clock schema, or the merge/apply path.
+- Statement caching for `xFilter` is called out as adjacent, not included.
+
+## Note on reproducing this locally
+
+`cd core && make loadable` currently fails in this tree for an unrelated reason: `sqlite3_capi`
+(`core/rs/sqlite-rs-embedded/sqlite3_capi/src/lib.rs:5`) uses `#![feature(concat_idents)]`, which was
+removed in Rust 1.90. Building the loadable extension needs a nightly older than that (or migrating to
+`${concat(..)}`). The measurements above were therefore taken by running the vtab's generated SQL shape
+directly against the bundled SQLite, which is sufficient — the pruning happens entirely inside the
+statement `xFilter` prepares.
