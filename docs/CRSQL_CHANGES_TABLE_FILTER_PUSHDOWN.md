@@ -506,6 +506,49 @@ throughout `changes_best_index`, but `CAST(tbl AS TEXT) = ?` is exact, shorter, 
 - **Regression:** existing `db_version`/`site_id`-filtered and unfiltered `crsql_changes` queries, and
   `ORDER BY` consumers, are unchanged.
 
+## Decision ledger
+
+This fork optimises for [Infocorder](https://infocorder.com)'s needs first; where a change serves every
+consumer at no meaningful cost, that is preferred. Sorting the open choices by that rule:
+
+| # | Choice | Cost to us | Who benefits | Call |
+|---|---|---|---|---|
+| 1 | `CAST(tbl AS TEXT) = ?` instead of `tbl = ?` | One token. N `Cast` opcodes in the run-once init block; **zero** per-row cost (measured) | Everyone | **Do it** — no tension |
+| 2 | `omit = 0` on the `Tbl` constraint | One redundant comparison per *returned* row | Everyone | **Do it** — no tension |
+| 3 | `BINARY` collation gate | ~4 lines, plus `constraint_is_usable` needs `index_info` + the constraint index (signature change, or inline it in the loop) | Everyone; we almost certainly never hit it | **Do it** — cheap generality |
+| 4 | `idxNum` tbl bit + cost tier | A cascade branch and a small refactor; numbers need `EXPLAIN QUERY PLAN` verification, not a guessed factor | Only joins and `IN` | **Depends — see below** |
+| 5 | `sqlite3_vtab_in()` | Binding addition + real `xFilter` work | Only `IN` users | **Skip unless `IN` matters** |
+| 6 | Prune the union SQL / cache statements | Moderate; new code paths in `xFilter` | Databases with many CRRs | **Measure first** |
+
+Rows 1–3 are the "costs us nothing, helps everyone" cases, and the ones that make the compatibility
+claim at the top of this document unqualified. Worth taking even though our own table names are ordinary
+identifiers and we would never notice their absence.
+
+### The one place the policy actually changes scope
+
+Row 4 is the real branch, because **the primary win does not depend on it.** For a plain
+`SELECT ... FROM crsql_changes WHERE "table" = ?` with a bound-parameter right-hand side, the constraint
+has no prerequisites and is not an `IN`, so `whereLoopAddVirtual` makes no further `xBestIndex` calls —
+"there is no point in making any further calls to xBestIndex() since they will all return the same
+result" (`core/src/sqlite/sqlite3.c:162008`). The single plan is used **regardless of its cost**, and the
+scan is pruned.
+
+The cost tier is needed only when SQLite has a rival plan to compare against:
+
+- `crsql_changes` in a **join**, where the right-hand side of `"table" = x` depends on another table.
+- **`WHERE "table" IN (...)`**, where SQLite deliberately re-plans with `IN` disabled and the `IN` plan
+  additionally carries a forced sorter.
+
+So if our access pattern is only `WHERE "table" = ?` (optionally with `db_version` / `site_id`) and a
+bound parameter, rows 4 and 5 can both be dropped: fewer lines, no hand-tuned planner estimates to
+justify or maintain, and no acceptance test that has to assert plan *selection* rather than results. If
+we do use `"table" IN (...)`, row 4 becomes required — without it the `IN` pushdown silently loses the
+tie-break and the optimisation does not happen at all, while every correctness test still passes.
+
+That question — do we read `crsql_changes` with `"table" IN (...)`, or join against it on `"table"`? —
+is worth settling before implementation, since it is the difference between a ~15-line patch and one that
+carries planner-estimate tuning plus a plan-selection test.
+
 ## Scope / non-goals
 
 - Only the `table`-column equality (and `IN`) path. `pk` and `val` predicates remain post-scan; a
