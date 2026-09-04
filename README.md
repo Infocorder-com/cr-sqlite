@@ -26,18 +26,17 @@ Stock cr-sqlite keeps its internal prepared statements (in `crsql_ExtData`) aliv
 
 ### 2. `crsql_changes` table-filter pushdown (about to be made)
 
-Stock cr-sqlite's `crsql_changes` virtual table treats `WHERE "table" = ?` as a *post-scan* filter: it scans the entire `UNION ALL` over **every** table's change-clock and discards non-matching rows afterward, so a table-scoped read costs O(total change rows across the whole database), independent of the target table's size. This fork patches the vtab's `xBestIndex` so a `"table" = ?` (or `"table" IN (...)`) constraint is pushed into the union and prunes the scan to the one matching `<table>__crsql_clock`. See [`docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md`](docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md).
+Stock cr-sqlite's `crsql_changes` virtual table treats `WHERE "table" = ?` as a *post-scan* filter: it scans the entire `UNION ALL` over **every** table's change-clock and discards non-matching rows afterward, so a table-scoped read costs O(total change rows across the whole database), independent of the target table's size. This fork patches the vtab's `xBestIndex` so a `"table" = ?` (or `"table" IN (...)`) constraint is pushed into the union and prunes the scan to the one matching `<table>__crsql_clock`. The predicate is emitted as `CAST(tbl AS TEXT) = ?`, which preserves SQLite's normal TEXT-affinity comparison, so **result sets are byte-identical to stock cr-sqlite for every table name** — this is a pure query-planner improvement, not a behavioral change. See [`docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md`](docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md).
 
 - **Benefit:** bounded table-scoped change reads — O(rows in that table), not O(total). Anything that syncs, backfills, reconciles, audits or inspects *specific* tables via `crsql_changes` stays cheap as the rest of the database grows.
-- **Cost / who should be careful:** the pushed-down predicate is compared *without* TEXT affinity, so the result is **not** byte-identical to stock cr-sqlite for a CRR table whose name is purely numeric — `WHERE "table" = 5` against a table literally named `5` returns rows in stock cr-sqlite but **none** after the pushdown (an intrinsic quirk, present regardless of the `omit` flag). It also needs a planner cost-model tuning. All of Infocorder's table names are ordinary identifiers, so this never bites us; a consumer that names CRR tables with digits and reads them through `crsql_changes` would be affected.
+- **Cost / who should be careful:** there is no result-level cost — output is unchanged for every query. The only caveats are the usual fork ones: it is a divergence from upstream (so tracking `vlcn-io`/`superfly` exactly is harder), and the patch carries a planner cost-model tier that `"table" IN (...)` pushdown depends on. No schema, wire-format, or ABI change.
 
 ### Especially poor fits for this fork
 
 - You want a **drop-in, binary-compatible** replacement for stock cr-sqlite, or need to **track `vlcn-io` / `superfly` upstream exactly** — this fork intentionally diverges and is maintained for Infocorder's needs, not general parity.
-- You have (or might create) **CRR tables with purely-numeric names** and query them by `"table" = <n>` through `crsql_changes` — change 2 alters those results.
 - You depend on stock cr-sqlite's **connection-close / finalize semantics** — change 1 alters those.
 
-For everyone else, this fork is effectively a superset of `superfly`'s behavior: unfiltered and identifier-named-table `crsql_changes` reads, the on-disk format, the wire/changeset format, and the public API are all unchanged.
+For everyone else, this fork is effectively a superset of `superfly`'s behavior: `crsql_changes` result sets (change 2 is byte-identical, just faster for table-scoped reads), the on-disk format, the wire/changeset format, and the public API are all unchanged.
 
 ## How to merge in commits from superfly
 

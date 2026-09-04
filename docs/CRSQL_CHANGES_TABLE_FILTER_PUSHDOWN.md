@@ -195,10 +195,16 @@ recursive CTE, and no `RIGHT`/`FULL` join above the subquery.
    the tbl bit will confine it to one table's clock. Scale the `db_version` / `site_id` tiers **down** when
    the tbl bit is *also* set (e.g. multiply their cost by a small factor), so the estimate reflects the
    pruning. The absolute numbers are hand-picked guesses; only the *ordering* between tiers matters.
-   Two cautions: the existing `1.0` / `10.0` tiers are already low enough to beat any competing plan, so
-   this particular tuning is closer to hygiene than to a fix; and resist driving `estimatedRows` toward
-   `1`, since that number feeds join-cardinality estimates elsewhere and the existing `estimatedRows = 1`
-   on the top tier is already an aggressive fiction.
+
+   **This tuning is load-bearing for `IN`, not mere hygiene.** For a plain `"table" = ? AND db_version > ?`
+   it is only cosmetic — the single plan is used regardless of cost. But `WHERE "table" IN (...) AND
+   db_version > ? ORDER BY db_version, seq` hits the same tie-break trap as bare `IN`: the `IN` plan
+   (`idxNum = 3`) and the non-`IN` rival (`idxNum = 2`) **both** match the `db_version` tier and land on the
+   same `10.0`, and the force-cleared `orderByConsumed` then adds a sorter to the `IN` plan only — so at
+   equal cost the pushdown loses. Scaling the `db_version`/`site_id` tiers down when the tbl bit is set is
+   what breaks that tie in the `IN` plan's favour. One caution the other way: resist driving `estimatedRows`
+   toward `1`, since that number feeds join-cardinality estimates elsewhere and the existing
+   `estimatedRows = 1` on the top tier is already an aggressive fiction.
 
    Note the snippet above uses `estimated_cost` / `estimated_rows` locals; today each branch writes
    `(*index_info).estimatedCost` directly inside its own `unsafe` block, so this is a (small, welcome)
@@ -288,12 +294,22 @@ guards in the same places as the bare form:
 184   Cast  5   66   0                   <-- evaluated once, in the prologue
 ```
 
-The `Cast` lands in the once-only prologue alongside the parameter load, so it costs one opcode per
-*statement*, not per arm and not per row.
+The EXPLAIN excerpt above shows a single `Cast` for brevity; a real N-arm union actually emits **one
+`Cast` per CRR table** (arm `'a'` casts `'a'`, arm `'b'` casts `'b'`, …). The material point holds either
+way: every one of them lands in the run-once init block ahead of the main loop (after the top-level
+`Halt`, reached once via `Init`/`Goto`), so the cost is one opcode per CRR table **per statement
+execution** — never per row. Do not "optimise" it as if it were per-row work.
 
-Implement it in `get_clock_table_col_name` (or at the point the predicate text is built) by mapping
-`CrsqlChangesColumn::Tbl` to `CAST(tbl AS TEXT)` rather than `tbl`. Nothing else changes: still one
-`?`, still one `argvIndex`, still aligned with `changes_filter`'s positional `bind_value` loop.
+Implement it by mapping `CrsqlChangesColumn::Tbl` to `CAST(tbl AS TEXT)` rather than `tbl`. Nothing else
+changes: still one `?`, still one `argvIndex`, still aligned with `changes_filter`'s positional
+`bind_value` loop.
+
+**One caveat on where to map it.** `get_clock_table_col_name` is shared with the **`ORDER BY`** emission
+path, not only the `WHERE` predicate. If you make the substitution there, `ORDER BY [table]` also becomes
+`ORDER BY CAST(tbl AS TEXT)`. That is harmless — the cast is identity on a `TEXT` literal, the ordering
+stays BINARY, and `ORDER BY` consumption remains valid — but it is a wider blast radius than the fix needs.
+If you prefer to leave `ORDER BY` byte-for-byte unchanged, inject the `CAST` only at the point the
+`WHERE`-predicate text is built and leave `get_clock_table_col_name` alone for the sort key.
 
 ### Why not the `CASE`/`typeof` form
 
