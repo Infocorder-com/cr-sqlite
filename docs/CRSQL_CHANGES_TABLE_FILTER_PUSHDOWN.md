@@ -6,12 +6,11 @@ ships) and re-checked on 3.50.2. See
 [Which SQLite is actually in play](#which-sqlite-is-actually-in-play).
 **Area:** `crsql_changes` virtual table — `xBestIndex` / `xFilter`.
 **Compatibility:** No schema change, no wire/format change, no new C ABI. Purely a query-planner
-improvement. With the predicate emitted as `CAST(tbl AS TEXT) = ?`, result sets are unchanged for every
-query except one documented shape: an explicit non-`BINARY` collation on the comparison
-(`WHERE "table" = 'ITEMS' COLLATE NOCASE`), which the `BINARY` gate would close but which this fork has
-chosen not to pay for — see the [Decision ledger](#decision-ledger). A bare `tbl = ?` (without the
-`CAST`) would additionally change results for numerically-named CRR tables. Note also that `IN` queries
-keep identical *results* but change *plan*: see [Row 4](#row-4-the-right-decision-but-not-for-the-stated-reason).
+improvement. With the predicate emitted as `CAST(tbl AS TEXT) = ?` **and** the `BINARY` collation gate,
+result sets are unchanged for every query. Dropping either one is a silent behaviour change: a bare
+`tbl = ?` changes results for numerically-named CRR tables, and skipping the gate changes results for
+`WHERE "table" = 'ITEMS' COLLATE NOCASE`. `IN` queries keep identical *results* either way but do change
+*plan* — see [Row 4](#row-4-the-right-decision-but-not-for-the-stated-reason).
 
 ## Summary
 
@@ -520,9 +519,9 @@ hot paths are `"table" = ?` and `"table" = ? AND pk IN (...)`.
 |---|---|---|---|
 | 1 | `CAST(tbl AS TEXT) = ?` instead of `tbl = ?` | One token; `Cast` opcodes land in the run-once init block, zero per-row cost (measured) | **Take** — free generality |
 | 2 | `omit = 0` on the `Tbl` constraint | One redundant comparison per *returned* row | **Take** — free generality |
-| 3 | `BINARY` collation gate | **Fork/vendor the `sqlite-rs-embedded` submodule** to add a `vtab_collation` wrapper — not four lines | **Probably drop** — see below |
+| 3 | `BINARY` collation gate | A `vtab_collation` wrapper in `sqlite-rs-embedded` — cheap **now that a fork of that repo already exists** (see below) | **Reconsider — take it** |
 | 4 | `idxNum` tbl bit + cost tier | A cascade branch plus estimate tuning | **Drop** — no join sites, and it is *not* what makes `IN` win |
-| 5 | `sqlite3_vtab_in()` full handling | Submodule fork + real `xFilter` work | **Drop** |
+| 5 | `sqlite3_vtab_in()` full handling | Wrapper is now cheap; the real `xFilter` work is not | **Drop** |
 | 6 | Prune the union SQL / cache statements | Moderate; new `xFilter` paths | **Measure first** |
 
 Rows 1 and 2 are still the clean "costs nothing, helps everyone" cases and should ship.
@@ -551,14 +550,25 @@ Three ways to land this, in order of preference given the usage above:
 
 Option 1 is the right first move. Revisit only if a spot-check shows one of the three sites regressing.
 
-### Row 3: the collation gate got more expensive
+### Row 3: the collation gate is cheap again
 
-The gate was recommended as cheap generality. It is not cheap: it needs a wrapper in a submodule owned
-by the unmaintained upstream, which is precisely the kind of change this fork's README warns widens
-drift. Under this fork's stated policy — take free generality, otherwise serve our own needs — that
-tips it to **drop**, and keep the `COLLATE` caveat documented in the README instead. It becomes worth
-revisiting only if the submodule has to be forked for some other reason anyway, at which point it is
-genuinely four lines.
+This was downgraded to "drop" on the grounds that `sqlite3_vtab_collation` has no callable wrapper and
+adding one meant forking a submodule owned by the unmaintained `vlcn-io` upstream. That premise no
+longer holds: a fork of `superfly/sqlite-rs-embedded` already exists under this org, and the submodule
+is being repointed at it regardless (see [Note on reproducing this locally](#note-on-reproducing-this-locally)).
+Adding a wrapper alongside the existing `pub fn vtab_distinct(index_info: *mut index_info)` is then the
+four lines it originally looked like:
+
+```rust
+pub fn vtab_collation(idx_info: *mut index_info, i: c_int) -> *const c_char {
+    unsafe { invoke_sqlite!(vtab_collation, idx_info, i) }
+}
+```
+
+`sqlite3_vtab_collation` is already in the `#[cfg(feature = "static")]` alias list
+(`sqlite3_capi/src/capi.rs:78`) and in `sqlite3_api_routines` for the loadable path, so no bindgen or
+header change is needed. That restores it to the "costs nothing, helps everyone" tier — **take it**, and
+the compatibility claim at the top of this document becomes unqualified.
 
 ## Scope / non-goals
 
@@ -586,9 +596,32 @@ and `sqlite3_vtab_in` (3.38). Check that floor before reaching for anything newe
 
 ## Note on reproducing this locally
 
-`cd core && make loadable` currently fails in this tree for an unrelated reason: `sqlite3_capi`
-(`core/rs/sqlite-rs-embedded/sqlite3_capi/src/lib.rs:5`) uses `#![feature(concat_idents)]`, which was
-removed in Rust 1.90. Building the loadable extension needs a nightly older than that (or migrating to
-`${concat(..)}`). The measurements above were therefore taken by running the vtab's generated SQL shape
-directly against the bundled SQLite, which is sufficient — the pruning happens entirely inside the
+`cd core && make loadable` fails in this tree. `sqlite3_capi/src/lib.rs` carries
+`#![feature(concat_idents)]`, **removed** in Rust 1.90 — a hard error on any toolchain. The crates pin
+`nightly-2023-10-05` in `rust-toolchain.toml`, but `rustup` is not installed on this machine, so the
+pins are inert and the system stable compiler (1.95.0) is used.
+
+The fix exists upstream, and is proven — but it is **not** on `superfly/cr-sqlite`'s `main`, which still
+pins the same `aba5628` submodule commit we do, still points `.gitmodules` at `vlcn-io`, and still
+carries every nightly gate. The stable-rust work lives on the unmerged branch
+`gorbak/replace-submodule-with-subrepo` (`f347c8d9`, 2026-01-27), paired with
+`superfly/sqlite-rs-embedded` `1872f70`. Verified locally: with that submodule, `sqlite3_capi`,
+`sqlite3_allocator`, `sqlite_nostd` and `crsql_core` all build on stable 1.95.
+
+The recipe, from `f347c8d9`:
+
+| File | Change |
+|---|---|
+| `core/rs/core/src/lib.rs` | delete `#![feature(vec_into_raw_parts)]` (stable since 1.93) |
+| `core/rs/fractindex-core/src/lib.rs` | delete `#![feature(core_intrinsics)]` — a stale gate, the crate uses no intrinsics |
+| `core/rs/bundle/src/lib.rs` | delete both gates; `core::intrinsics::abort()` → `stable_trap::abort()` (×3) |
+| `core/rs/bundle/src/lib.rs` | replace `#[lang = "eh_personality"]` with `#[no_mangle] extern "C" fn rust_eh_personality() {}`, plus `_rust_eh_personality` for `target_arch = "arm"` |
+| `core/rs/bundle/Cargo.toml` | add `stable_trap = { path = "../sqlite-rs-embedded/stable_trap" }` |
+| 5 × `rust-toolchain.toml` | repin off `nightly-2023-10-05` |
+
+The `eh_personality` step is the non-obvious one: rather than declaring a lang item (nightly-only), it
+defines the symbol the linker asks for directly.
+
+Until that lands, the measurements in this document were taken by running the vtab's generated SQL
+directly against the bundled engine, which is sufficient — the pruning happens entirely inside the
 statement `xFilter` prepares.
