@@ -1,4 +1,5 @@
 .DS_Store
+docs/CRSQLITE_FORK_UPGRADE_COORDINATION.md
 out.db
 .vscode
 a.out
