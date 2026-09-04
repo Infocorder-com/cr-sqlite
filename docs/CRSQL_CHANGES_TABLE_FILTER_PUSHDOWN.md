@@ -6,11 +6,12 @@ ships) and re-checked on 3.50.2. See
 [Which SQLite is actually in play](#which-sqlite-is-actually-in-play).
 **Area:** `crsql_changes` virtual table — `xBestIndex` / `xFilter`.
 **Compatibility:** No schema change, no wire/format change, no new C ABI. Purely a query-planner
-improvement. Result sets are unchanged for every query **provided** the predicate is emitted as
-`CAST(tbl AS TEXT) = ?` **and** the constraint is accepted only under `BINARY` collation (see
-[Emitting the predicate with TEXT affinity](#emitting-the-predicate-with-text-affinity)). A bare
-`tbl = ?` silently changes results for numerically-named CRR tables; skipping the collation gate
-silently changes results for `... = ? COLLATE NOCASE`.
+improvement. With the predicate emitted as `CAST(tbl AS TEXT) = ?`, result sets are unchanged for every
+query except one documented shape: an explicit non-`BINARY` collation on the comparison
+(`WHERE "table" = 'ITEMS' COLLATE NOCASE`), which the `BINARY` gate would close but which this fork has
+chosen not to pay for — see the [Decision ledger](#decision-ledger). A bare `tbl = ?` (without the
+`CAST`) would additionally change results for numerically-named CRR tables. Note also that `IN` queries
+keep identical *results* but change *plan*: see [Row 4](#row-4-the-right-decision-but-not-for-the-stated-reason).
 
 ## Summary
 
@@ -175,57 +176,46 @@ recursive CTE, and no `RIGHT`/`FULL` join above the subquery.
    }
    ```
 
-   Why it matters, in **two** cases — not one:
+   Why it matters — **measured, and not what an earlier draft of this document claimed.** A probe vtab
+   reproducing this exact cost model (both tiers landing on `10.0`), linked against the bundled 3.42.0
+   amalgamation, shows that **the `IN` plan already wins without any cost tier**:
 
-   - **Joins.** When `crsql_changes` appears in a join and the right-hand side of `"table" = x` depends on
-     another table, SQLite calls `xBestIndex` once with the constraint usable and once without; with two
-     identical `2147483647.0` costs there is nothing to prefer the pushdown, and SQLite may pick the full
-     scan.
-   - **`IN`.** `whereLoopAddVirtual` explicitly re-calls `xBestIndex` "with `IN(...)` terms disabled"
-     (`core/src/sqlite/sqlite3.c:162020`) and compares the two plans. Worse, when the vtab *does* consume
-     an `IN` constraint SQLite force-clears `orderByConsumed`
-     (`core/src/sqlite/sqlite3.c:161754`), so the `IN` plan must add a sorter that the non-`IN` plan does
-     not need. At equal cost the `IN` pushdown therefore **loses**, and
-     `WHERE "table" IN (...)` — the headline "multi-table reconciliation" benefit — silently does not
-     materialise. The cost tier is what makes it win.
+   ```
+   SELECT * FROM probe WHERE tbl IN ('a','b','c') AND dbv > 1 ORDER BY dbv;
+     [xBestIndex] ... tbl=EQ(pushed) dbv(pushed)   -> idxNum=3 cost=10.0 orderByConsumed=1
+     [xBestIndex] ... col0(UNUSABLE) dbv(pushed)   -> idxNum=2 cost=10.0 orderByConsumed=1
+     [xFilter] idxNum=3 args: a 1
+     [xFilter] idxNum=3 args: b 1
+     [xFilter] idxNum=3 args: c 1
+   ```
 
-   A plain `WHERE "table" = ?` with a bound-parameter RHS is the one case that does *not* depend on the
-   cost tier: the term has no prerequisites and no `IN`, so `whereLoopAddVirtual` makes no further
-   `xBestIndex` calls and the single plan is used regardless of cost.
+   The mechanism: every vtab loop gets `iSortIdx = 0` (`core/src/sqlite/sqlite3.c:162187`) and vtab loops
+   carry **no** `nIn` cost multiplier, so with identical `rRun`/`nOut`/`prereq` the two plans are directly
+   comparable in `whereLoopFindLesser`. The `IN` plan is inserted first (the "all constraints usable" call
+   at `:162004`), so the later non-`IN` template is **discarded outright** — it never reaches the path
+   solver where the sorter would have been priced in. The forced `orderByConsumed = 0` therefore costs a
+   sort but does not cost the plan.
 
-   **The combined `tbl + db_version` plan also needs tuning.** When both constraints are usable, `idxNum`
-   is `3` (bit 0 = tbl, bit 1 = db_version) and the cascade currently matches the `db_version` tier
-   **first**, so `"table" = ? AND db_version > ?` is costed as an un-pruned `db_version` scan even though
-   the tbl bit will confine it to one table's clock. Scale the `db_version` / `site_id` tiers **down** when
-   the tbl bit is *also* set (e.g. multiply their cost by a small factor), so the estimate reflects the
-   pruning. The absolute numbers are hand-picked guesses; only the *ordering* between tiers matters.
+   So the cost tier is **not** what makes `IN` win. Its only remaining justification is the **join** case:
+   `crsql_changes` joined on `"table" = other.col`, where the constraint carries a prerequisite and SQLite
+   genuinely compares a constrained plan against an unconstrained one. For a plain
+   `WHERE "table" = ?` with a bound-parameter right-hand side there is no rival plan at all —
+   `whereLoopAddVirtual` makes no further `xBestIndex` calls ("there is no point in making any further
+   calls to xBestIndex() since they will all return the same result", `:162008`) and the single plan is
+   used regardless of cost.
 
-   **This tuning is load-bearing for `IN`, not mere hygiene.** For a plain `"table" = ? AND db_version > ?`
-   it is only cosmetic — the single plan is used regardless of cost. But `WHERE "table" IN (...) AND
-   db_version > ? ORDER BY db_version, seq` hits the same tie-break trap as bare `IN`: the `IN` plan
-   (`idxNum = 3`) and the non-`IN` rival (`idxNum = 2`) **both** match the `db_version` tier and land on the
-   same `10.0`, and the force-cleared `orderByConsumed` then adds a sorter to the `IN` plan only — so at
-   equal cost the pushdown loses. Scaling the `db_version`/`site_id` tiers down when the tbl bit is set is
-   what breaks that tie in the `IN` plan's favour. One caution the other way: resist driving `estimatedRows`
-   toward `1`, since that number feeds join-cardinality estimates elsewhere and the existing
-   `estimatedRows = 1` on the top tier is already an aggressive fiction.
+   **If you do not want the `IN` pushdown, you must decline it explicitly** — omitting the cost tier does
+   not achieve that. Declining is measured to restore today's behaviour exactly:
 
-   **Those two pulls are in tension, so do not assume a factor — verify.** Breaking the tie requires the
-   cost reduction to exceed the *sort* cost SQLite adds to the `IN` path, and `rSortCost` scales with
-   `estimatedRows`; lowering rows helps win the tie but degrades join estimates. There is no factor that
-   is provably right a priori. Treat "`EXPLAIN QUERY PLAN` confirms `WHERE "table" IN (...)` reaches the
-   pushdown" as an explicit acceptance test, not an assumption.
-
-   **Better, if the `IN` case matters enough:** opt into `sqlite3_vtab_in()` for the `Tbl` constraint.
-   The `orderByConsumed` clearing is in the `else` branch of an `mHandleIn` test
-   (`core/src/sqlite/sqlite3.c:161746`), so a constraint the vtab handles via the `IN` iterator keeps
-   `ORDER BY` consumption — which removes the sorter, removes the tie-break entirely, and collapses N
-   `xFilter` calls (and N re-prepares of the whole union) into one. `sqlite3_vtab_in` /
-   `sqlite3_vtab_in_first` / `sqlite3_vtab_in_next` need SQLite ≥ 3.38 (bundled is 3.42) and are present
-   in `sqlite3ext.h`, though **not** currently re-exported by `sqlite3_capi/src/capi.rs`, so this needs a
-   binding addition plus real `xFilter` work (iterate the value list and prune the union to those tables).
-   It is strictly more work than the cost tier; it is also the only option that makes the `IN` win
-   robust rather than contingent on hand-tuned estimates.
+   ```
+   // in the xBestIndex constraint loop, for CrsqlChangesColumn::Tbl:
+   if sqlite3_vtab_in(index_info, i, -1) != 0 { continue; }   // leave IN to SQLite
+   ```
+   ```
+   SELECT * FROM probe WHERE tbl IN ('a','b','c') AND dbv > 1 ORDER BY dbv;
+     [xBestIndex] ... tbl=IN(DECLINED) dbv(pushed)  -> idxNum=2 cost=10.0 orderByConsumed=1
+     [xFilter] idxNum=2 args: 1                      <-- one call, ORDER BY still consumed
+   ```
 
    Note the snippet above uses `estimated_cost` / `estimated_rows` locals; today each branch writes
    `(*index_info).estimatedCost` directly inside its own `unsafe` block, so this is a (small, welcome)
@@ -398,12 +388,19 @@ hand), accept the `Tbl` constraint only when the comparison collation is `BINARY
 back to today's behaviour of letting SQLite apply it:
 
 ```rust
-// `sqlite3_vtab_collation` is already re-exported by the bindings:
-//   sqlite3_capi/src/capi.rs:74 -> `sqlite3_vtab_collation as vtab_collation`
-//   sqlite_nostd/src/nostd.rs:19 -> `pub use sqlite3_capi::*;`
 let coll = unsafe { CStr::from_ptr(sqlite::vtab_collation(index_info, i)) };
 let binary = coll.to_bytes().eq_ignore_ascii_case(b"BINARY");
 ```
+
+**This is not as cheap as it looks, and an earlier draft of this document understated it.**
+`sqlite3_vtab_collation` appears in `sqlite3_capi/src/capi.rs:74` only as a raw alias inside the private
+`mod aliased`, gated on `#[cfg(feature = "static")]`. There is no callable `pub fn vtab_collation(..)`
+wrapper, and the loadable build dispatches through `invoke_sqlite!` against a **private**
+`static mut SQLITE3_API` (`capi.rs:125`) that a downstream crate cannot reach. Adding the wrapper means
+editing `core/rs/sqlite-rs-embedded` — which is a **git submodule pointing at
+`vlcn-io/sqlite-rs-embedded`**, the unmaintained upstream. So this costs a submodule fork or vendoring,
+not four lines. The same is true of `sqlite3_vtab_in`, which is not even aliased. Price both accordingly
+in the ledger below.
 
 Only a constraint that is both `INDEX_CONSTRAINT_EQ` *and* `BINARY`-collated gets an `argvIndex`. Note
 this check needs the `index_info` pointer and the constraint index, which `constraint_is_usable` does not
@@ -500,54 +497,68 @@ throughout `changes_best_index`, but `CAST(tbl AS TEXT) = ?` is exact, shorter, 
   Those all evaluate false both before and after, so the test passes either way — it will **not** catch a
   bare-`tbl = ?` affinity regression. Add the numerically-named-table cases above, plus a text
   right-hand side that matches a table and one that matches nothing.
-- **`IN` plan selection:** assert that `WHERE "table" IN (...)` actually reaches the pushdown. Without
-  the cost tier, SQLite prefers the non-`IN` plan (which keeps `orderByConsumed`), and the optimisation
-  silently does not happen — a passing correctness suite will not reveal this.
+- **`IN` plan change:** `WHERE "table" IN (...)` switches from one `xFilter` call to one **per listed
+  table**, plus a sort — measured, and it happens with or without the cost tier. Results are unchanged,
+  so a correctness suite will not show it. If the three `IN` call sites matter, time them before and
+  after rather than assuming parity.
 - **Regression:** existing `db_version`/`site_id`-filtered and unfiltered `crsql_changes` queries, and
   `ORDER BY` consumers, are unchanged.
 
 ## Decision ledger
 
 This fork optimises for [Infocorder](https://infocorder.com)'s needs first; where a change serves every
-consumer at no meaningful cost, that is preferred. Sorting the open choices by that rule:
+consumer at no meaningful cost, that is preferred. Costs below are corrected against two things that
+turned out to matter: `sqlite3_vtab_*` helpers are **not** reachable without forking a submodule, and
+the `IN` plan wins **without** the cost tier.
 
-| # | Choice | Cost to us | Who benefits | Call |
-|---|---|---|---|---|
-| 1 | `CAST(tbl AS TEXT) = ?` instead of `tbl = ?` | One token. N `Cast` opcodes in the run-once init block; **zero** per-row cost (measured) | Everyone | **Do it** — no tension |
-| 2 | `omit = 0` on the `Tbl` constraint | One redundant comparison per *returned* row | Everyone | **Do it** — no tension |
-| 3 | `BINARY` collation gate | ~4 lines, plus `constraint_is_usable` needs `index_info` + the constraint index (signature change, or inline it in the loop) | Everyone; we almost certainly never hit it | **Do it** — cheap generality |
-| 4 | `idxNum` tbl bit + cost tier | A cascade branch and a small refactor; numbers need `EXPLAIN QUERY PLAN` verification, not a guessed factor | Only joins and `IN` | **Depends — see below** |
-| 5 | `sqlite3_vtab_in()` | Binding addition + real `xFilter` work | Only `IN` users | **Skip unless `IN` matters** |
-| 6 | Prune the union SQL / cache statements | Moderate; new code paths in `xFilter` | Databases with many CRRs | **Measure first** |
+**Usage, verified in the consuming app:** no `crsql_changes` reader joins another table on `"table"`.
+Three sites use `"table" IN (...)`, each already dominated by a pushed-down `db_version` constraint
+(`db_version > ?`; `db_version = ? AND seq > ?` with a `LIMIT`; `db_version > ? AND site_id = ?`). The
+hot paths are `"table" = ?` and `"table" = ? AND pk IN (...)`.
 
-Rows 1–3 are the "costs us nothing, helps everyone" cases, and the ones that make the compatibility
-claim at the top of this document unqualified. Worth taking even though our own table names are ordinary
-identifiers and we would never notice their absence.
+| # | Choice | Real cost | Call |
+|---|---|---|---|
+| 1 | `CAST(tbl AS TEXT) = ?` instead of `tbl = ?` | One token; `Cast` opcodes land in the run-once init block, zero per-row cost (measured) | **Take** — free generality |
+| 2 | `omit = 0` on the `Tbl` constraint | One redundant comparison per *returned* row | **Take** — free generality |
+| 3 | `BINARY` collation gate | **Fork/vendor the `sqlite-rs-embedded` submodule** to add a `vtab_collation` wrapper — not four lines | **Probably drop** — see below |
+| 4 | `idxNum` tbl bit + cost tier | A cascade branch plus estimate tuning | **Drop** — no join sites, and it is *not* what makes `IN` win |
+| 5 | `sqlite3_vtab_in()` full handling | Submodule fork + real `xFilter` work | **Drop** |
+| 6 | Prune the union SQL / cache statements | Moderate; new `xFilter` paths | **Measure first** |
 
-### The one place the policy actually changes scope
+Rows 1 and 2 are still the clean "costs nothing, helps everyone" cases and should ship.
 
-Row 4 is the real branch, because **the primary win does not depend on it.** For a plain
-`SELECT ... FROM crsql_changes WHERE "table" = ?` with a bound-parameter right-hand side, the constraint
-has no prerequisites and is not an `IN`, so `whereLoopAddVirtual` makes no further `xBestIndex` calls —
-"there is no point in making any further calls to xBestIndex() since they will all return the same
-result" (`core/src/sqlite/sqlite3.c:162008`). The single plan is used **regardless of its cost**, and the
-scan is pruned.
+### Row 4: the right decision, but not for the stated reason
 
-The cost tier is needed only when SQLite has a rival plan to compare against:
+Dropping the cost tier is correct — there are no join sites. But it does **not** leave the three `IN`
+sites at today's behaviour. As measured above, the `IN` plan wins on its own: those queries will issue
+**one `xFilter` per listed table** instead of one, each re-preparing the full union SQL (whose size is
+O(number of CRRs)), plus a sort, since the vtab's `ORDER BY` consumption is force-cleared for `IN`.
 
-- `crsql_changes` in a **join**, where the right-hand side of `"table" = x` depends on another table.
-- **`WHERE "table" IN (...)`**, where SQLite deliberately re-plans with `IN` disabled and the `IN` plan
-  additionally carries a forced sorter.
+Results are identical either way. The performance question is genuinely open: each probe is now pruned
+to one clock *and* still `db_version`-bounded, which is cheaper per probe, against N re-prepares of a
+large statement and a sorter. With a small N and few CRRs this is likely a wash or a win; it degrades as
+the CRR count grows, because prepare cost scales with it and nothing in items 1–2 shrinks the SQL text.
 
-So if our access pattern is only `WHERE "table" = ?` (optionally with `db_version` / `site_id`) and a
-bound parameter, rows 4 and 5 can both be dropped: fewer lines, no hand-tuned planner estimates to
-justify or maintain, and no acceptance test that has to assert plan *selection* rather than results. If
-we do use `"table" IN (...)`, row 4 becomes required — without it the `IN` pushdown silently loses the
-tie-break and the optimisation does not happen at all, while every correctness test still passes.
+Three ways to land this, in order of preference given the usage above:
 
-That question — do we read `crsql_changes` with `"table" IN (...)`, or join against it on `"table"`? —
-is worth settling before implementation, since it is the difference between a ~15-line patch and one that
-carries planner-estimate tuning plus a plan-selection test.
+1. **Accept it.** Ship items 1–2, let the `IN` sites take the N-probe plan. None is a hot path and all
+   are already `db_version`-bounded. Cost: zero. Requires accepting a behaviour change, so state it as
+   one rather than as "no regression", and spot-check the three sites once.
+2. **Decline `IN` explicitly** via `sqlite3_vtab_in(p, i, -1)`. Measured to restore today's plan exactly
+   (single `xFilter`, `ORDER BY` still consumed). Deterministic, but costs the submodule fork.
+3. **Add item 6** (prune the union SQL), which removes the N-re-prepare objection and makes the `IN`
+   plan straightforwardly good. Most work, best end state.
+
+Option 1 is the right first move. Revisit only if a spot-check shows one of the three sites regressing.
+
+### Row 3: the collation gate got more expensive
+
+The gate was recommended as cheap generality. It is not cheap: it needs a wrapper in a submodule owned
+by the unmaintained upstream, which is precisely the kind of change this fork's README warns widens
+drift. Under this fork's stated policy — take free generality, otherwise serve our own needs — that
+tips it to **drop**, and keep the `COLLATE` caveat documented in the README instead. It becomes worth
+revisiting only if the submodule has to be forked for some other reason anyway, at which point it is
+genuinely four lines.
 
 ## Scope / non-goals
 
