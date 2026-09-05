@@ -75,8 +75,21 @@ fn changes_best_index(
             continue;
         }
         let col = CrsqlChangesColumn::from_i32(constraint.iColumn);
+        let is_tbl = matches!(col, Some(CrsqlChangesColumn::Tbl));
         if let Some(col_name) = get_clock_table_col_name(&col) {
             if let Some(op_string) = get_operator_string(constraint.op) {
+                // `tbl` is a bare string literal in each union arm, so it carries NO
+                // affinity, while the vtab's `[table]` column is declared TEXT. Without
+                // the CAST, `"table" = 5` would compare integer 5 against 'items' with no
+                // conversion, whereas SQLite's own check applies TEXT affinity. CAST(..
+                // AS TEXT) has TEXT affinity, which restores the comparison SQLite would
+                // have performed. Applied here only -- the ORDER BY loop below keeps
+                // emitting bare `tbl`.
+                let pred_expr = if is_tbl {
+                    format!("CAST({} AS TEXT)", col_name)
+                } else {
+                    col_name.clone()
+                };
                 if first_constraint {
                     str.push_str("WHERE ");
                     first_constraint = false
@@ -87,13 +100,17 @@ fn changes_best_index(
                 if constraint.op == sqlite::INDEX_CONSTRAINT_ISNOTNULL as u8
                     || constraint.op == sqlite::INDEX_CONSTRAINT_ISNULL as u8
                 {
-                    str.push_str(&format!("{} {}", col_name, op_string));
+                    str.push_str(&format!("{} {}", pred_expr, op_string));
                     constraint_usage[i].argvIndex = 0;
                     constraint_usage[i].omit = 1;
                 } else {
-                    str.push_str(&format!("{} {} ?", col_name, op_string));
+                    str.push_str(&format!("{} {} ?", pred_expr, op_string));
                     constraint_usage[i].argvIndex = arg_v_index;
-                    constraint_usage[i].omit = 1;
+                    // Leave SQLite's own `"table" = ?` check in place. The pruning
+                    // predicate is provably a subset of it, so this is redundant in
+                    // practice -- but it costs one comparison per *returned* row and
+                    // guards against a future predicate that is looser than SQLite's.
+                    constraint_usage[i].omit = if is_tbl { 0 } else { 1 };
                     arg_v_index += 1;
                 }
             }
@@ -186,13 +203,19 @@ fn constraint_is_usable(constraint: &sqlite::index_constraint) -> bool {
     if constraint.usable == 0 {
         return false;
     }
-    if let Some(col) = CrsqlChangesColumn::from_i32(constraint.iColumn) {
-        !matches!(
-            col,
-            CrsqlChangesColumn::Tbl | CrsqlChangesColumn::Pk | CrsqlChangesColumn::Cval
-        )
-    } else {
-        false
+    match CrsqlChangesColumn::from_i32(constraint.iColumn) {
+        // `pk` is a packed blob produced by `crsql_pack_columns` and `val` is
+        // materialized from the base table *after* the scan, so neither exists in a
+        // form the clock union can filter on. They stay post-scan predicates.
+        Some(CrsqlChangesColumn::Pk) | Some(CrsqlChangesColumn::Cval) => false,
+        // `tbl` is a constant literal in each arm of the clock union, so an equality
+        // predicate lets SQLite skip non-matching arms before opening their cursors.
+        // EQ only: SQLite also reports `IN` as EQ here, which is intended. Other
+        // operators (`!=`, `LIKE`, `IS`, `IS NULL`) stay unusable and are applied by
+        // SQLite itself, exactly as before.
+        Some(CrsqlChangesColumn::Tbl) => constraint.op == sqlite::INDEX_CONSTRAINT_EQ as u8,
+        Some(_) => true,
+        None => false,
     }
 }
 

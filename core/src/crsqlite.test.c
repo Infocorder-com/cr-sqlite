@@ -791,6 +791,9 @@ static void testBuildIdReportsFeatureMarker() {
   assert(buildId != 0);
   // The feature tag must be present so the host can verify the FD-close fix.
   assert(strstr(buildId, "e1-fd-close") != 0);
+  // The tag is a cumulative `+`-joined capability list; each host gates on its own
+  // token, so a substring match must keep working as capabilities are appended.
+  assert(strstr(buildId, "e2-tbl-pushdown") != 0);
   sqlite3_finalize(pStmt);
 
   assert(crsql_close(db) == SQLITE_OK);
