@@ -14,8 +14,8 @@ each step:
 - **Release A** — EQ-only veto lift + `CAST(tbl AS TEXT) = ?` + `omit = 0`. Result sets are unchanged for
   every query **except** an explicit non-`BINARY` collation on the comparison
   (`WHERE "table" = 'ITEMS' COLLATE NOCASE`), which remains as documented in
-  [The remaining parity gap](#the-remaining-parity-gap-explicit-collate). Note the `CAST` is not optional
-  even in A: dropping it would *additionally* change results for numerically-named CRR tables.
+  [The remaining parity gap](#the-remaining-parity-gap-explicit-collate). Keep the `CAST` anyway — see
+  the note below on why its motivating case turns out to be unreachable.
 - **Release B** — adds the `BINARY` collation gate, closing that last shape. Only then is "result sets are
   unchanged for every query" unqualified.
 
@@ -373,6 +373,31 @@ path, not only the `WHERE` predicate. If you make the substitution there, `ORDER
 stays BINARY, and `ORDER BY` consumption remains valid — but it is a wider blast radius than the fix needs.
 If you prefer to leave `ORDER BY` byte-for-byte unchanged, inject the `CAST` only at the point the
 `WHERE`-predicate text is built and leave `get_clock_table_col_name` alone for the sort key.
+
+### The numeric-name case is unreachable in practice
+
+The `CAST` above was motivated by a CRR table whose name is the exact TEXT rendering of a number. **Such
+a table cannot be created**, so that divergence was never a live risk. `crsql_as_crr` accepts only bare
+SQL identifiers — anything requiring quotes fails, measured against the built extension:
+
+```
+crsql_as_crr('x5')  -> OK
+crsql_as_crr('5')   -> Error: stepping, SQL logic error
+crsql_as_crr('5x')  -> Error: stepping, SQL logic error
+crsql_as_crr('-3')  -> Error: stepping, SQL logic error
+crsql_as_crr('5.0') -> Error: stepping, SQL logic error
+crsql_as_crr('a b') -> Error: stepping, SQL logic error
+```
+
+(An upstream identifier-quoting gap, pre-existing and unrelated to this change.) Every numeric rendering
+begins with a digit or `-`, so none of them can name a CRR.
+
+**Keep the `CAST` regardless.** It costs one `Cast` opcode per arm per *statement* — measured, in the
+run-once init block — so the price of being right is nil, it stays correct if a clock is ever populated
+by means other than `crsql_as_crr`, and a predicate that is knowingly wrong about affinity is a bad thing
+to leave in a query planner. But do not describe the numeric-name shape as a *risk* this fixes; it is
+belt-and-braces, and the honest framing is that Release A's only reachable divergence is the `COLLATE`
+one below.
 
 ### The remaining parity gap: explicit `COLLATE`
 
