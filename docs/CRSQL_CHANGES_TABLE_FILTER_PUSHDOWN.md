@@ -6,11 +6,21 @@ ships) and re-checked on 3.50.2. See
 [Which SQLite is actually in play](#which-sqlite-is-actually-in-play).
 **Area:** `crsql_changes` virtual table — `xBestIndex` / `xFilter`.
 **Compatibility:** No schema change, no wire/format change, no new C ABI. Purely a query-planner
-improvement. With the predicate emitted as `CAST(tbl AS TEXT) = ?` **and** the `BINARY` collation gate,
-result sets are unchanged for every query. Dropping either one is a silent behaviour change: a bare
-`tbl = ?` changes results for numerically-named CRR tables, and skipping the gate changes results for
-`WHERE "table" = 'ITEMS' COLLATE NOCASE`. `IN` queries keep identical *results* either way but do change
-*plan* — see [Row 4](#row-4-the-right-decision-but-not-for-the-stated-reason).
+improvement.
+
+**Shipping in two releases** (coordination doc §9), which changes what the compatibility claim covers at
+each step:
+
+- **Release A** — EQ-only veto lift + `CAST(tbl AS TEXT) = ?` + `omit = 0`. Result sets are unchanged for
+  every query **except** an explicit non-`BINARY` collation on the comparison
+  (`WHERE "table" = 'ITEMS' COLLATE NOCASE`), which remains as documented in
+  [The remaining parity gap](#the-remaining-parity-gap-explicit-collate). Note the `CAST` is not optional
+  even in A: dropping it would *additionally* change results for numerically-named CRR tables.
+- **Release B** — adds the `BINARY` collation gate, closing that last shape. Only then is "result sets are
+  unchanged for every query" unqualified.
+
+Independent of A/B: `IN` queries keep identical *results* but do change *plan* from Release A onward — see
+[Row 4](#row-4-the-right-decision-but-not-for-the-stated-reason).
 
 ## Summary
 
