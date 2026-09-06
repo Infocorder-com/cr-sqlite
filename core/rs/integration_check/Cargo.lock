@@ -122,6 +122,7 @@ dependencies = [
  "crsql_fractindex_core",
  "libc-print",
  "sqlite_nostd",
+ "stable_trap",
 ]
 
 [[package]]
@@ -440,6 +441,10 @@ dependencies = [
  "sqlite3_allocator",
  "sqlite3_capi",
 ]
+
+[[package]]
+name = "stable_trap"
+version = "0.1.0"
 
 [[package]]
 name = "syn"
