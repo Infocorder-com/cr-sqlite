@@ -16,7 +16,12 @@ pub const SHA: &'static str = core::env!("CRSQLITE_COMMIT_SHA");
 //   e2-tbl-pushdown  `crsql_changes WHERE "table" = ?` is pushed into the clock union,
 //                    bounding a table-scoped read by that table's own clock
 //                    (docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md, Release A)
+//   e3-tbl-collate-gate
+//                    that pushdown is declined when SQLite would compare the
+//                    `table` constraint under a non-BINARY collation, so
+//                    `WHERE "table" = 'X' COLLATE NOCASE` is answered correctly
+//                    instead of being pruned under BINARY (Release B)
 pub const BUILD_ID: &'static str = concat!(
-    "e1-fd-close+e2-tbl-pushdown ",
+    "e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate ",
     core::env!("CRSQLITE_COMMIT_SHA")
 );

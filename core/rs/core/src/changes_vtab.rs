@@ -76,6 +76,14 @@ fn changes_best_index(
         }
         let col = CrsqlChangesColumn::from_i32(constraint.iColumn);
         let is_tbl = matches!(col, Some(CrsqlChangesColumn::Tbl));
+        // Decline a `table` constraint SQLite would compare under a non-BINARY
+        // collation -- the union prunes under BINARY, so honoring it would
+        // mis-prune. Declining means no argvIndex and no predicate text, i.e.
+        // SQLite applies it itself. Only `Tbl` is pushed into the union, so only
+        // `Tbl` needs the check.
+        if is_tbl && !constraint_collation_is_binary(index_info, i) {
+            continue;
+        }
         if let Some(col_name) = get_clock_table_col_name(&col) {
             if let Some(op_string) = get_operator_string(constraint.op) {
                 // `tbl` is a bare string literal in each union arm, so it carries NO
@@ -197,6 +205,29 @@ fn changes_best_index(
     }
 
     Ok(ResultCode::OK)
+}
+
+/// True when SQLite would compare this constraint under the `BINARY` collation.
+///
+/// The pushed-down predicate is evaluated inside the clock union, where the
+/// comparison is always `BINARY`. If SQLite would have used a different
+/// collation -- because the query says `... = 'X' COLLATE NOCASE`, or the column
+/// were ever redeclared with a collation -- then pruning under `BINARY` would
+/// drop rows the outer check would have kept. `sqlite3_vtab_collation` reports
+/// the *effective comparison* collation, so a plain `"table" = ?` answers
+/// `BINARY` and keeps the pushdown; anything else declines it and SQLite applies
+/// the constraint post-scan, exactly as it did before the pushdown existed.
+///
+/// A NULL return (constraint index out of range) is treated as not-BINARY: it
+/// should be unreachable, and declining is the safe direction.
+fn constraint_collation_is_binary(index_info: *mut sqlite::index_info, i: usize) -> bool {
+    let name = sqlite::vtab_collation(index_info, i as c_int);
+    if name.is_null() {
+        return false;
+    }
+    unsafe { CStr::from_ptr(name) }
+        .to_bytes()
+        .eq_ignore_ascii_case(b"BINARY")
 }
 
 fn constraint_is_usable(constraint: &sqlite::index_constraint) -> bool {
