@@ -15,7 +15,26 @@ A component of the [vulcan](https://vlcn.io) project.
 
 > ⚠️ **This repository is NOT a drop-in replacement for the original `vlcn-io` project or the `superfly` fork.**
 
-This repository is an **extension AND SPECIALIZATION** of the `superfly` fork that addresses two specific changes we wanted for [Infocorder](https://infocorder.com)'s hub-and-spoke SQLite sync that do **not** generalize to all use cases. If you just want vanilla cr-sqlite, use `vlcn-io/cr-sqlite` or `superfly/cr-sqlite` instead — this fork deliberately diverges from both. The two changes are:
+This repository is an **extension AND SPECIALIZATION** of the `superfly` fork, carrying changes we wanted for [Infocorder](https://infocorder.com)'s hub-and-spoke SQLite sync that do **not** all generalize to other use cases. If you just want vanilla cr-sqlite, use `vlcn-io/cr-sqlite` or `superfly/cr-sqlite` instead — this fork deliberately diverges from both.
+
+It also vendors a **different `sqlite-rs-embedded`**: the submodule points at [`Infocorder-com/superfly_sqlite-rs-embedded`](https://github.com/Infocorder-com/superfly_sqlite-rs-embedded) (our fork of Fly.io's fork) rather than `vlcn-io/sqlite-rs-embedded`. That brings a real soundness fix — `value_text` / `value_blob` called `slice::from_raw_parts` on a possibly-NULL pointer, which is UB and is hit on every merge and pk unpack — plus the stable-Rust support that change 3 depends on.
+
+**Detecting what you've got.** `crsql_build_id()` returns `<capability-tag> <commit-sha>`, where the tag is a `+`-joined cumulative list. A host should **substring-match the token it cares about** rather than compare the whole string, so appending capabilities never breaks an existing check:
+
+```
+sqlite> SELECT crsql_build_id();
+e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate 6cf126543be0818741ec28905d5fd4749509d554
+```
+
+| token | capability |
+|---|---|
+| `e1-fd-close` | change 1 — file descriptors released on connection close |
+| `e2-tbl-pushdown` | change 2 — `crsql_changes WHERE "table" = ?` pushed into the clock union |
+| `e3-tbl-collate-gate` | change 2's collation gate — the pushdown is declined under a non-`BINARY` collation |
+
+Upstream cr-sqlite has no `crsql_build_id()` at all, so its absence distinguishes a stock build from this fork.
+
+The changes are:
 
 ### 1. Finalize-on-close: release OS file descriptors when a connection closes (already shipped)
 
@@ -24,20 +43,36 @@ Stock cr-sqlite keeps its internal prepared statements (in `crsql_ExtData`) aliv
 - **Benefit:** long-lived processes that open and close *many* connections (e.g. a server holding one SQLite database per project/tenant) no longer leak file descriptors, and no app-side `crsql_finalize()` dance is required on every teardown path.
 - **Cost / who should be careful:** it changes connection-teardown behavior (cr-sqlite now hooks close to finalize its cached statements). Hosts that deliberately rely on stock close/finalize semantics, or that already call `crsql_finalize()` themselves, should confirm the new path suits them. And, like any fork change, it makes tracking upstream exactly harder.
 
-### 2. `crsql_changes` table-filter pushdown (about to be made)
+### 2. `crsql_changes` table-filter pushdown (shipped)
 
-Stock cr-sqlite's `crsql_changes` virtual table treats `WHERE "table" = ?` as a *post-scan* filter: it scans the entire `UNION ALL` over **every** table's change-clock and discards non-matching rows afterward, so a table-scoped read costs O(total change rows across the whole database), independent of the target table's size. This fork patches the vtab's `xBestIndex` so a `"table" = ?` (or `"table" IN (...)`) constraint is pushed into the union and prunes the scan to the one matching `<table>__crsql_clock`. The predicate is emitted as `CAST(tbl AS TEXT) = ?`, which preserves SQLite's normal TEXT-affinity comparison, so **result sets are byte-identical to stock cr-sqlite for every table name**, including numeric ones. See [`docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md`](docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md).
+Stock cr-sqlite's `crsql_changes` virtual table treats `WHERE "table" = ?` as a *post-scan* filter: it scans the entire `UNION ALL` over **every** table's change-clock and discards non-matching rows afterward, so a table-scoped read costs O(total change rows across the whole database), independent of the target table's size. This fork patches the vtab's `xBestIndex` so a `"table" = ?` (or `"table" IN (...)`) constraint is pushed into the union and prunes the scan to the one matching `<table>__crsql_clock`. The predicate is emitted as `CAST(tbl AS TEXT) = ?`, which preserves SQLite's normal TEXT-affinity comparison, so **result sets are byte-identical to stock cr-sqlite for every table name**, including numeric ones.
+
+A second commit added the **collation gate** (`e3-tbl-collate-gate`): SQLite hands a virtual table an equality constraint *without* filtering on collation, so `WHERE "table" = 'ITEMS' COLLATE NOCASE` initially arrived as a plain equality and got pruned under `BINARY`, silently returning nothing. The vtab now asks `sqlite3_vtab_collation()` and **declines** the constraint unless the comparison is `BINARY`, in which case SQLite applies it post-scan exactly as before the pushdown existed. So **result sets are byte-identical to stock cr-sqlite for every query shape**, not just for ordinary ones. See [`docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md`](docs/CRSQL_CHANGES_TABLE_FILTER_PUSHDOWN.md).
 
 - **Benefit:** bounded table-scoped change reads — O(rows in that table), not O(total). Anything that syncs, backfills, reconciles, audits or inspects *specific* tables via `crsql_changes` stays cheap as the rest of the database grows.
-- **Cost / who should be careful:** output is unchanged for every ordinary query. One narrow exception is planned to be closed before this ships: a query that puts an explicit non-`BINARY` collation on the comparison — `WHERE "table" = 'ITEMS' COLLATE NOCASE` — would match in stock cr-sqlite but not after the pushdown, because SQLite hands such constraints to the virtual table without filtering on collation. (Stock cr-sqlite already behaves this way for `WHERE cid = ... COLLATE ...`.) Otherwise the caveats are the usual fork ones: it is a divergence from upstream, and the patch carries a planner cost-model tier that `"table" IN (...)` pushdown depends on. No schema, wire-format, or ABI change.
+- **Cost / who should be careful:** results are unchanged, but two behaviours differ.
+  - A `WHERE "table" = ? COLLATE NOCASE` (or any non-`BINARY` collation) query is **correct but not accelerated** — the gate declines the pushdown and it falls back to a full scan.
+  - `WHERE "table" IN (...)` keeps identical results but changes *plan*: SQLite reports `IN` as an equality, so it issues one `xFilter` per listed table plus a sort, instead of one scan. Each probe is pruned, but the generated SQL is re-prepared per value, and that SQL grows with the number of CRR tables. Time it if you use `IN` over many tables.
+  - Otherwise the usual fork caveat: it is a divergence from upstream. No schema, wire-format, or ABI change.
+
+### 3. Builds on stable Rust (shipped)
+
+Upstream cr-sqlite requires a **nightly** toolchain: `sqlite-rs-embedded` used the `concat_idents` feature (removed from the compiler in Rust 1.90, so newer toolchains reject it outright), and cr-sqlite's own crates used `core_intrinsics`, `lang_items` and `vec_into_raw_parts`. Consumers were stuck pinning an old nightly, or patching the feature gates out at build time.
+
+This fork builds on **stable Rust 1.95.0**, pinned in each crate's `rust-toolchain.toml`. Following Fly.io's unmerged `f347c8d9`: the stale gates are deleted, `core::intrinsics::abort()` becomes `stable_trap::abort()`, and the `eh_personality` lang item is replaced by a plain `#[no_mangle] extern "C" fn rust_eh_personality()` that defines the symbol the linker wants without needing nightly. See [`docs/STABLE_RUST_PORT.md`](docs/STABLE_RUST_PORT.md).
+
+- **Benefit:** no nightly pin, and no build-time patching of feature gates. One less way for a toolchain change to break the build — which had already happened once, when `concat_idents` was removed.
+- **Cost / who should be careful:** `make asan` still needs nightly, because `-Zbuild-std` is a nightly-only flag; the same applies to the cross-compiled targets (`CI_MAYBE_TARGET`, iOS, Android), which are untouched here. Native `make loadable` / `make static` need only stable. Both `Cargo.lock` files are now lockfile **v4**, which requires cargo ≥ 1.78 — so build this ref with the toolchain it pins, and don't pair a new ref with an old nightly.
 
 ### Especially poor fits for this fork
 
 - You want a **drop-in, binary-compatible** replacement for stock cr-sqlite, or need to **track `vlcn-io` / `superfly` upstream exactly** — this fork intentionally diverges and is maintained for Infocorder's needs, not general parity.
 - You depend on stock cr-sqlite's **connection-close / finalize semantics** — change 1 alters those.
+- You read `crsql_changes` with **`"table" IN (...)` over many tables** and are sensitive to plan changes — see change 2's cost note.
+- You need the **cross-compiled or sanitizer targets** (iOS, Android, `CI_MAYBE_TARGET`, `make asan`) — those still require nightly; change 3 only makes the native builds stable.
 - You need to **keep receiving upstream fixes and features** — see the drift warning below.
 
-For everyone else, this fork is effectively a superset of `superfly`'s behavior: `crsql_changes` result sets (change 2 is byte-identical, just faster for table-scoped reads), the on-disk format, the wire/changeset format, and the public API are all unchanged.
+For everyone else, this fork is effectively a superset of `superfly`'s behavior: `crsql_changes` result sets are byte-identical for every query shape (change 2 is faster for table-scoped reads, not different), and the on-disk format, the wire/changeset format and the public API are all unchanged. The only additions to the API surface are `crsql_build_id()` and change 1's teardown behaviour.
 
 ### ⚠️ Upstream drift is the biggest risk of depending on this repo
 

@@ -1,26 +1,40 @@
 # Pushing the table filter down in the `crsql_changes` virtual table
 
-**Status:** Proposal / design. Revised after measuring SQLite's actual behaviour against the SQL this
-vtab generates, using the bundled `core/dist/sqlite3` shell (3.42.0 — the engine this tree actually
-ships) and re-checked on 3.50.2. See
-[Which SQLite is actually in play](#which-sqlite-is-actually-in-play).
+**Status:** **Implemented and shipped.** Two commits on this fork's `main`:
+`67a61644` (the pushdown — `e2-tbl-pushdown`) and `6cf12654` (the collation gate — `e3-tbl-collate-gate`,
+with the `vtab_collation` submodule wrapper at `c3c01fb8`). Both built and verified on stable Rust
+1.95.0. The design below is retained as the record of *why* it looks the way it does; the measurements
+were taken with the bundled `core/dist/sqlite3` shell (3.42.0 — the engine this tree ships) and
+re-checked on 3.50.2. See [Which SQLite is actually in play](#which-sqlite-is-actually-in-play).
 **Area:** `crsql_changes` virtual table — `xBestIndex` / `xFilter`.
 **Compatibility:** No schema change, no wire/format change, no new C ABI. Purely a query-planner
-improvement.
+improvement, and **result sets are byte-identical to stock cr-sqlite for every query shape.**
 
-**Shipping in two releases** (coordination doc §9), which changes what the compatibility claim covers at
-each step:
+Three pieces are load-bearing for that claim, and dropping any one of them is a silent behaviour change:
 
-- **Release A** — EQ-only veto lift + `CAST(tbl AS TEXT) = ?` + `omit = 0`. Result sets are unchanged for
-  every query **except** an explicit non-`BINARY` collation on the comparison
-  (`WHERE "table" = 'ITEMS' COLLATE NOCASE`), which remains as documented in
-  [The remaining parity gap](#the-remaining-parity-gap-explicit-collate). Keep the `CAST` anyway — see
-  the note below on why its motivating case turns out to be unreachable.
-- **Release B** — adds the `BINARY` collation gate, closing that last shape. Only then is "result sets are
-  unchanged for every query" unqualified.
+| piece | without it |
+|---|---|
+| EQ-only veto lift | other operators would be pushed down without being safe to push |
+| `CAST(tbl AS TEXT) = ?` | `"table" = 5` compares an integer against a string literal with no affinity (belt-and-braces — see [the numeric-name note](#the-numeric-name-case-is-unreachable-in-practice)) |
+| `BINARY` collation gate | `WHERE "table" = 'X' COLLATE NOCASE` is pruned under `BINARY` and wrongly returns nothing |
 
-Independent of A/B: `IN` queries keep identical *results* but do change *plan* from Release A onward — see
-[Row 4](#row-4-the-right-decision-but-not-for-the-stated-reason).
+`omit = 0` is kept as cheap insurance rather than a requirement.
+
+**One thing that is *not* result-identical:** `IN` queries keep identical results but change *plan* —
+SQLite reports `IN` as EQ, so the `IN` pushdown wins and issues one `xFilter` per listed table plus a
+sort. See [Row 4](#row-4-the-right-decision-but-not-for-the-stated-reason).
+
+**Measured, as shipped** (200k unrelated clock rows):
+
+| query | time |
+|---|---|
+| `WHERE "table" = ?` (BINARY → pushed) | **4 ms** |
+| `WHERE "table" IN (…)` | **3 ms** |
+| `WHERE "table" = ? COLLATE NOCASE` (declined → post-scan) | 271 ms |
+| unfiltered full scan (contrast) | 256 ms |
+
+Downstream measured the same win through the real NIF: the table-scoped read went from 4.09× to
+**1.05× flat**, and ~17 ms to ~850 µs under a 32k-row polluter.
 
 ## Summary
 
@@ -396,10 +410,16 @@ begins with a digit or `-`, so none of them can name a CRR.
 run-once init block — so the price of being right is nil, it stays correct if a clock is ever populated
 by means other than `crsql_as_crr`, and a predicate that is knowingly wrong about affinity is a bad thing
 to leave in a query planner. But do not describe the numeric-name shape as a *risk* this fixes; it is
-belt-and-braces, and the honest framing is that Release A's only reachable divergence is the `COLLATE`
-one below.
+belt-and-braces, and the honest framing is that the pushdown's only reachable divergence was the
+`COLLATE` one below — now closed by the gate.
 
-### The remaining parity gap: explicit `COLLATE`
+### The collation gap: explicit `COLLATE` — ✅ closed by the gate
+
+> **Closed in `6cf12654`.** `constraint_collation_is_binary()` asks `sqlite3_vtab_collation()` and
+> declines the `Tbl` constraint unless the comparison is `BINARY`; SQLite then applies it post-scan.
+> Measured before/after on the same fixture — `WHERE [table] = 'ITEMS' COLLATE NOCASE` went from
+> **0 rows (wrong)** to **2 rows (correct)**, both operand orderings, while a plain `= ?` still prunes
+> (4 ms vs a 256 ms full scan). The analysis below is the record of why the gap existed.
 
 `CAST(tbl AS TEXT) = ?` closes the *affinity* gap. It does **not** close the *collation* gap, and that
 gap is the same shape: prune-before-recheck, so `omit = 0` does not help.
@@ -552,12 +572,12 @@ hot paths are `"table" = ?` and `"table" = ? AND pk IN (...)`.
 
 | # | Choice | Real cost | Call |
 |---|---|---|---|
-| 1 | `CAST(tbl AS TEXT) = ?` instead of `tbl = ?` | One token; `Cast` opcodes land in the run-once init block, zero per-row cost (measured) | **Take** — free generality |
-| 2 | `omit = 0` on the `Tbl` constraint | One redundant comparison per *returned* row | **Take** — free generality |
-| 3 | `BINARY` collation gate | A `vtab_collation` wrapper in `sqlite-rs-embedded` — cheap **now that a fork of that repo already exists** (see below) | **Reconsider — take it** |
-| 4 | `idxNum` tbl bit + cost tier | A cascade branch plus estimate tuning | **Drop** — no join sites, and it is *not* what makes `IN` win |
-| 5 | `sqlite3_vtab_in()` full handling | Wrapper is now cheap; the real `xFilter` work is not | **Drop** |
-| 6 | Prune the union SQL / cache statements | Moderate; new `xFilter` paths | **Measure first** |
+| 1 | `CAST(tbl AS TEXT) = ?` instead of `tbl = ?` | One token; `Cast` opcodes land in the run-once init block, zero per-row cost (measured) | ✅ **Shipped** in `67a61644` |
+| 2 | `omit = 0` on the `Tbl` constraint | One redundant comparison per *returned* row | ✅ **Shipped** in `67a61644` |
+| 3 | `BINARY` collation gate | A `vtab_collation` wrapper in `sqlite-rs-embedded` — cheap once a fork of that repo existed | ✅ **Shipped** in `6cf12654` (+ submodule `c3c01fb8`) |
+| 4 | `idxNum` tbl bit + cost tier | A cascade branch plus estimate tuning | ❌ **Dropped** — no join sites, and it is *not* what makes `IN` win |
+| 5 | `sqlite3_vtab_in()` full handling | Wrapper is now cheap; the real `xFilter` work is not | ❌ **Dropped** |
+| 6 | Prune the union SQL / cache statements | Moderate; new `xFilter` paths | ⬜ **Not done** — revisit only if an `IN` site proves slow |
 
 Rows 1 and 2 are still the clean "costs nothing, helps everyone" cases and should ship.
 
@@ -631,7 +651,21 @@ and `sqlite3_vtab_in` (3.38). Check that floor before reaching for anything newe
 
 ## Building locally, and the toolchain floor
 
-**This builds.** Verified on 2026-09-04, producing `core/dist/crsqlite.so`:
+> **Superseded in part.** The nightly requirement described below is **gone** — the fork now builds on
+> stable Rust 1.95.0, pinned in each crate's `rust-toolchain.toml`. `RUSTUP_TOOLCHAIN` no longer needs
+> setting; the committed tomls select the toolchain. The history is kept because the ≥1.93 floor and the
+> lockfile-version coupling still bind anyone building an older ref.
+>
+> ```bash
+> cd core && make loadable      # or: make static
+> ```
+>
+> Caveats that survive the port: `make asan` keeps the nightly-only `-Zbuild-std`, as do the
+> cross-compiled targets (`CI_MAYBE_TARGET`, `IOS_TARGET`, `ANDROID_TARGET`); and both `Cargo.lock`
+> files are now lockfile **v4**, which needs cargo ≥ 1.78 — so build a ref with the toolchain that ref
+> pins, and never pair a new ref with an old nightly.
+
+**Historical (pre-stable-port).** Verified on 2026-09-04, producing `core/dist/crsqlite.so`:
 
 ```bash
 cd core
