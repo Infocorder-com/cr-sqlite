@@ -51,18 +51,26 @@ pub fn __rust_alloc_error_handler(_: Layout) -> ! {
     stable_trap::abort()
 }
 
+/// The Rust half of init. Returns the ext data, or null on failure with the
+/// real result code in `*rc_out` where init knows it (see
+/// `sqlite3_crsqlcore_init`); `sqlite3_crsqlite_init` turns that into its
+/// return code and message (**Init Failure Code and Message**).
 #[no_mangle]
 pub extern "C" fn sqlite3_crsqlrustbundle_init(
     db: *mut sqlite::sqlite3,
     err_msg: *mut *mut c_char,
     api: *mut sqlite::api_routines,
+    rc_out: *mut core::ffi::c_int,
 ) -> *mut ::core::ffi::c_void {
     sqlite::EXTENSION_INIT2(api);
 
     let rc = sqlite3_crsqlfractionalindex_init(db, err_msg, api);
     if rc != 0 {
+        if !rc_out.is_null() {
+            unsafe { *rc_out = rc as core::ffi::c_int };
+        }
         return core::ptr::null_mut();
     }
 
-    sqlite3_crsqlcore_init(db, err_msg, api)
+    sqlite3_crsqlcore_init(db, err_msg, api, rc_out)
 }

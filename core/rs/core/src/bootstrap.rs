@@ -17,11 +17,14 @@ fn uuid() -> [u8; 16] {
 #[no_mangle]
 pub extern "C" fn crsql_init_site_id(db: *mut sqlite3, ret: *mut u8) -> c_int {
     let buffer: &mut [u8] = unsafe { slice::from_raw_parts_mut(ret, 16) };
-    if let Ok(site_id) = init_site_id(db) {
-        buffer.copy_from_slice(&site_id);
-        ResultCode::OK as c_int
-    } else {
-        ResultCode::ERROR as c_int
+    match init_site_id(db) {
+        Ok(site_id) => {
+            buffer.copy_from_slice(&site_id);
+            ResultCode::OK as c_int
+        }
+        // The real code, so a lock failure reaches the host as SQLITE_BUSY
+        // (**Init Failure Code and Message**).
+        Err(code) => code as c_int,
     }
 }
 
@@ -125,43 +128,53 @@ fn crsql_create_schema_table_if_not_exists(db: *mut sqlite3) -> Result<ResultCod
     }
     db.exec_safe("SAVEPOINT crsql_create_schema_table;")?;
 
-    if let Ok(_) = db.exec_safe(&format!(
+    match db.exec_safe(&format!(
         "CREATE TABLE IF NOT EXISTS \"{}\" (\"key\" TEXT PRIMARY KEY, \"value\" ANY);",
         consts::TBL_SCHEMA
     )) {
-        db.exec_safe("RELEASE crsql_create_schema_table;")
-    } else {
-        // Roll back to OUR savepoint only. A bare ROLLBACK would abort a
-        // transaction that belongs to the host (**Init Host Rollback**).
-        let _ = db
-            .exec_safe("ROLLBACK TO crsql_create_schema_table; RELEASE crsql_create_schema_table;");
-        Err(ResultCode::ERROR)
+        Ok(_) => db.exec_safe("RELEASE crsql_create_schema_table;"),
+        Err(code) => {
+            // Roll back to OUR savepoint only. A bare ROLLBACK would abort a
+            // transaction that belongs to the host (**Init Host Rollback**).
+            let _ = db.exec_safe(
+                "ROLLBACK TO crsql_create_schema_table; RELEASE crsql_create_schema_table;",
+            );
+            Err(code)
+        }
     }
 }
 
 #[no_mangle]
 pub extern "C" fn crsql_maybe_update_db(db: *mut sqlite3, err_msg: *mut *mut c_char) -> c_int {
     // No schema table? First time this DB has been opened with this extension.
-    if let Ok(has_schema_table) = has_table(db, consts::TBL_SCHEMA) {
-        if let Err(code) = crsql_create_schema_table_if_not_exists(db) {
-            return code as c_int;
+    // Every failure returns its real code, so a lock failure reaches the
+    // host as SQLITE_BUSY (**Init Failure Code and Message**).
+    match has_table(db, consts::TBL_SCHEMA) {
+        Ok(has_schema_table) => {
+            if let Err(code) = crsql_create_schema_table_if_not_exists(db) {
+                return code as c_int;
+            }
+            let r = db.exec_safe("SAVEPOINT crsql_maybe_update_db;");
+            if let Err(code) = r {
+                return code as c_int;
+            }
+            match maybe_update_db_inner(db, has_schema_table == false, err_msg) {
+                Ok(_) => {
+                    let _ = db.exec_safe("RELEASE crsql_maybe_update_db;");
+                    ResultCode::OK as c_int
+                }
+                Err(code) => {
+                    // Roll back to OUR savepoint only (**Init Host
+                    // Rollback**); the caller's init transaction rolls back
+                    // the rest.
+                    let _ = db.exec_safe(
+                        "ROLLBACK TO crsql_maybe_update_db; RELEASE crsql_maybe_update_db;",
+                    );
+                    code as c_int
+                }
+            }
         }
-        let r = db.exec_safe("SAVEPOINT crsql_maybe_update_db;");
-        if let Err(code) = r {
-            return code as c_int;
-        }
-        if let Ok(_) = maybe_update_db_inner(db, has_schema_table == false, err_msg) {
-            let _ = db.exec_safe("RELEASE crsql_maybe_update_db;");
-            return ResultCode::OK as c_int;
-        } else {
-            // Roll back to OUR savepoint only (**Init Host Rollback**); the
-            // caller's init transaction rolls back the rest.
-            let _ =
-                db.exec_safe("ROLLBACK TO crsql_maybe_update_db; RELEASE crsql_maybe_update_db;");
-            return ResultCode::ERROR as c_int;
-        }
-    } else {
-        return ResultCode::ERROR as c_int;
+        Err(code) => code as c_int,
     }
 }
 
@@ -170,29 +183,31 @@ fn maybe_update_db_inner(
     is_blank_slate: bool,
     err_msg: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
-    let mut recorded_version: i32 = 0;
+    // 64-bit, matching the **Init Completeness Check**'s `CAST(value AS INTEGER)`:
+    // a 32-bit read truncated a version above 2^31 and refused the file.
+    let mut recorded_version: i64 = 0;
     let mut is_blank_slate = is_blank_slate;
 
     // Completely new DBs need no migrations.
     // We can set them to the current version.
     if is_blank_slate {
-        recorded_version = consts::CRSQLITE_VERSION;
+        recorded_version = consts::CRSQLITE_VERSION as i64;
     } else {
         let stmt =
             db.prepare_v2("SELECT value FROM crsql_master WHERE key = 'crsqlite_version'")?;
         let step_result = stmt.step()?;
         if step_result == ResultCode::ROW {
-            recorded_version = stmt.column_int(0);
+            recorded_version = stmt.column_int64(0);
         } else if is_init_residue(db)? {
             // **Init Residue Heal**: a Half-Initialized Database holds no
             // cr-sqlite state at all, so initialize it as if it were new.
             is_blank_slate = true;
-            recorded_version = consts::CRSQLITE_VERSION;
+            recorded_version = consts::CRSQLITE_VERSION as i64;
         }
     }
     // libc_print::libc_println!("recorded_version: {}", recorded_version);
 
-    if recorded_version < consts::CRSQLITE_VERSION_0_17_0 && !is_blank_slate {
+    if recorded_version < consts::CRSQLITE_VERSION_0_17_0 as i64 && !is_blank_slate {
         let cstring = CString::new(format!("Opening a db created with cr-sqlite version {} is not supported. Upcoming release 0.17.0 is a breaking change.", recorded_version))?;
         unsafe {
             (*err_msg) = cstring.into_raw();
@@ -201,7 +216,7 @@ fn maybe_update_db_inner(
     }
 
     // write the db version if we migrated to a new one or we are a blank slate db
-    if recorded_version < consts::CRSQLITE_VERSION || is_blank_slate {
+    if recorded_version < consts::CRSQLITE_VERSION as i64 || is_blank_slate {
         if crate::init_fault::fail_at(crate::init_fault::InitStep::VersionWrite) {
             return Err(ResultCode::BUSY);
         }
@@ -222,15 +237,20 @@ fn maybe_update_db_inner(
 ///      empty;
 ///   3. no other table, index, trigger or view whose name contains `crsql`
 ///      exists, other than those three tables and their `sqlite_autoindex_*`
-///      indexes.
+///      indexes. The exemption is for objects of type `table` with those
+///      names only: a trigger named `crsql_master` still blocks the heal.
 /// Rule 3 matches with `instr(lower(name), 'crsql')`, NOT `LIKE`: LIKE's case
 /// sensitivity follows `PRAGMA case_sensitive_like`, which a host may set
 /// before a `load_extension`. Keep it name-based and broad: every cr-sqlite
 /// version that ever finished init left a site-id table (under one of its
 /// names), and every CRR leaves `__crsql_*` objects, so a file this admits has
 /// nothing to lose. Application tables are allowed (scope ruled broad).
-/// Called only under init's transaction, and only when `crsql_master` exists
-/// without a `crsqlite_version` row.
+/// Called only when `crsql_master` exists without a `crsqlite_version` row,
+/// and only inside init's transaction: under `BEGIN IMMEDIATE` (the write
+/// lock held), or -- for `load_extension` inside a host transaction -- under
+/// `SAVEPOINT crsql_init`, which holds no write lock. That is safe: a
+/// competing writer makes the heal's first write fail, and the savepoint
+/// rolls back cleanly.
 fn is_init_residue(db: *mut sqlite3) -> Result<bool, ResultCode> {
     let stmt = db.prepare_v2("SELECT count(*) FROM crsql_master")?;
     if stmt.step()? != ResultCode::ROW || stmt.column_int64(0) != 0 {
@@ -248,7 +268,8 @@ fn is_init_residue(db: *mut sqlite3) -> Result<bool, ResultCode> {
         "SELECT count(*) FROM sqlite_master
          WHERE type IN ('table', 'index', 'trigger', 'view')
            AND instr(lower(name), 'crsql') > 0
-           AND name NOT IN ('crsql_master', 'crsql_tracked_peers', 'crsql_db_versions')
+           AND NOT (type = 'table'
+                    AND name IN ('crsql_master', 'crsql_tracked_peers', 'crsql_db_versions'))
            AND NOT (type = 'index'
                     AND tbl_name IN ('crsql_master', 'crsql_tracked_peers', 'crsql_db_versions')
                     AND substr(name, 1, 17) = 'sqlite_autoindex_')",

@@ -98,3 +98,34 @@ def test_init_race_failed_load_close(tmp_path):
         timeout=60,
     )
     assert r.returncode == 0, f"subprocess exited {r.returncode}"
+
+
+# What a load_extension host sees when init runs out of lock budget. SQLite's
+# sqlite3_load_extension always returns SQLITE_ERROR for a failed entry point
+# (whatever code the entry point returned) and prefixes the entry point's
+# message, so the message is the host's only signal; it must name the lock.
+LOCKED_LOAD_MSG = "error during initialization: cr-sqlite init: database is locked"
+
+
+@pytest.mark.parametrize("host_txn", [False, True])
+def test_init_race_busy_load_message(tmp_path, keeper, host_txn):
+    path = tmp_path / "fresh.db"
+    holder = sqlite3.connect(path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    # timeout=0: no host busy handler, so the lock fails the load at once.
+    c = sqlite3.connect(path, isolation_level=None, timeout=0)
+    try:
+        if host_txn:
+            c.execute("BEGIN")
+            c.execute("SELECT count(*) FROM sqlite_master").fetchall()
+        c.enable_load_extension(True)
+        with pytest.raises(sqlite3.OperationalError) as e:
+            c.load_extension(EXTENSION)
+        assert str(e.value) == LOCKED_LOAD_MSG
+        # A failed init leaves the host's transaction alone.
+        assert c.in_transaction == host_txn
+    finally:
+        # Close before the keeper releases the library.
+        c.close()
+        holder.execute("ROLLBACK")
+        holder.close()

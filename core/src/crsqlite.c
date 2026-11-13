@@ -72,11 +72,32 @@ static int crsql_close_trace_hook(unsigned traceType, void *pCtx, void *p,
 }
 
 void *sqlite3_crsqlrustbundle_init(sqlite3 *db, char **pzErrMsg,
-                                   const sqlite3_api_routines *pApi);
+                                   const sqlite3_api_routines *pApi, int *pRc);
 // The ownership handoff (core/rs/core/src/lib.rs): registers crsql_db_version
 // with the destructor that frees pExtData. If it fails, SQLite has already
 // run that destructor.
 int crsql_register_db_version(sqlite3 *db, crsql_ExtData *pExtData);
+
+// Init Failure Code and Message (docs/CRSQLITE_INIT_RACE_FIX.md). Every
+// failed init returns its real result code -- SQLITE_BUSY when it could not
+// get its lock -- and leaves a message, unless an earlier step already left a
+// more specific one (the version-0 refusal does). The message is allocated
+// with sqlite3_mprintf, which on the loadable path is the host SQLite's own
+// allocator (SQLITE_EXTENSION_INIT2 routes it through pApi): both callers of
+// an entry point free it with sqlite3_free -- sqlite3AutoLoadExtensions after
+// prefixing "automatic extension loading failed: ", and sqlite3LoadExtension
+// after prefixing "error during initialization: ". (sqlite3_load_extension
+// itself always returns SQLITE_ERROR for a failed entry point, whatever code
+// it returned, so on that path the message is the host's only signal.)
+static int crsql_init_failed(char **pzErrMsg, int rc) {
+  if (rc == SQLITE_OK) {
+    rc = SQLITE_ERROR;
+  }
+  if (pzErrMsg != 0 && *pzErrMsg == 0) {
+    *pzErrMsg = sqlite3_mprintf("cr-sqlite init: %s", sqlite3_errstr(rc));
+  }
+  return rc;
+}
 
 #ifdef _WIN32
 __declspec(dllexport)
@@ -102,10 +123,13 @@ __declspec(dllexport)
   //
   // On success the Rust init has committed the Atomic Init Transaction and
   // returns the ext data, which this function still owns until the handoff
-  // below. On failure it has freed everything of its own.
-  crsql_ExtData *pExtData = sqlite3_crsqlrustbundle_init(db, pzErrMsg, pApi);
+  // below. On failure it has freed everything of its own and left its real
+  // result code in initRc (SQLITE_ERROR where it has no better one).
+  int initRc = SQLITE_ERROR;
+  crsql_ExtData *pExtData =
+      sqlite3_crsqlrustbundle_init(db, pzErrMsg, pApi, &initRc);
   if (pExtData == 0) {
-    return SQLITE_ERROR;
+    return crsql_init_failed(pzErrMsg, initRc);
   }
 
 #ifdef UNIT_TEST
@@ -122,7 +146,7 @@ __declspec(dllexport)
     // finalizes its statements, so the host's sqlite3_close_v2 can deallocate
     // the connection (Init Error-Path Frees).
     crsql_freeExtData(pExtData);
-    return rc;
+    return crsql_init_failed(pzErrMsg, rc);
   }
 
   // The ownership handoff -- init's LAST fallible step. crsql_db_version's
@@ -133,7 +157,7 @@ __declspec(dllexport)
   // load_extension never leaves it registered (Failed Load Unmapped Callback).
   rc = crsql_register_db_version(db, pExtData);
   if (rc != SQLITE_OK) {
-    return rc;
+    return crsql_init_failed(pzErrMsg, rc);
   }
 
   // NOTHING FALLIBLE MAY FOLLOW. A failure after the handoff would have to

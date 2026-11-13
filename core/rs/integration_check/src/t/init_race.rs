@@ -52,12 +52,21 @@ extern "C" {
     fn fwrite(ptr: *const c_void, size: usize, n: usize, f: *mut c_void) -> usize;
     fn fclose(f: *mut c_void) -> c_int;
     fn clock_gettime(clk: c_int, ts: *mut Timespec) -> c_int;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn opendir(path: *const c_char) -> *mut c_void;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn readdir(dir: *mut c_void) -> *mut c_void;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn closedir(dir: *mut c_void) -> c_int;
+
+    // core/src/crsqlite.c: the load_extension entry point. This binary is
+    // built with SQLITE_OMIT_LOAD_EXTENSION, so SQLITE_EXTENSION_INIT2
+    // ignores the API routines pointer and a null one is correct here.
+    fn sqlite3_crsqlite_init(
+        db: *mut b::sqlite3,
+        pz_err_msg: *mut *mut c_char,
+        api: *const c_void,
+    ) -> c_int;
 
     // core/src/core_init.c: registers this build's auto-extension entry point.
     fn core_init(dummy: *const c_char) -> c_int;
@@ -71,6 +80,14 @@ const OPEN_RW: c_int = (b::SQLITE_OPEN_READWRITE | b::SQLITE_OPEN_CREATE) as c_i
 const OPEN_RO: c_int = b::SQLITE_OPEN_READONLY as c_int;
 const SQLITE_OK: c_int = 0;
 const SQLITE_BUSY: c_int = 5;
+const SQLITE_READONLY: c_int = 8;
+/// What `sqlite3AutoLoadExtensions` prefixes to an auto-extension's message.
+const AUTOEXT_PREFIX: &str = "automatic extension loading failed: ";
+/// cr-sqlite's own message for an init that ran out of lock budget.
+const LOCKED_MSG: &str = "cr-sqlite init: database is locked";
+/// A test that cannot run here returns `Err(skipped(reason))`; the runner
+/// reports it as SKIPPED, never as ok.
+const SKIP_PREFIX: &str = "SKIPPED: ";
 const CRSQLITE_VERSION: i64 = 170000;
 
 #[cfg(target_os = "macos")]
@@ -180,25 +197,39 @@ fn now_ms() -> i64 {
     (ts.tv_sec as i64) * 1000 + (ts.tv_nsec as i64) / 1_000_000
 }
 
-/// Open file descriptors of this process (`/proc/self/fd`), or None where
-/// that is not available.
-#[cfg(target_os = "linux")]
+/// Where the open file descriptors of this process are listed: Linux, then
+/// macOS and the BSDs.
+#[cfg(unix)]
+const FD_DIRS: [&str; 2] = ["/proc/self/fd", "/dev/fd"];
+
+/// Open file descriptors of this process, or None where no fd directory
+/// exists (Windows). Tests that need it report SKIPPED then, never ok.
+#[cfg(unix)]
 fn fd_count() -> Option<usize> {
-    let d = unsafe { opendir(cstr("/proc/self/fd").as_ptr()) };
-    if d.is_null() {
-        return None;
+    for dir in FD_DIRS {
+        let d = unsafe { opendir(cstr(dir).as_ptr()) };
+        if d.is_null() {
+            continue;
+        }
+        let mut n = 0;
+        while !unsafe { readdir(d) }.is_null() {
+            n += 1;
+        }
+        unsafe { closedir(d) };
+        return Some(n);
     }
-    let mut n = 0;
-    while !unsafe { readdir(d) }.is_null() {
-        n += 1;
-    }
-    unsafe { closedir(d) };
-    Some(n)
+    None
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn fd_count() -> Option<usize> {
     None
 }
+
+fn skipped(reason: &str) -> String {
+    format!("{}{}", SKIP_PREFIX, reason)
+}
+
+const NO_FD_DIR: &str = "no fd directory (/proc/self/fd or /dev/fd) to count file descriptors";
 
 struct Opened {
     rc: c_int,
@@ -493,6 +524,23 @@ fn init_race_heal_refuses_crsql_object() -> TResult {
     r
 }
 
+/// Heal rule 3 exempts the three bookkeeping TABLES by name, not any object
+/// that happens to carry one of their names: a user trigger called
+/// `crsql_master` is a cr-sqlite-named object and must block the heal.
+fn init_race_heal_refuses_crsql_named_trigger() -> TResult {
+    let path = residue_with(
+        "trig",
+        "CREATE TABLE app (a); CREATE TRIGGER crsql_master AFTER INSERT ON app BEGIN SELECT 1; END;",
+    )?;
+    let before = read_file(&path)?;
+    let r = open_expect_failure(&path, "version 0 is not supported");
+    let after = read_file(&path)?;
+    remove_db(&path);
+    r?;
+    check!(before == after, "file bytes changed by a refused open");
+    Ok(())
+}
+
 fn init_race_heal_app_tables() -> TResult {
     let path = residue_with(
         "app",
@@ -596,8 +644,7 @@ fn init_race_error_paths_free_once() -> TResult {
 /// process holds no more file descriptors than before the open.
 fn init_race_late_failure_no_zombie() -> TResult {
     if fd_count().is_none() {
-        println!("  (skipped: no /proc/self/fd)");
-        return Ok(());
+        return Err(skipped(NO_FD_DIR));
     }
     let mut failures = Vec::new();
     let init_path = initialized("zombie_init")?;
@@ -796,11 +843,175 @@ fn init_race_config_broken_setting_closes() -> TResult {
         let after = fd_count();
         check!(o.rc != SQLITE_OK, "open with a broken setting succeeded");
         check!(crc == SQLITE_OK, "close_v2 returned {}", crc);
+        // The checks above ran; without an fd directory the leak half cannot.
+        if before.is_none() {
+            return Err(skipped(NO_FD_DIR));
+        }
         check!(
             before == after,
             "fds {:?} before, {:?} after",
             before,
             after
+        );
+        Ok(())
+    })();
+    remove_db(&path);
+    r
+}
+
+/// Calls `sqlite3_crsqlite_init` as `sqlite3_load_extension` calls an
+/// extension's entry point: no busy handler of init's own, and a message the
+/// caller frees with `sqlite3_free`. This binary is built with
+/// SQLITE_OMIT_LOAD_EXTENSION, so the real `load_extension` (which always
+/// returns SQLITE_ERROR, prefixing the message) is covered by py
+/// `test_init_race_busy_load_message`.
+fn load_path_init(db: *mut b::sqlite3) -> (c_int, Option<String>) {
+    let mut err: *mut c_char = null_mut();
+    let rc = unsafe { sqlite3_crsqlite_init(db, &mut err, core::ptr::null()) };
+    let msg = if err.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { CStr::from_ptr(err) }
+                .to_str()
+                .unwrap_or("?")
+                .to_string(),
+        )
+    };
+    unsafe { b::sqlite3_free(err as *mut c_void) };
+    (rc, msg)
+}
+
+/// A lock failure reports SQLITE_BUSY and says so, on every path: the
+/// auto-extension open (under the **Init Busy Timeout**), the load_extension
+/// entry point in autocommit mode, and inside a host transaction (the
+/// `SAVEPOINT crsql_init` path, whose first write is refused). Before the
+/// fix all three returned SQLITE_ERROR with an empty message. Under
+/// `make valgrind-strict` this also proves the message is freed by SQLite's
+/// allocator without a leak or a mismatched free.
+fn init_race_busy_reports_code_and_message() -> TResult {
+    let path = tmp_db("busymsg");
+    let r = (|| -> TResult {
+        let _b = Budget::set(100);
+        let p = open_plain(&path, OPEN_RW)?;
+        exec(p, "BEGIN IMMEDIATE")?;
+        let result = (|| -> TResult {
+            let o = open_cr(&path, OPEN_RW);
+            close_v2(o.db);
+            check!(
+                o.rc == SQLITE_BUSY,
+                "auto-extension open returned {} `{}`",
+                o.rc,
+                o.err
+            );
+            let want = format!("{}{}", AUTOEXT_PREFIX, LOCKED_MSG);
+            check!(
+                o.err == want,
+                "auto-extension message `{}`, want `{}`",
+                o.err,
+                want
+            );
+
+            let l = open_plain(&path, OPEN_RW)?;
+            let (rc, msg) = load_path_init(l);
+            let crc = close_v2(l);
+            check!(rc == SQLITE_BUSY, "load path returned {} {:?}", rc, msg);
+            check!(
+                msg.as_deref() == Some(LOCKED_MSG),
+                "load path message {:?}",
+                msg
+            );
+            check!(crc == SQLITE_OK, "load path close_v2 returned {}", crc);
+
+            let l = open_plain(&path, OPEN_RW)?;
+            let begun = exec(l, "BEGIN; SELECT count(*) FROM sqlite_master;");
+            let (rc, msg) = if begun.is_ok() {
+                load_path_init(l)
+            } else {
+                (-1, None)
+            };
+            let _ = exec(l, "ROLLBACK");
+            let crc = close_v2(l);
+            begun?;
+            check!(
+                rc == SQLITE_BUSY,
+                "load path in a host transaction returned {} {:?}",
+                rc,
+                msg
+            );
+            check!(
+                msg.as_deref() == Some(LOCKED_MSG),
+                "load path in a host transaction: message {:?}",
+                msg
+            );
+            check!(crc == SQLITE_OK, "close_v2 returned {}", crc);
+            Ok(())
+        })();
+        let _ = exec(p, "ROLLBACK");
+        close_v2(p);
+        result?;
+        let n = crsql_objects(&path)?;
+        check!(n == 0, "{} cr-sqlite objects written by failed inits", n);
+        Ok(())
+    })();
+    remove_db(&path);
+    r
+}
+
+/// Other init failures carry their real code and a message too: a read-only
+/// open of an empty file fails at init's first write with SQLITE_READONLY.
+fn init_race_other_failure_reports_code_and_message() -> TResult {
+    let path = tmp_db("romsg");
+    let r = (|| -> TResult {
+        // An empty file: a plain open creates it and writes nothing.
+        close_v2(open_plain(&path, OPEN_RW)?);
+        let o = open_cr(&path, OPEN_RO);
+        close_v2(o.db);
+        check!(
+            o.rc == SQLITE_READONLY,
+            "read-only open returned {} `{}`",
+            o.rc,
+            o.err
+        );
+        let want = format!(
+            "{}cr-sqlite init: attempt to write a readonly database",
+            AUTOEXT_PREFIX
+        );
+        check!(o.err == want, "message `{}`, want `{}`", o.err, want);
+        Ok(())
+    })();
+    remove_db(&path);
+    r
+}
+
+/// The completeness check and the init sequence read the recorded version
+/// the same, 64-bit way. A version above 2^31 is a (future) version the
+/// check accepts; a 32-bit read in the sequence truncated it to a negative
+/// number and refused the file as "version -2147483648".
+fn init_race_version_read_is_64_bit() -> TResult {
+    let path = initialized("v64")?;
+    let r = (|| -> TResult {
+        let p = open_plain(&path, OPEN_RW)?;
+        let w = exec(
+            p,
+            "UPDATE crsql_master SET value = 2147483648 WHERE key = 'crsqlite_version'",
+        );
+        close_v2(p);
+        w?;
+        let o = open_cr(&path, OPEN_RW);
+        let v = if o.rc == SQLITE_OK {
+            query_i64(
+                o.db,
+                "SELECT value FROM crsql_master WHERE key = 'crsqlite_version'",
+            )
+        } else {
+            Ok(None)
+        };
+        close_v2(o.db);
+        check!(o.rc == SQLITE_OK, "open failed: {} {}", o.rc, o.err);
+        check!(
+            v? == Some(2147483648),
+            "the recorded version was rewritten by an open"
         );
         Ok(())
     })();
@@ -978,8 +1189,27 @@ const TESTS: &[(&str, fn() -> TResult)] = &[
         "init_race_config_broken_setting_closes",
         init_race_config_broken_setting_closes,
     ),
+    (
+        "init_race_heal_refuses_crsql_named_trigger",
+        init_race_heal_refuses_crsql_named_trigger,
+    ),
+    (
+        "init_race_busy_reports_code_and_message",
+        init_race_busy_reports_code_and_message,
+    ),
+    (
+        "init_race_other_failure_reports_code_and_message",
+        init_race_other_failure_reports_code_and_message,
+    ),
+    (
+        "init_race_version_read_is_64_bit",
+        init_race_version_read_is_64_bit,
+    ),
 ];
 
+/// Runs every test (or `CRSQL_INIT_RACE_ONLY`), printing `ok`, `FAILED` or
+/// `SKIPPED` for each and a summary line. A SKIPPED test passes the suite
+/// but is never printed as ok: it could not run on this platform.
 #[no_mangle]
 pub extern "C" fn crsql_init_race_check() {
     let only = unsafe { getenv(cstr("CRSQL_INIT_RACE_ONLY").as_ptr()) };
@@ -991,7 +1221,7 @@ pub extern "C" fn crsql_init_race_check() {
             .ok()
             .map(|s| s.to_string())
     };
-    let mut failed = 0;
+    let (mut passed, mut failed, mut skipped) = (0, 0, 0);
     for (name, f) in TESTS {
         if let Some(o) = &only {
             if o != name {
@@ -999,13 +1229,24 @@ pub extern "C" fn crsql_init_race_check() {
             }
         }
         match f() {
-            Ok(()) => println!("{} ... ok", name),
+            Ok(()) => {
+                passed += 1;
+                println!("{} ... ok", name);
+            }
+            Err(e) if e.starts_with(SKIP_PREFIX) => {
+                skipped += 1;
+                println!("{} ... {}", name, e);
+            }
             Err(e) => {
                 failed += 1;
                 println!("{} ... FAILED: {}", name, e);
             }
         }
     }
+    println!(
+        "init_race: {} passed, {} skipped, {} failed",
+        passed, skipped, failed
+    );
     if failed > 0 {
         panic!("{} init_race test(s) failed", failed);
     }

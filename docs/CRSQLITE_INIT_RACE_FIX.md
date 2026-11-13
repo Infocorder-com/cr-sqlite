@@ -1,8 +1,10 @@
 # Making cr-sqlite's per-connection init atomic — the init race wedge
 
-**Status:** ✅ **Built and verified in the working tree, not yet committed** (2026-11-13). Every part
-below is implemented; `make test`, `make valgrind-strict`, `py/correctness` and the stress script are
-green, and the key guarantees are mutation-verified. Where the build made a choice the plan left open,
+**Status:** ✅ **Built, verified and committed in `578ef5d6`** (2026-11-13). A follow-up that fixes
+the code review's findings (**Code review follow-up**, in the **Build record**) is in the working
+tree, verified, and awaiting the operator's commit; the release SHA to pin is the commit that includes
+it. Every part below is implemented; `make test`, `make valgrind-strict`, `py/correctness` and the
+stress script are green, and the key guarantees are mutation-verified. Where the build made a choice the plan left open,
 or added to it, **Build record** says so. The plan was revised twice after adversarial reviews and the
 operator's rulings before it was built.
 **Area:** extension init — `core/rs/core/src/lib.rs` `sqlite3_crsqlcore_init`,
@@ -11,7 +13,9 @@ and a new auto-extension entry point, `sqlite3_crsqlite_autoext_init`), `core/sr
 `core/src/core_init.c`.
 **Compatibility:** no wire or changeset format change. One new exported C symbol,
 `sqlite3_crsqlite_autoext_init` (the auto-extension entry point of **Init Busy Timeout**); existing
-symbols are unchanged. On-disk format is unchanged for every database that opens today. The behaviour
+exported API symbols are unchanged (the internal Rust init symbols `sqlite3_crsqlrustbundle_init` and
+`sqlite3_crsqlcore_init`, which only `crsqlite.c` calls, gained an `rc_out` parameter for
+**Init Failure Code and Message**). On-disk format is unchanged for every database that opens today. The behaviour
 changes are that a **Half-Initialized Database** — which today can never be opened — opens, and that an
 open through the new entry point waits for a competing connection instead of failing.
 **Downstream integration:** `silicon_brain` `docs/CRSQLITE_INIT_RACE_FIX_INTEGRATION.md` (pin bump,
@@ -478,15 +482,21 @@ target (**Fault injection**, **What to run**).
 The **Atomic Init Transaction** prevents new wedges. It does not rescue a file wedged by an earlier
 build: `has_schema_table` is true and there is no version row, so the version-0 refusal still fires.
 
-**The heal predicate.** Inside the slow path (so under the lock), treat the database as a blank slate
-— `is_blank_slate = true` — when **all** of these hold:
+**The heal predicate.** Inside init's transaction, treat the database as a blank slate
+— `is_blank_slate = true` — when **all** of these hold. The predicate runs in `maybe_update_db_inner`,
+so it runs wherever the sequence does: on the slow path, under `BEGIN IMMEDIATE` and so under the write
+lock; and on the `SAVEPOINT crsql_init` path (`load_extension` inside a host transaction), which holds
+**no** write lock. That second case is safe: a competing writer makes the heal's first write fail to
+upgrade the lock, the open fails, and the savepoint rolls back cleanly, leaving the file as it was.
 
 1. `crsql_master` exists and has **zero rows** — not merely "no `crsqlite_version` row". (`crsql_master`
    also stores `config.*` rows written by `crsql_config_set`; a file with any row was opened
    successfully at least once.)
 2. `crsql_tracked_peers` and `crsql_db_versions`, if they exist, have zero rows.
 3. **No other cr-sqlite object exists.** No table, index, trigger or view in `sqlite_master` whose name
-   contains `crsql`, other than those three tables and their `sqlite_autoindex_*` indexes. Match with
+   contains `crsql`, other than those three tables and their `sqlite_autoindex_*` indexes. The
+   exemption is by type **and** name — objects of type `table` with exactly those names — so a user
+   trigger called `crsql_master` still blocks the heal (`init_race_heal_refuses_crsql_named_trigger`). Match with
    `instr(lower(name), 'crsql') > 0`, **not** `LIKE '%crsql%'`: `LIKE`'s case sensitivity follows
    `PRAGMA case_sensitive_like`, which a host may have set on its connection before a `load_extension`
    (or the `SQLITE_CASE_SENSITIVE_LIKE` compile option), while `instr` over `lower()` does not change.
@@ -660,6 +670,42 @@ in a bounded loop with `sqlite3_sleep`, precisely to avoid touching the busy han
 those two points — not the fast-path reads, which the measurements showed failing on initialized files.
 A busy handler installed by a separate auto-extension entry point covers every read and write of init.
 
+### Init Failure Code and Message — what a host sees when init fails
+
+**The rule.** A failed init returns its **real** result code — `SQLITE_BUSY` when it could not get
+its lock — and always leaves a message. Before this rule, `sqlite3_crsqlite_init` returned
+`SQLITE_ERROR` whenever the Rust half failed and set no message, so a host saw rc 1 and a message that
+ended in a colon with nothing after it.
+
+**How the code travels.** The Rust half returns a pointer (the ext data), so the code travels in an
+out-parameter: `sqlite3_crsqlrustbundle_init` and `sqlite3_crsqlcore_init` take an `int *rc_out`
+(internal symbols; only `crsqlite.c` calls them). `sqlite3_crsqlite_init` seeds it with
+`SQLITE_ERROR`; the Rust half overwrites it with the code of the step that failed — the
+**Atomic Init Transaction**'s `BEGIN`, read, `COMMIT`, or any step of the sequence, each of which
+now passes its own code up instead of collapsing to `SQLITE_ERROR` — and with the fractional-index
+init's code if that fails. A registration failure keeps the seeded `SQLITE_ERROR`.
+
+**The message.** `crsql_init_failed` in `crsqlite.c` sets `*pzErrMsg` to
+`cr-sqlite init: <sqlite3_errstr(rc)>` — `cr-sqlite init: database is locked` for a lock failure —
+unless a step already left a more specific message (the version-0 refusal does). It uses
+`sqlite3_mprintf`, which on the loadable path is the host SQLite's own allocator
+(`SQLITE_EXTENSION_INIT2` routes it through the API routines), because both of SQLite's callers free
+the message with `sqlite3_free`. Checked in this fork's SQLite 3.42.0 and Exqlite's 3.54.1: the two
+`sqlite3AutoLoadExtensions` and `sqlite3LoadExtension` are identical in this respect. The Rust
+version-0 message is allocated by the Rust global allocator, which is `sqlite3_malloc`
+(`SQLite3Allocator`), so it is freed correctly too.
+
+**What the host sees, per path:**
+
+| path | return code | message |
+|---|---|---|
+| auto-extension (`sqlite3_open_v2`; Exqlite's) | `SQLITE_BUSY` (5): `sqlite3AutoLoadExtensions` stores the entry point's code with `sqlite3ErrorWithMsg`, and `openDatabase` returns `sqlite3_errcode(db)` | `automatic extension loading failed: cr-sqlite init: database is locked` |
+| `sqlite3_load_extension` / `SELECT load_extension(...)` | ⚠️ **always `SQLITE_ERROR` (1)**: `sqlite3LoadExtension` discards a failed entry point's code | `error during initialization: cr-sqlite init: database is locked` — on this path the message is the host's only signal |
+
+The entry point itself returns `SQLITE_BUSY` on both paths; it is SQLite's `load_extension` wrapper
+that turns it into `SQLITE_ERROR`. As with any failed open, the auto-extension path leaves a handle the
+host must close.
+
 ### Error paths, teardown and the rest of the extension
 
 - **Every early return** in `sqlite3_crsqlcore_init` and `sqlite3_crsqlite_init` follows the ownership
@@ -754,11 +800,16 @@ Name them so a grep finds them all: prefix `init_race_`.
 | `init_race_heal_app_tables` | residue plus an application table with rows | heals (broad scope); app rows untouched |
 | `init_race_atomic_at_each_step` | fault injection (**Fault injection**) fails init at each persistent step, from `crsql_init_peer_tracking_table` through `create_site_id_triggers`, and at `COMMIT` | open fails; afterwards `sqlite_master` contains **no** `crsql` object; next open succeeds |
 | `init_race_error_paths_free_once` | the same injection at every registration and at the `crsql_changes` module, before and after the commit, including the handoff itself; each open is closed with `sqlite3_close_v2`, as Exqlite does | open fails, close returns `SQLITE_OK`; under the strict valgrind target: no leak, no invalid free, no use after free |
-| `init_race_late_failure_no_zombie` | for every injection point from `crsql_newExtData` on (including `crsql_changes` and the handoff): count the process's open file descriptors (`/proc/self/fd` on Linux; skip elsewhere), open a file-backed database with the injection set, `sqlite3_close_v2` it | the descriptor count is back to its value before the open — a zombie keeps the database descriptor open. Pins the **Init Error-Path Frees** zombie |
+| `init_race_late_failure_no_zombie` | for every injection point from `crsql_newExtData` on (including `crsql_changes` and the handoff): count the process's open file descriptors (`/proc/self/fd` on Linux, `/dev/fd` on macOS and the BSDs; reported as **SKIPPED**, never ok, where neither exists), open a file-backed database with the injection set, `sqlite3_close_v2` it | the descriptor count is back to its value before the open — a zombie keeps the database descriptor open. Pins the **Init Error-Path Frees** zombie |
 | `init_race_loser_writes_nothing` | plain, cr-sqlite-free connection P holds `BEGIN IMMEDIATE` on a fresh file; budget overridden to 200 ms; open C with cr-sqlite; time the open with a monotonic clock | C's open fails; ⏱ **elapsed ≥ 150 ms** (it waited, rather than failing at once) and **elapsed < 200 ms + 1 s** (it gave up within the budget); after P rolls back the file is still empty. ⚠️ Before the fix C fails at once and the file is also empty, so **only the lower timing bound** distinguishes the fix |
 | `init_race_commit_busy` | P is a **plain, cr-sqlite-free** connection that holds `SHARED` (`BEGIN; SELECT count(*) FROM sqlite_master;`) on a fresh file; budget 200 ms; open C with cr-sqlite; time it | C's `COMMIT` waits out the budget (P cannot release on one thread) and rolls back: ⏱ **elapsed ≥ 150 ms** and **< 200 ms + 1 s**; the file is still empty; after P ends, C's next open succeeds. ⚠️ Before the fix C's first separately committed `CREATE TABLE` fails at once and rolls back, leaving the file empty too, so again **only the lower timing bound** is red before the fix |
 | `init_race_reopen_writes_nothing` | fully initialized file; open it read-write while P holds `BEGIN IMMEDIATE`; separately open it read-only (`SQLITE_OPEN_READONLY`) | both opens succeed at once (elapsed well under the budget). ⭐ The read-write half is the one that proves the fast path takes no write lock; the read-only half cannot detect an over-strict check (**Keeping the re-open path read-only**) |
 | `init_race_config_busy_fails` | initialized file with `merge-equal-values` set; set the `UNIT_TEST` hook `crsql_test_force_config_step_rc = SQLITE_BUSY` (below); open; reset the hook | open fails rather than succeeding with the default |
+| `init_race_heal_refuses_crsql_named_trigger` | residue plus an application table and a **trigger** named `crsql_master` | open fails with the version-0 message; file bytes unchanged. Pins that heal rule 3 exempts the three names only as tables |
+| `init_race_busy_reports_code_and_message` | P holds `BEGIN IMMEDIATE` on a fresh file; budget 100 ms. (a) auto-extension open; (b) a plain connection calls `sqlite3_crsqlite_init` directly, as `sqlite3_load_extension` does; (c) the same inside a host transaction (`BEGIN; SELECT …`), i.e. the `SAVEPOINT crsql_init` path | (a) `SQLITE_BUSY` and `automatic extension loading failed: cr-sqlite init: database is locked`; (b) and (c) `SQLITE_BUSY` and `cr-sqlite init: database is locked`, freed with `sqlite3_free`; no cr-sqlite object written. Under the strict valgrind target: no leak or mismatched free (**Init Failure Code and Message**) |
+| `init_race_other_failure_reports_code_and_message` | an empty file (created by a plain open); open it read-only with cr-sqlite | `SQLITE_READONLY` and `automatic extension loading failed: cr-sqlite init: attempt to write a readonly database` |
+| `init_race_version_read_is_64_bit` | initialized file whose recorded version is set to 2^31 | the open succeeds and leaves the value alone. A 32-bit read in the sequence refused it as "version -2147483648" while the completeness check accepted it |
+| `test_init_race_busy_load_message` (`py/correctness`, two cases: autocommit, and inside a host transaction) | keeper connection; a holder holds `BEGIN IMMEDIATE` on a fresh file; a connection with no busy timeout calls `load_extension` | `OperationalError` with exactly `error during initialization: cr-sqlite init: database is locked` (SQLite's `load_extension` always reports `SQLITE_ERROR`); the host's transaction state is unchanged |
 | `init_race_host_txn_preserved` | not testable here — the test binary sets `SQLITE_OMIT_LOAD_EXTENSION`. In `py/correctness`: open a **keeper** connection and load the extension on it (`:memory:`); then on a copy of `v0.12.0.prior-db`, `BEGIN`, insert a row into a host table, `load_extension` (fails: v0.12 is refused); close the keeper only after this connection | the host's row is still there; the host's transaction is still open |
 | `test_init_race_heal_case_sensitive_like` (`py/correctness`) | keeper connection as above; on a residue file plus an empty `Foo__CRSQL_Clock` table, `PRAGMA case_sensitive_like = ON`, then `load_extension` | the load fails (not healed) |
 | `test_init_race_failed_load_close` (`py/correctness`) | **no keeper**: in a **subprocess**, `load_extension` on a copy of `v0.12.0.prior-db` (fails), then close the connection and exit 0 | the subprocess exits 0. ⚠️ Red before the fix: closing calls `crsql_sqlite_free` in the unloaded library, so the subprocess crashes. The subprocess keeps a crash from taking pytest down |
@@ -935,9 +986,10 @@ and the coordination doc's **Pin this** sections):
 
 ## Build record — what was built, and the choices the plan left open
 
-Built 2026-11-13 on stable Rust 1.95.0 (asdf), gcc, Linux x86_64, against this fork's HEAD `8d153fc2`.
-Not yet committed: the release SHA and the coordination doc's **Pin this** table are filled in when the
-operator commits.
+Built 2026-11-13 on stable Rust 1.95.0 (asdf), gcc, Linux x86_64, against this fork's HEAD `8d153fc2`,
+and committed as `578ef5d6`. The **Code review follow-up** below is in the working tree, awaiting the
+operator's commit. The release SHA to pin is the commit that includes the follow-up; the coordination
+doc's **Pin this** table carries a placeholder until then.
 
 ### Where the code is
 
@@ -950,6 +1002,7 @@ operator commits.
 | **Failed Load Unmapped Callback** | `lib.rs`: `sqlite_free_destructor` (`api.free` on the loadable path, the `sqlite3_free` symbol statically) |
 | **Init Host Rollback** | `bootstrap.rs`: `ROLLBACK TO <savepoint>; RELEASE <savepoint>` in both init savepoints; `InitTxn`'s savepoint form |
 | `config.%` loop | `ext-data.c`: fails the open on any final step result but `SQLITE_DONE`; finalizes the statement on the broken-setting and prepare-failure paths |
+| **Init Failure Code and Message** | `crsqlite.c`: `crsql_init_failed`, and `initRc` passed to `sqlite3_crsqlrustbundle_init`. `bundle/src/lib.rs` and `lib.rs` `sqlite3_crsqlcore_init`: the `rc_out` parameter. `lib.rs` `init_sequence` and `init_rc`, `bootstrap.rs` `crsql_maybe_update_db`, `crsql_create_schema_table_if_not_exists` and `crsql_init_site_id`: each passes its real code up |
 | fault injection | `init_fault.rs` (`InitStep`, `fail_at`, `n_arg`), `test_exports.rs` (the static, `crsql_test_fail_init_at`, `crsql_test_init_fail_step`); C hooks declared in `crsqlite.h` under `UNIT_TEST` |
 | tests | `core/rs/integration_check/src/t/init_race.rs`; `py/correctness/tests/test_init_race.py`; `tools/init_race_stress.sh` |
 
@@ -982,8 +1035,9 @@ operator commits.
 - **The heal predicate runs only when `crsql_master` has no `crsqlite_version` row**, inside
   `maybe_update_db_inner`, so it never runs on the fast path, where the check requires that row. Rule 2
   checks each table's existence first, as written.
-- **The completeness check** compares `CAST(value AS INTEGER) >= CRSQLITE_VERSION`, matching the
-  sequence's `column_int` read.
+- **The completeness check** compares `CAST(value AS INTEGER) >= CRSQLITE_VERSION`, a 64-bit read; the
+  sequence reads the same value with `column_int64` (it read `column_int`, which truncated above 2^31,
+  until the **Code review follow-up**).
 - **The fast-path/slow-path loop is bounded at three passes.** A file that keeps flipping between
   complete and incomplete fails the open with `SQLITE_BUSY` rather than looping.
 - **Site-ID Index Gap:** closed for every database initialized from now on. An existing file whose
@@ -1075,6 +1129,52 @@ then compared against a snapshot.
 **Not verified here:** macOS and Windows builds; the libSQL build (this fork has none); a disk-backed
 stress run (tmpfs reproduced, so the fallback was not needed).
 
+### Code review follow-up
+
+A code review of `578ef5d6` found five fixable defects. The operator approved fixing them on
+2026-11-13; they are in the working tree, awaiting commit. Built the same way (stable 1.95.0, the
+populated cargo cache, offline). Each new test was red before its fix.
+
+| finding | fix | test — how it failed before the fix |
+|---|---|---|
+| a lock failure returned rc 1 with an empty message | **Init Failure Code and Message**: the real code travels from the Rust init to the entry points through `rc_out`; every step of the sequence passes its own code up; `crsql_init_failed` sets `cr-sqlite init: <errstr>` with `sqlite3_mprintf` | `init_race_busy_reports_code_and_message`: rc 1, `automatic extension loading failed: `; `init_race_other_failure_reports_code_and_message`: the same; py `test_init_race_busy_load_message` (both cases): `error during initialization: ` |
+| the spec said the heal runs only under the lock | spec text corrected (**Init Residue Heal**): it also runs on the `SAVEPOINT crsql_init` path, safely | — |
+| status text out of date | this record, the **Status** line, and the coordination doc's section 14 | — |
+| `init_race_late_failure_no_zombie` passed silently off Linux | `fd_count` falls back to `/dev/fd`; where neither exists the test, and the fd half of `init_race_config_broken_setting_closes`, report **SKIPPED**. The runner prints `ok` / `FAILED` / `SKIPPED` and a summary line (`init_race: N passed, N skipped, N failed`); a skip does not fail the suite | not a red-first fix; checked by mutation below |
+| heal rule 3 exempted the three names whatever the object type | exempt only `type = 'table'` objects with those names, plus their `sqlite_autoindex_*` indexes | `init_race_heal_refuses_crsql_named_trigger`: the open succeeded (healed) |
+| the sequence read the version with `column_int` | `column_int64`, matching the completeness check | `init_race_version_read_is_64_bit`: refused as "version -2147483648" |
+
+**Verification after the follow-up:**
+
+| check | result |
+|---|---|
+| `make test` | green: 32 C test cases, 21 `init_race` (21 passed, 0 skipped), 11 Rust suites |
+| `make valgrind-strict` | 0 errors, 0 bytes in use at exit, all 21 `init_race` passing under valgrind |
+| `py/correctness` | 161 passed (159 plus the two cases of `test_init_race_busy_load_message`) |
+| `tools/init_race_stress.sh 200 10` (tmpfs, all three modes) | fresh: 0 failed opens, 0 wedged, 0 partial, 0 hangs; WAL: 0 failed; switching: 0 failed opens (132 switcher `PRAGMA` lock failures, which are not init's) |
+
+**Mutations**, each bounded with `timeout`, restored in the same command and checked with `cmp`:
+
+| guarantee | mutation | result |
+|---|---|---|
+| code propagation, C side | `crsql_init_failed(pzErrMsg, SQLITE_ERROR)` instead of `initRc` | `busy_reports_code_and_message` and `other_failure_reports_code_and_message` red (rc 1) |
+| code propagation, Rust side | the `*rc_out` write removed | the same two red |
+| code propagation inside the sequence | the peer-table step returns `SQLITE_ERROR` | `busy_reports_code_and_message` red on the host-transaction case; `other_failure_…` red |
+| heal rule 3 by type | the `type = 'table'` condition removed | `heal_refuses_crsql_named_trigger` red |
+| 64-bit version read | `column_int(0) as i64` | `version_read_is_64_bit` red |
+| fd fallback and SKIPPED | both fd directories made nonexistent | suite passes with `2 skipped`, both tests printed `SKIPPED: no fd directory …`; with only `/dev/fd` available, all 21 pass |
+
+**Not verified:** a real `load_extension` under valgrind (the test binary omits `load_extension`; the
+C test calls the entry point directly, as `sqlite3LoadExtension` does, and the py test checks the real
+path's message but not its memory); macOS (`/dev/fd`) and Windows (the SKIPPED path) were exercised
+only by the mutation above, on Linux.
+
+**Left as they were (recorded, not fixed):** the review's other findings — that the busy wait depends
+on the app's startup shim registering `sqlite3_crsqlite_autoext_init` (documented under
+**Init Busy Timeout** and in the coordination doc); coarse sleeps on builds without `usleep`, such as
+WASM; the site-id state after a host `ROLLBACK`, which predates this fix; and `crsql_as_table`'s bare
+`ROLLBACK` (**Not changed**, above).
+
 ---
 
 ## Risks
@@ -1099,7 +1199,10 @@ stress run (tmpfs reproduced, so the fallback was not needed).
 - **A fallible step added after the ownership handoff** brings back the zombie connection. Guarded by
   the comment at the handoff and by `init_race_late_failure_no_zombie`.
 - **Hosts that relied on the noise.** A host that treated a first failed open as normal changes
-  nothing; one that parses the version-0 message to detect wedged files will stop seeing it.
+  nothing; one that parses the version-0 message to detect wedged files will stop seeing it. A host
+  that compared a failed open's code with `SQLITE_ERROR` now sees `SQLITE_BUSY` for a lock failure on
+  the auto-extension path, and every failure now carries a `cr-sqlite init: …` message
+  (**Init Failure Code and Message**).
 - **Hosts that do not adopt the new entry point** keep the atomic init and the heal, but not the wait:
   their pool starts still see failed opens, cleanly. ⚠️ Nothing in `crsql_build_id()` shows which entry
   point a host registered, so a host must check its own wiring.

@@ -118,12 +118,19 @@ fn crsql_as_table_impl(db: *mut sqlite::sqlite3, table: &str) -> Result<ResultCo
     remove_crr_triggers_if_exist(db, table)
 }
 
+/// Returns the ext data, or null on failure. On failure `*rc_out` (when not
+/// null) receives the real result code where init knows it -- in particular
+/// `SQLITE_BUSY` when the **Atomic Init Transaction** could not get its lock
+/// -- and is left untouched otherwise, so the caller's default stands.
+/// `sqlite3_crsqlite_init` returns that code and supplies the message
+/// (**Init Failure Code and Message**).
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn sqlite3_crsqlcore_init(
     db: *mut sqlite::sqlite3,
     err_msg: *mut *mut c_char,
     api: *mut sqlite::api_routines,
+    rc_out: *mut c_int,
 ) -> *mut c_void {
     sqlite::EXTENSION_INIT2(api);
 
@@ -241,7 +248,12 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     // On success the ext data comes back owning the site-id buffer.
     let ext_data = match init_persistent_state(db, err_msg) {
         Ok(ext_data) => ext_data,
-        Err(_) => return null_mut(),
+        Err(rc) => {
+            if !rc_out.is_null() {
+                unsafe { *rc_out = rc as c_int };
+            }
+            return null_mut();
+        }
     };
 
     // After the COMMIT: registrations WITHOUT a destructor. Any failure here
@@ -765,9 +777,12 @@ fn init_sequence(
     if fail_at(InitStep::PeerTrackingTable) {
         return Err(ResultCode::BUSY);
     }
+    // Every step below passes its real result code up, so a lock failure on
+    // the `SAVEPOINT crsql_init` path reaches the host as SQLITE_BUSY
+    // (**Init Failure Code and Message**).
     let rc = crate::bootstrap::crsql_init_peer_tracking_table(db);
     if rc != ResultCode::OK as c_int {
-        return Err(ResultCode::ERROR);
+        return Err(init_rc(rc));
     }
 
     if fail_at(InitStep::DbVersionsTable) {
@@ -775,12 +790,12 @@ fn init_sequence(
     }
     let rc = crate::bootstrap::crsql_init_db_versions_table(db);
     if rc != ResultCode::OK as c_int {
-        return Err(ResultCode::ERROR);
+        return Err(init_rc(rc));
     }
 
     let rc = crate::bootstrap::crsql_maybe_update_db(db, err_msg);
     if rc != ResultCode::OK as c_int {
-        return Err(ResultCode::ERROR);
+        return Err(init_rc(rc));
     }
 
     // allocate ext data earlier in the init process because we need its
@@ -824,7 +839,7 @@ fn init_sequence(
     if rc != ResultCode::OK as c_int {
         sqlite::free(site_id_buffer as *mut c_void);
         unsafe { crsql_freeExtData(ext_data) };
-        return Err(ResultCode::ERROR);
+        return Err(init_rc(rc));
     }
 
     // From here on the ext data owns `site_id_buffer`.
@@ -834,15 +849,29 @@ fn init_sequence(
     }
     if rc != ResultCode::OK as c_int {
         unsafe { crsql_freeExtData(ext_data) };
-        return Err(ResultCode::ERROR);
+        return Err(init_rc(rc));
     }
 
-    if fail_at(InitStep::SiteIdTriggers) || crate::bootstrap::create_site_id_triggers(db).is_err() {
+    let triggers = if fail_at(InitStep::SiteIdTriggers) {
+        Err(ResultCode::BUSY)
+    } else {
+        crate::bootstrap::create_site_id_triggers(db)
+    };
+    if let Err(rc) = triggers {
         unsafe { crsql_freeExtData(ext_data) };
-        return Err(ResultCode::ERROR);
+        return Err(rc);
     }
 
     Ok(ext_data)
+}
+
+/// A step's C result code as an init error. Unknown or OK codes become
+/// SQLITE_ERROR, so a failure can never be reported as success.
+fn init_rc(rc: c_int) -> ResultCode {
+    match sqlite::convert_rc(rc) {
+        Err(code) => code,
+        Ok(_) => ResultCode::ERROR,
+    }
 }
 
 /// The **ownership handoff**: registers `crsql_db_version` with the

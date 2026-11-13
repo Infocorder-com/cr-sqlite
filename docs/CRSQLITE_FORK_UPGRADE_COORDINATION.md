@@ -1228,16 +1228,20 @@ the submodule-rides-with-ref fact; the toolchain-aware cache stamp (ref changed)
 
 ---
 
-## 14. Init race fix (`e4-init-atomic`) — BUILT ✅, awaiting commit (upstream, 2026-11-13)
+## 14. Init race fix (`e4-init-atomic`) — committed in `578ef5d6`; review follow-up awaiting commit (upstream, 2026-11-13)
 
 Design and full verification: the fork's `docs/CRSQLITE_INIT_RACE_FIX.md` (**Build record**). Downstream
 integration: `docs/CRSQLITE_INIT_RACE_FIX_INTEGRATION.md` here.
+
+**Status.** The fix is committed in the fork as `578ef5d6`. A follow-up that fixes the code review's
+findings (the fork doc's **Code review follow-up**) is in the fork's working tree, verified, and
+awaiting the operator's commit. ⛔ **Pin the commit that includes the follow-up, not `578ef5d6`.**
 
 ### Pin this
 
 | | |
 |---|---|
-| **`CRSQLITE_REF`** | ⏸ **not yet assigned** — the commit the operator makes from the verified working tree. ⛔ Do not bump until it is on GitHub |
+| **`CRSQLITE_REF`** | ⏸ **`<TO BE FILLED AT ADOPTION>`** — the fork commit that includes the review follow-up (after `578ef5d6`). Placeholder, not a SHA. ⛔ Do not bump until it is on GitHub |
 | **submodule pin** | **unchanged**: `c3c01fb84622b29bdf356d060254f36c9f4ca9ce`. No submodule push is needed |
 | `crsql_build_id()` | `e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic <sha>` |
 | toolchain | stable `1.95.0` (unchanged) |
@@ -1256,13 +1260,22 @@ integration: `docs/CRSQLITE_INIT_RACE_FIX_INTEGRATION.md` here.
 - **Gates** keyed on `e2-tbl-pushdown` / `e3-tbl-collate-gate` keep working (substring match). Add an
   `e4-init-atomic` gate where the fix must be present.
 - **Unchanged:** the on-disk format, the wire format, the public SQL API, and the submodule.
+- **What a failed init now reports** (changed by the review follow-up). A lock failure is no longer
+  rc 1 with an empty message. Through the auto-extension (Exqlite's open): rc **`SQLITE_BUSY` (5)**,
+  message `automatic extension loading failed: cr-sqlite init: database is locked`. Through
+  `load_extension`: rc is still `SQLITE_ERROR` (1) — SQLite's `load_extension` discards the entry
+  point's code — with message `error during initialization: cr-sqlite init: database is locked`. Other
+  failures carry their own code and `cr-sqlite init: <reason>`; the version-0 refusal message is
+  unchanged. ⚠️ Any downstream test helper, log filter or retry rule that matches the old empty-message
+  form or `rc == SQLITE_ERROR` for these opens needs to match the new text and code.
 
 ### Verification (upstream, stable 1.95.0, Linux)
 
-- `make test` green: 32 C test cases, 17 `init_race`, 11 Rust suites.
-- `make valgrind-strict` (a new target that fails on leaks and memory errors): 0 errors, 0 bytes in use.
-  The baseline on `8d153fc2` was also clean.
-- `py/correctness`: 159 passed (156 before, plus 3 `init_race`).
+- `make test` green: 32 C test cases, 21 `init_race` (17 at `578ef5d6`, plus 4 from the review
+  follow-up), 11 Rust suites.
+- `make valgrind-strict` (a new target that fails on leaks and memory errors): 0 errors, 0 bytes in use,
+  before and after the follow-up. The baseline on `8d153fc2` was also clean.
+- `py/correctness`: 161 passed (156 before, plus 3 `init_race` at `578ef5d6` and 2 from the follow-up).
 - `tools/init_race_stress.sh 1500 10`, before and after:
 
   | mode | before | after |
@@ -1271,5 +1284,7 @@ integration: `docs/CRSQLITE_INIT_RACE_FIX_INTEGRATION.md` here.
   | initialized WAL | 76 failed | 0 |
   | rollback, switching to WAL | 1,167 failed | 0 |
 
-- 11 mutations of the key guarantees, each red, each restored and checked.
+- 11 mutations of the key guarantees at `578ef5d6`, and 6 more for the follow-up, each red (or, for the
+  fd fallback, reporting SKIPPED), each restored and checked. The follow-up's stress run
+  (`tools/init_race_stress.sh 200 10`, all three modes) had 0 failed opens and 0 wedged files.
 - ⚠️ **Not verified upstream:** macOS and Windows builds.
