@@ -160,6 +160,17 @@ Authoritative facts, with line numbers:
   ever *is* touched, fold it into the next lockfile change rather than doing it standalone.
 - ⚠️ **v3→v4 hazard:** any `cargo` command run with a modern *stable* toolchain rewrites this lockfile to `version = 4`,
   which the nightly can't parse. Always put the intended toolchain on PATH first; check `git diff` on `Cargo.lock`.
+- **[upstream] 2026-11-13 — Dependabot security bumps (in the tree, uncommitted).** All six fork lockfiles (the
+  five under `core/rs/` plus `tools/`) are now lockfile **v4**; that supersedes "stays at v3" above, because the
+  stable-Rust port pins cargo 1.95, which writes v4. Alerted crates: `bytes 1.5.0 → 1.11.1` (`core`, `bundle`,
+  `bundle_static`, `integration_check`); `shlex → 1.3.0` (those four plus `fractindex-core`); `rustix 0.38.13 →
+  0.38.19`, dragging `linux-raw-sys 0.4.7 → 0.4.15` (`integration_check`); `rand 0.8.5 → 0.8.6` (`fractindex-core`,
+  `tools`). ⚠️ The `core`, `bundle` and `fractindex-core` lockfiles were **stale** — they still pinned `bindgen
+  0.68.1` against the submodule's `0.72.1`, and `bundle`'s lacked its `stable_trap` and `libc-print` deps — so the
+  bump also re-resolved them, which is the rewrite any build was already doing: `bindgen 0.68.1 → 0.72.1`,
+  `proc-macro2 → 1.0.107`, `rustc-hash 1.1.0 → 2.1.3`, `libc 0.2.151 → 0.2.191` in `bundle` (`libc-print 0.5.0`
+  needs ≥ 0.2.186), and `which`, `lazy_static`, `lazycell`, `peeking_take_while`, `once_cell` dropped.
+  `bundle_static`'s `rustc-hash 2.1.1` pin is untouched. Python correctness suite: `pytest 7.3.1 → 9.0.3`.
 
 ---
 
@@ -384,6 +395,9 @@ the pushdown, on its own, with its own 3-platform verification. Windows/MinGW lo
   for silicon_brain's native-per-platform model `SB_CRSQLITE_NIGHTLY` can be dropped outright. Recorded one
   residual: `make asan` (`:130`) keeps `-Zbuild-std` and stays nightly-only, so A1's "no nightly" is true of the
   shipping build but not of the fork's sanitizer CI. A2 replies all accepted on both sides; ready to build A1.
+- **2026-11-13 (upstream, FYI):** Dependabot security bumps across the fork's Cargo lockfiles and
+  `py/correctness`, recorded under **Lockfile state**. No `Cargo.toml` changed and no `CRSQLITE_REF` bump is
+  implied. `make test`, `make valgrind-strict`, the correctness suite and the init-race stress run all pass.
 
 ## 9. Next release — the `crsql_changes` table-filter pushdown (Release A)
 
