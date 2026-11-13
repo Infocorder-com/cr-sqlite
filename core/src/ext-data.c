@@ -158,12 +158,18 @@ int crsql_initSiteIdExt(sqlite3 *db, crsql_ExtData *pExtData, unsigned char *sit
   pExtData->siteId = siteIdBuffer;
 
   pExtData->pSetSiteIdOrdinalStmt = 0;
+  pExtData->pSelectSiteIdOrdinalStmt = 0;
   int rc = sqlite3_prepare_v3(
       db, "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal",
       -1, SQLITE_PREPARE_PERSISTENT, &(pExtData->pSetSiteIdOrdinalStmt), 0);
+  // Return the FIRST failure. These codes used to be summed, so two failures
+  // reported a meaningless code. crsql_freeExtData finalizes whichever
+  // statement was prepared.
+  if (rc != SQLITE_OK) {
+    return rc;
+  }
 
-  pExtData->pSelectSiteIdOrdinalStmt = 0;
-  rc += sqlite3_prepare_v3(
+  rc = sqlite3_prepare_v3(
       db, "SELECT ordinal FROM crsql_site_id WHERE site_id = ?", -1,
       SQLITE_PREPARE_PERSISTENT, &(pExtData->pSelectSiteIdOrdinalStmt), 0);
 

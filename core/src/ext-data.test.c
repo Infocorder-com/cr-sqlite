@@ -221,6 +221,32 @@ static void testFetchPragmaDataVersion() {
   printf("\t\e[0;32mSuccess\e[0m\n");
 }
 
+// crsql_initSiteIdExt reports its FIRST failure. It used to sum the codes of
+// its two prepares, so when both failed (here: no crsql_site_id table, each
+// SQLITE_ERROR) it returned 2, SQLITE_INTERNAL -- a code nothing raised.
+static void testInitSiteIdExtReportsFirstFailure() {
+  printf("InitSiteIdExtReportsFirstFailure\n");
+  sqlite3 *db;
+  int rc = sqlite3_open(":memory:", &db);
+  assert(rc == SQLITE_OK);
+  rc = sqlite3_exec(db, "DROP TABLE crsql_site_id", 0, 0, 0);
+  assert(rc == SQLITE_OK);
+  crsql_ExtData *pExtData = crsql_newExtData(db);
+  assert(pExtData != 0);
+  unsigned char *siteIdBuffer =
+      sqlite3_malloc(SITE_ID_LEN * sizeof *(siteIdBuffer));
+  rc = crsql_initSiteIdExt(db, pExtData, siteIdBuffer);
+  assert(rc == SQLITE_ERROR);
+  assert(pExtData->pSetSiteIdOrdinalStmt == 0);
+  assert(pExtData->pSelectSiteIdOrdinalStmt == 0);
+
+  // The ext data owns siteIdBuffer now; this frees both.
+  crsql_finalize(pExtData);
+  crsql_freeExtData(pExtData);
+  crsql_close(db);
+  printf("\t\e[0;32mSuccess\e[0m\n");
+}
+
 void crsqlExtDataTestSuite() {
   printf("\e[47m\e[1;30mSuite: crsql_ExtData\e[0m\n");
   textNewExtData();
@@ -228,4 +254,5 @@ void crsqlExtDataTestSuite() {
   testFinalize();
   testFetchPragmaSchemaVersion();
   testFetchPragmaDataVersion();
+  testInitSiteIdExtReportsFirstFailure();
 }

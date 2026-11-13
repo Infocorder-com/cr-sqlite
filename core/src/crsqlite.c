@@ -89,8 +89,18 @@ int crsql_register_db_version(sqlite3 *db, crsql_ExtData *pExtData);
 // after prefixing "error during initialization: ". (sqlite3_load_extension
 // itself always returns SQLITE_ERROR for a failed entry point, whatever code
 // it returned, so on that path the message is the host's only signal.)
+//
+// The code returned is always a real SQLite error code: a primary code from
+// SQLITE_ERROR to SQLITE_WARNING, or an extended code whose low byte is one.
+// Anything else -- OK, ROW, DONE, a negative number, or sqlite_nostd's
+// sentinel ResultCode::NULL (5000), which an empty stored site id produced --
+// becomes SQLITE_ERROR. Passed through, 5000 read as "unknown error" and an
+// auto-extension open returned 5000 & 0xff = 136. The Rust side applies the
+// same rule (init_error_code in core/rs/core/src/lib.rs).
 static int crsql_init_failed(char **pzErrMsg, int rc) {
-  if (rc == SQLITE_OK) {
+  int primary = rc & 0xff;
+  if (rc <= 0 || rc > 0xffff || primary < SQLITE_ERROR ||
+      primary > SQLITE_WARNING) {
     rc = SQLITE_ERROR;
   }
   if (pzErrMsg != 0 && *pzErrMsg == 0) {
