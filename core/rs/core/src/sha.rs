@@ -27,7 +27,16 @@ pub const SHA: &'static str = core::env!("CRSQLITE_COMMIT_SHA");
 //                    2 s in total for a competing connection
 //                    (docs/CRSQLITE_INIT_RACE_FIX.md). The token does NOT show
 //                    which entry point a host registered.
+//   e5-merge-validation
+//                    a peer's change merged through `crsql_changes` is refused
+//                    with SQLITE_ERROR, before anything is written, when its
+//                    packed primary key has the wrong column count (Packed PK
+//                    Arity Check) or a col_version, db_version, cl or seq is
+//                    outside 0..=2^53 (Merge Counter Bound); a NUL in a peer's
+//                    table name no longer turns the error into SQLITE_NOMEM
+//                    (Error Message NUL Escape). docs/CRSQLITE_INIT_RACE_FIX.md,
+//                    "Merge Input Validation".
 pub const BUILD_ID: &'static str = concat!(
-    "e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic ",
+    "e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic+e5-merge-validation ",
     core::env!("CRSQLITE_COMMIT_SHA")
 );

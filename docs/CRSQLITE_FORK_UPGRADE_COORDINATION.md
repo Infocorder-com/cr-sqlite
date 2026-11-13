@@ -1292,6 +1292,10 @@ refuses a peer's change in `merge_insert` with `SQLITE_ERROR` before anything is
 - **Error Message NUL Escape** (wrong error code): a change naming a table that does not exist, with a NUL
   byte in the name, returned `SQLITE_NOMEM` because the error message could not be built; it now returns
   `SQLITE_ERROR`, with the NUL shown as `\0`.
+- **Release token `e5-merge-validation`** (approved by the operator on 2026-11-13). The release that
+  carries these fixes appends it to `crsql_build_id()`, so a gate can tell it from a build that has
+  `e4-init-atomic` but not the merge fixes (see **Pin this** and **What downstream must change with the
+  pin bump**).
 
 ### Crash surface after the merge fixes
 
@@ -1321,7 +1325,7 @@ refused. What remains:
 |---|---|
 | **`CRSQLITE_REF`** | ⚠️ **`ba3c7ff5721fa45789abff9539c4d824b374bcae`** — PROVISIONAL, to be updated to the commit that includes the merge fixes (see **Status**). Lives only in silicon_brain's `scripts/build_crsqlite_static.sh` |
 | **submodule pin** | **unchanged**: `c3c01fb84622b29bdf356d060254f36c9f4ca9ce`. No submodule push is needed |
-| `crsql_build_id()` | `e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic <sha>` |
+| `crsql_build_id()` | `e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic+e5-merge-validation <sha>` for the release that includes the merge fixes. ⚠️ The provisional pin `ba3c7ff5` returns the list without `+e5-merge-validation` |
 | toolchain | stable `1.95.0` (unchanged) |
 
 ### What downstream must change with the pin bump
@@ -1335,8 +1339,15 @@ refused. What remains:
   `core/src/ext.h`, which now declares both.
 - **Never** pass `sqlite3_crsqlite_autoext_init` to `load_extension`. `sqlite3_crsqlite_init` stays the
   `load_extension` entry point.
-- **Gates** keyed on `e2-tbl-pushdown` / `e3-tbl-collate-gate` keep working (substring match). Add an
-  `e4-init-atomic` gate where the fix must be present.
+- **Gates** keyed on `e2-tbl-pushdown` / `e3-tbl-collate-gate` / `e4-init-atomic` keep working
+  (substring match). ⭐ **Move the app's gates to `e5-merge-validation` in the same change as the pin**:
+  the CI `SB_REQUIRE_BUILD_MARKER` (`.github/workflows/build.yml`), `CRSQLITE_REQUIRED_MARKER` in
+  `deploy/deploy-hub.sh`, and the pin comment in `scripts/build_crsqlite_static.sh` that names the gate
+  token. The token list is cumulative, so `e5-merge-validation` implies `e4-init-atomic`, and an
+  `e4-init-atomic` gate alone would pass a build without the merge fixes (the provisional pin is one).
+  Both gates use `grep -aq <token>` on the linked binary; the token is one contiguous literal in the fork's
+  static archive and in a NIF linked from it, so no other change to the gates is needed. ⚠️ Moving a gate
+  before the pin would fail every build, because `ba3c7ff5` does not carry the token.
 - **Unchanged:** the on-disk format, the public SQL API, and the submodule. The bytes of the wire format
   (packed primary keys in `crsql_changes`) are unchanged too, but ⛔ `85faa868` through `ba3c7ff5` cannot
   **read** blob primary keys of 128–255, 32768–65535 or 2^23 to 2^24−1 bytes, so they fail to merge them
@@ -1387,4 +1398,8 @@ refused. What remains:
   `tools/init_race_stress.sh 100 8`, all three modes, 0 failed opens and 0 wedged; `make static`,
   `make loadable` and `make loadable_dbg` build; the reviewer's fuzz drivers, 800,000 cases across release
   and debug, 0 crashes; 5 mutations each red, restored and checked.
+- With the `e5-merge-validation` token added: `make test` green; `make valgrind-strict` 0 errors, 0 bytes
+  in use; `py/correctness` 320 passed; `make static` builds and `grep -aq e5-merge-validation` finds the
+  token in the static archive and the loadable `.so`; removing the token turns
+  `testBuildIdReportsFeatureMarker` red.
 - ⚠️ **Not verified upstream:** macOS and Windows builds.

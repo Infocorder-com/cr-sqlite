@@ -23,7 +23,7 @@ It also vendors a **different `sqlite-rs-embedded`**: the submodule points at [`
 
 ```
 sqlite> SELECT crsql_build_id();
-e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic <commit-sha>
+e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic+e5-merge-validation <commit-sha>
 ```
 
 | token | capability |
@@ -32,6 +32,7 @@ e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic <commit-sha>
 | `e2-tbl-pushdown` | change 2 — `crsql_changes WHERE "table" = ?` pushed into the clock union |
 | `e3-tbl-collate-gate` | change 2's collation gate — the pushdown is declined under a non-`BINARY` collation |
 | `e4-init-atomic` | change 4 — extension init is atomic, a Half-Initialized Database is healed, and opens through `sqlite3_crsqlite_autoext_init` wait for a competing connection. ⚠️ The token does not show which entry point a host registered |
+| `e5-merge-validation` | change 5 — a peer's change merged through `crsql_changes` is refused, before anything is written, when its packed primary key has the wrong column count or a counter is outside 0 to 2^53; a NUL in its table name no longer reports `SQLITE_NOMEM` |
 
 Upstream cr-sqlite has no `crsql_build_id()` at all, so its absence distinguishes a stock build from this fork.
 
@@ -83,6 +84,18 @@ See [`docs/CRSQLITE_INIT_RACE_FIX.md`](docs/CRSQLITE_INIT_RACE_FIX.md).
   - An open through the new entry point **can spend up to 2 s waiting** for a competing connection (plus init's own work). On a host that opens on a bounded thread pool (for example a dirty I/O scheduler), several waiting opens occupy several threads for up to that long.
   - ⛔ **A failed `load_extension` of cr-sqlite leaves the connection unusable.** SQLite unloads the library immediately, but the functions and virtual-table modules init registered before the failure stay registered and point into the unloaded library. Close the connection, and do not call any `crsql_*` function or use `crsql_changes` on it. Closing is safe: init registers no destructor that lives in the library until its last fallible step.
   - A Half-Initialized Database now **opens** instead of failing; a host that parsed the version-0 message to detect wedged files will stop seeing it.
+
+### 5. Merge input validation (`e5-merge-validation`)
+
+Every row inserted into `crsql_changes` comes from another node, so a merge must not trust it. Stock cr-sqlite accepted a change whose packed primary key had **fewer** columns than the table's primary key — the missing key columns bound as NULL, the merged value landed in a key column, and the NULL key was then sent on to every peer — and accepted counters that broke later local writes (a merged `col_version` of `i64::MAX` made every later update of that cell fail). This fork's `merge_insert` now refuses, with `SQLITE_ERROR` and before writing anything:
+
+- a change whose packed primary key has a different column count from the table's primary key (**Packed PK Arity Check**);
+- a change whose `col_version`, `db_version`, causal length (`cl`) or `seq` is negative or above 2^53 (**Merge Counter Bound**). Honest peers never come near the bound.
+
+It also stops a NUL byte in a peer's table name from turning the "no such table" error into `SQLITE_NOMEM`; the NUL is shown as `\0` and the merge returns `SQLITE_ERROR` (**Error Message NUL Escape**). See [`docs/CRSQLITE_INIT_RACE_FIX.md`](docs/CRSQLITE_INIT_RACE_FIX.md), **Merge Input Validation**.
+
+- **Benefit:** a malformed or hostile change is an error instead of silent data corruption, a wedged cell, or a misleading out-of-memory code.
+- **Cost / who should be careful:** a change that was accepted before can now be refused. A host that applies a batch of changes in one transaction loses the whole batch when one change is refused. A database that already holds an out-of-range counter or a NULL key (only possible if a peer sent one to a build without this change) is not repaired, and fixed peers refuse the out-of-range counters it re-emits. No API, on-disk or wire-format change.
 
 ### Especially poor fits for this fork
 

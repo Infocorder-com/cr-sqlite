@@ -1334,6 +1334,15 @@ NUL as the two characters `\0`, so the message keeps the rest of the name and th
 - A column name with a NUL was never affected: no message quotes it; the lookup fails with
   `SQLITE_ERROR`.
 
+**Release token: `e5-merge-validation`** (approved by the operator on 2026-11-13). `BUILD_ID` in
+`core/rs/core/src/sha.rs` appends it, so `crsql_build_id()` returns
+`e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic+e5-merge-validation <sha>`, and the
+README's token table lists it (change 5). The list is cumulative, so `e5-merge-validation` implies
+`e1` to `e4`, and existing gates on `e2-tbl-pushdown`, `e3-tbl-collate-gate` or `e4-init-atomic` keep
+passing. A host that needs these fixes gates on `e5-merge-validation` with a substring match; the app's
+gates use `grep -aq` on the linked archive or NIF, and the token is one contiguous literal in it.
+`testBuildIdReportsFeatureMarker` (`core/src/crsqlite.test.c`) asserts it.
+
 **Tests** — `py/correctness/tests/test_merge_input_validation.py`, 55 cases, each refusal checked to
 write nothing (the table, its pks and clock tables, `crsql_changes` and `crsql_db_versions` are compared
 before and after):
@@ -1355,6 +1364,7 @@ before and after):
 | `make static`, `make loadable`, `make loadable_dbg` | build; the static archive still exports `sqlite3_crsqlite_autoext_init` |
 | the reviewer's `zerocols.py`, `dbvmax.py` and `malformed.py`, release and debug `.so` | every wrong-arity change refused and nothing written; both `dbvmax` merges refused and every local write after them succeeds; no crash |
 | the reviewer's fuzz drivers, 200,000 cases each, release and debug (`fuzz_driver.py` seeds 41 and 42, `fuzz_driver_valid.py` seeds 43 and 44, each child under `ulimit -v 2000000`) | **0 crashes** in all four runs. Every refusal by the new checks was replayed and classified: each one had a counter outside 0..2^53 (after integer conversion) or a key of the wrong arity, so **no in-range, right-arity merge was refused**. Replaying the seed-41 cases, the pre-fix build failed 11,607 merges with `SQLITE_NOMEM`, every one with a NUL in the table name; the fixed build fails none that way |
+| with the `e5-merge-validation` token added | `make test` green (33 C test cases, 23 `init_race`); `make valgrind-strict` 0 errors, 0 bytes in use; `py/correctness` 320 passed; `make static` (into a scratch prefix) builds, and `grep -aq e5-merge-validation` finds the token in both the static archive and the loadable `.so` |
 
 **Mutations**, each bounded with `timeout`, restored in the same command and checked with `cmp`:
 
@@ -1365,6 +1375,7 @@ before and after):
 | the bound is inclusive | `>` became `>=` | the four 2^53 cases of `test_in_range_counter_merges` and `test_col_version_at_bound_then_local_updates` red |
 | `seq` is covered | `seq` removed from the checked list | the four `seq` refusal cases red |
 | NUL escape at the call site | the schema message built with `CString::new(…)?` again | all three NUL tests red (`MemoryError`) |
+| the release token | `+e5-merge-validation` removed from `BUILD_ID` | `testBuildIdReportsFeatureMarker` red (`Assertion ... "e5-merge-validation" ... failed`) |
 
 **Not verified:** macOS and Windows; a merge carrying an out-of-range counter or a wrong-arity key
 through the app's sync path (the app's sync tests send only well-formed changes). The two speculative
