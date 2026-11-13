@@ -120,6 +120,9 @@ fn init_site_id(db: *mut sqlite3) -> Result<[u8; 16], ResultCode> {
 }
 
 fn crsql_create_schema_table_if_not_exists(db: *mut sqlite3) -> Result<ResultCode, ResultCode> {
+    if crate::init_fault::fail_at(crate::init_fault::InitStep::SchemaTable) {
+        return Err(ResultCode::BUSY);
+    }
     db.exec_safe("SAVEPOINT crsql_create_schema_table;")?;
 
     if let Ok(_) = db.exec_safe(&format!(
@@ -128,7 +131,10 @@ fn crsql_create_schema_table_if_not_exists(db: *mut sqlite3) -> Result<ResultCod
     )) {
         db.exec_safe("RELEASE crsql_create_schema_table;")
     } else {
-        let _ = db.exec_safe("ROLLBACK");
+        // Roll back to OUR savepoint only. A bare ROLLBACK would abort a
+        // transaction that belongs to the host (**Init Host Rollback**).
+        let _ = db
+            .exec_safe("ROLLBACK TO crsql_create_schema_table; RELEASE crsql_create_schema_table;");
         Err(ResultCode::ERROR)
     }
 }
@@ -148,7 +154,10 @@ pub extern "C" fn crsql_maybe_update_db(db: *mut sqlite3, err_msg: *mut *mut c_c
             let _ = db.exec_safe("RELEASE crsql_maybe_update_db;");
             return ResultCode::OK as c_int;
         } else {
-            let _ = db.exec_safe("ROLLBACK;");
+            // Roll back to OUR savepoint only (**Init Host Rollback**); the
+            // caller's init transaction rolls back the rest.
+            let _ =
+                db.exec_safe("ROLLBACK TO crsql_maybe_update_db; RELEASE crsql_maybe_update_db;");
             return ResultCode::ERROR as c_int;
         }
     } else {
@@ -162,6 +171,7 @@ fn maybe_update_db_inner(
     err_msg: *mut *mut c_char,
 ) -> Result<ResultCode, ResultCode> {
     let mut recorded_version: i32 = 0;
+    let mut is_blank_slate = is_blank_slate;
 
     // Completely new DBs need no migrations.
     // We can set them to the current version.
@@ -173,6 +183,11 @@ fn maybe_update_db_inner(
         let step_result = stmt.step()?;
         if step_result == ResultCode::ROW {
             recorded_version = stmt.column_int(0);
+        } else if is_init_residue(db)? {
+            // **Init Residue Heal**: a Half-Initialized Database holds no
+            // cr-sqlite state at all, so initialize it as if it were new.
+            is_blank_slate = true;
+            recorded_version = consts::CRSQLITE_VERSION;
         }
     }
     // libc_print::libc_println!("recorded_version: {}", recorded_version);
@@ -187,6 +202,9 @@ fn maybe_update_db_inner(
 
     // write the db version if we migrated to a new one or we are a blank slate db
     if recorded_version < consts::CRSQLITE_VERSION || is_blank_slate {
+        if crate::init_fault::fail_at(crate::init_fault::InitStep::VersionWrite) {
+            return Err(ResultCode::BUSY);
+        }
         let stmt =
             db.prepare_v2("INSERT OR REPLACE INTO crsql_master VALUES ('crsqlite_version', ?)")?;
         stmt.bind_int(1, consts::CRSQLITE_VERSION)?;
@@ -194,6 +212,168 @@ fn maybe_update_db_inner(
     }
 
     Ok(ResultCode::OK)
+}
+
+/// **Init Residue Heal** predicate (docs/CRSQLITE_INIT_RACE_FIX.md). True when
+/// the file is a Half-Initialized Database that holds NO cr-sqlite state:
+///   1. `crsql_master` exists and has zero rows (not merely no version row:
+///      `config.*` rows mean the file was opened successfully once);
+///   2. `crsql_tracked_peers` and `crsql_db_versions`, if they exist, are
+///      empty;
+///   3. no other table, index, trigger or view whose name contains `crsql`
+///      exists, other than those three tables and their `sqlite_autoindex_*`
+///      indexes.
+/// Rule 3 matches with `instr(lower(name), 'crsql')`, NOT `LIKE`: LIKE's case
+/// sensitivity follows `PRAGMA case_sensitive_like`, which a host may set
+/// before a `load_extension`. Keep it name-based and broad: every cr-sqlite
+/// version that ever finished init left a site-id table (under one of its
+/// names), and every CRR leaves `__crsql_*` objects, so a file this admits has
+/// nothing to lose. Application tables are allowed (scope ruled broad).
+/// Called only under init's transaction, and only when `crsql_master` exists
+/// without a `crsqlite_version` row.
+fn is_init_residue(db: *mut sqlite3) -> Result<bool, ResultCode> {
+    let stmt = db.prepare_v2("SELECT count(*) FROM crsql_master")?;
+    if stmt.step()? != ResultCode::ROW || stmt.column_int64(0) != 0 {
+        return Ok(false);
+    }
+    for tbl in ["crsql_tracked_peers", "crsql_db_versions"] {
+        if has_table(db, tbl)? {
+            let stmt = db.prepare_v2(&format!("SELECT count(*) FROM \"{}\"", tbl))?;
+            if stmt.step()? != ResultCode::ROW || stmt.column_int64(0) != 0 {
+                return Ok(false);
+            }
+        }
+    }
+    let stmt = db.prepare_v2(
+        "SELECT count(*) FROM sqlite_master
+         WHERE type IN ('table', 'index', 'trigger', 'view')
+           AND instr(lower(name), 'crsql') > 0
+           AND name NOT IN ('crsql_master', 'crsql_tracked_peers', 'crsql_db_versions')
+           AND NOT (type = 'index'
+                    AND tbl_name IN ('crsql_master', 'crsql_tracked_peers', 'crsql_db_versions')
+                    AND substr(name, 1, 17) = 'sqlite_autoindex_')",
+    )?;
+    if stmt.step()? != ResultCode::ROW {
+        return Err(ResultCode::ERROR);
+    }
+    Ok(stmt.column_int64(0) == 0)
+}
+
+/// **Init Completeness Check** (read-only). True when today's init sequence
+/// would write nothing: the four bookkeeping tables exist, `crsql_master`
+/// holds `crsqlite_version` >= `CRSQLITE_VERSION`, `crsql_site_id` holds an
+/// ordinal-0 row, and the three site-id triggers exist. Any step result other
+/// than ROW/DONE is an error that fails the open -- never "complete" and never
+/// "incomplete". Each statement is finalized before this returns, so it never
+/// leaves a SHARED lock behind for the slow path to wait on.
+///
+/// Too strict, and every healthy open takes the write lock; too loose, and a
+/// file that needs a write skips it. Pinned by `init_race_reopen_writes_nothing`
+/// and `init_race_error_paths_free_once` (an initialized file must not reach
+/// `BEGIN IMMEDIATE`).
+pub fn is_init_complete(db: *mut sqlite3) -> Result<bool, ResultCode> {
+    let catalog_ok = {
+        let stmt = db.prepare_v2(
+            "SELECT
+               (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN
+                  ('crsql_tracked_peers', 'crsql_db_versions', 'crsql_master', 'crsql_site_id')) = 4
+               AND (SELECT count(*) FROM sqlite_master WHERE type = 'trigger'
+                  AND tbl_name = 'crsql_site_id' AND name IN
+                  ('crsql_site_id_insert_trig', 'crsql_site_id_update_trig', 'crsql_site_id_delete_trig')) = 3",
+        )?;
+        if stmt.step()? != ResultCode::ROW {
+            return Err(ResultCode::ERROR);
+        }
+        stmt.column_int(0) == 1
+    };
+    if !catalog_ok {
+        return Ok(false);
+    }
+    let stmt = db.prepare_v2(
+        "SELECT
+           coalesce((SELECT CAST(value AS INTEGER) >= ?1 FROM crsql_master
+                     WHERE key = 'crsqlite_version'), 0)
+           AND EXISTS (SELECT 1 FROM crsql_site_id WHERE ordinal = 0)",
+    )?;
+    stmt.bind_int(1, consts::CRSQLITE_VERSION)?;
+    if stmt.step()? != ResultCode::ROW {
+        return Err(ResultCode::ERROR);
+    }
+    Ok(stmt.column_int(0) == 1)
+}
+
+/// The transaction of the **Atomic Init Transaction**: a read transaction
+/// (`BEGIN DEFERRED`), a write transaction (`BEGIN IMMEDIATE`), or -- when the
+/// host is already inside a transaction (only under `load_extension`) -- a
+/// `SAVEPOINT crsql_init`. Dropping it without `commit()` rolls back, so every
+/// early return of init rolls back automatically; the savepoint form rolls
+/// back only to its own savepoint, never the host's transaction.
+pub struct InitTxn {
+    db: *mut sqlite3,
+    savepoint: bool,
+    open: bool,
+}
+
+impl InitTxn {
+    pub fn begin_read(db: *mut sqlite3) -> Result<InitTxn, ResultCode> {
+        db.exec_safe("BEGIN DEFERRED")?;
+        Ok(InitTxn {
+            db,
+            savepoint: false,
+            open: true,
+        })
+    }
+
+    /// Takes RESERVED before reading, so the slow path's reads and writes see
+    /// one state. A deferred transaction upgrading from SHARED can be refused
+    /// with SQLITE_BUSY without the busy handler ever being invoked; this one
+    /// waits under the **Init Busy Timeout**.
+    pub fn begin_immediate(db: *mut sqlite3) -> Result<InitTxn, ResultCode> {
+        db.exec_safe("BEGIN IMMEDIATE")?;
+        Ok(InitTxn {
+            db,
+            savepoint: false,
+            open: true,
+        })
+    }
+
+    pub fn savepoint(db: *mut sqlite3) -> Result<InitTxn, ResultCode> {
+        db.exec_safe("SAVEPOINT crsql_init")?;
+        Ok(InitTxn {
+            db,
+            savepoint: true,
+            open: true,
+        })
+    }
+
+    /// COMMIT (or RELEASE). On failure -- e.g. SQLITE_BUSY once the busy
+    /// budget is spent -- the guard is dropped still open and rolls back.
+    pub fn commit(mut self) -> Result<(), ResultCode> {
+        let sql = if self.savepoint {
+            "RELEASE crsql_init"
+        } else {
+            "COMMIT"
+        };
+        self.db.exec_safe(sql)?;
+        self.open = false;
+        Ok(())
+    }
+}
+
+impl Drop for InitTxn {
+    fn drop(&mut self) {
+        if !self.open {
+            return;
+        }
+        let sql = if self.savepoint {
+            "ROLLBACK TO crsql_init; RELEASE crsql_init"
+        } else {
+            "ROLLBACK"
+        };
+        // SQLite may already have rolled back (for example after an I/O
+        // error); then this fails harmlessly.
+        let _ = self.db.exec_safe(sql);
+    }
 }
 
 /**

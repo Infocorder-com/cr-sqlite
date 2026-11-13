@@ -4,6 +4,24 @@
 #include <string.h>
 
 #include "consts.h"
+#include "crsqlite.h"
+
+#ifdef UNIT_TEST
+int crsql_test_force_config_step_rc = 0;
+#endif
+
+// The step of the `config.%` read in crsql_newExtData. A test hook
+// (crsql_test_force_config_step_rc) can replace its result, because on one
+// thread no lock can block this read without blocking init's earlier reads
+// first.
+static int crsql_config_step(sqlite3_stmt *pStmt) {
+#ifdef UNIT_TEST
+  if (crsql_test_force_config_step_rc != 0) {
+    return crsql_test_force_config_step_rc;
+  }
+#endif
+  return sqlite3_step(pStmt);
+}
 
 void crsql_clear_stmt_cache(crsql_ExtData *pExtData);
 void crsql_init_table_info_vec(crsql_ExtData *pExtData);
@@ -18,6 +36,9 @@ void crsql_drop_last_db_versions_map(crsql_ExtData *pExtData);
 // The initialization here is incomplete! We need to call crsql_initSiteIdExt after this.
 crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   crsql_ExtData *pExtData = sqlite3_malloc(sizeof *pExtData);
+  if (pExtData == 0) {
+    return 0;
+  }
 
   pExtData->siteId = 0;
   pExtData->pPragmaSchemaVersionStmt = 0;
@@ -76,8 +97,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   crsql_init_last_db_versions_map(pExtData);
   crsql_init_ordinal_map(pExtData);
 
-  sqlite3_stmt *pStmt;
-
+  sqlite3_stmt *pStmt = 0;
 
   rc += sqlite3_prepare_v2(db,
                            "SELECT ltrim(key, 'config.'), value FROM "
@@ -85,6 +105,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
                            -1, &pStmt, 0);
 
   if (rc != SQLITE_OK) {
+    sqlite3_finalize(pStmt);
     crsql_freeExtData(pExtData);
     return 0;
   }
@@ -92,7 +113,8 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   // set defaults!
   pExtData->mergeEqualValues = 0;
 
-  while (sqlite3_step(pStmt) == SQLITE_ROW) {
+  int stepRc;
+  while ((stepRc = crsql_config_step(pStmt)) == SQLITE_ROW) {
     const unsigned char *name = sqlite3_column_text(pStmt, 0);
     int colType = sqlite3_column_type(pStmt, 1);
 
@@ -102,6 +124,7 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
         pExtData->mergeEqualValues = value;
       } else {
         // broken setting...
+        sqlite3_finalize(pStmt);
         crsql_freeExtData(pExtData);
         return 0;
       }
@@ -111,7 +134,18 @@ crsql_ExtData *crsql_newExtData(sqlite3 *db) {
   }
 
   sqlite3_finalize(pStmt);
+  // Anything but SQLITE_DONE (SQLITE_BUSY above all) means the settings were
+  // not all read. Fail the open rather than run with a default setting.
+  if (stepRc != SQLITE_DONE) {
+    crsql_freeExtData(pExtData);
+    return 0;
+  }
   int pv = crsql_fetchPragmaDataVersion(db, pExtData);
+#ifdef UNIT_TEST
+  if (crsql_test_init_fail_step() == CRSQL_INIT_STEP_NEW_EXT_DATA) {
+    rc = SQLITE_BUSY;
+  }
+#endif
   if (pv == -1 || rc != SQLITE_OK) {
     crsql_freeExtData(pExtData);
     return 0;

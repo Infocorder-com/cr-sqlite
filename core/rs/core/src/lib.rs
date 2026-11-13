@@ -28,6 +28,10 @@ pub mod db_version;
 mod db_version;
 mod debug;
 mod ext_data;
+#[cfg(feature = "test")]
+pub mod init_fault;
+#[cfg(not(feature = "test"))]
+mod init_fault;
 mod is_crr;
 mod local_writes;
 #[cfg(feature = "test")]
@@ -65,6 +69,7 @@ use db_version::{
     crsql_fill_db_version_if_needed, crsql_next_db_version, crsql_peek_next_db_version,
     insert_db_version,
 };
+use init_fault::{fail_at, InitStep};
 use is_crr::*;
 use local_writes::after_delete::x_crsql_after_delete;
 use local_writes::after_insert::x_crsql_after_insert;
@@ -125,7 +130,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     let rc = db
         .create_function_v2(
             "crsql_set_debug",
-            1,
+            init_fault::n_arg(InitStep::EarlyRegistrations, 1),
             sqlite::UTF8 | sqlite::DIRECTONLY,
             None,
             Some(debug::x_crsql_set_debug),
@@ -196,17 +201,20 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         return null_mut();
     }
 
-    let rc = crate::bootstrap::crsql_init_peer_tracking_table(db);
-    if rc != ResultCode::OK as c_int {
-        return null_mut();
-    }
-
-    let rc = crate::bootstrap::crsql_init_db_versions_table(db);
-    if rc != ResultCode::OK as c_int {
-        return null_mut();
-    }
-
+    // The sync-bit registration sits BEFORE the init transaction, because
+    // `crsql_newExtData` (inside it) prepares statements that call it, and
+    // every registration that carries a destructor must be outside the
+    // transaction. Its destructor is SQLite's own `sqlite3_free` (taken from
+    // the API routines on the loadable path), never a function in this
+    // library: after a failed `load_extension` SQLite unloads the library at
+    // once, and would otherwise call into unmapped code when the connection
+    // closes (**Failed Load Unmapped Callback**). From this registration on,
+    // SQLite owns the int: it frees it at close, or at once if the
+    // registration fails.
     let sync_bit_ptr = sqlite::malloc(mem::size_of::<c_int>()) as *mut c_int;
+    if sync_bit_ptr.is_null() {
+        return null_mut();
+    }
     unsafe {
         *sync_bit_ptr = 0;
     }
@@ -215,101 +223,42 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     let rc = db
         .create_function_v2(
             "crsql_internal_sync_bit",
-            -1,
+            init_fault::n_arg(InitStep::SyncBitRegistration, -1),
             sqlite::UTF8 | sqlite::INNOCUOUS,
             Some(sync_bit_ptr as *mut c_void),
             Some(x_crsql_sync_bit),
             None,
             None,
-            Some(crsql_sqlite_free),
+            sqlite_free_destructor(api),
         )
         .unwrap_or(sqlite::ResultCode::ERROR);
     if rc != ResultCode::OK {
         return null_mut();
     }
 
-    let rc = crate::bootstrap::crsql_maybe_update_db(db, err_msg);
-    if rc != ResultCode::OK as c_int {
-        return null_mut();
-    }
+    // **Atomic Init Transaction**: every persistent write of init happens in
+    // one transaction, so a file is either untouched or fully initialized.
+    // On success the ext data comes back owning the site-id buffer.
+    let ext_data = match init_persistent_state(db, err_msg) {
+        Ok(ext_data) => ext_data,
+        Err(_) => return null_mut(),
+    };
 
-    // allocate ext data earlier in the init process because we need its
-    // pointer to be available for the crsql_update_site_id function.
-    let ext_data = unsafe { crsql_newExtData(db) };
-    if ext_data.is_null() {
-        return null_mut();
-    }
-
-    let rc = db
-        .create_function_v2(
-            "crsql_update_site_id",
-            2,
-            sqlite::UTF8 | sqlite::INNOCUOUS | sqlite::DETERMINISTIC,
-            Some(ext_data as *mut c_void),
-            Some(x_crsql_update_site_id),
-            None,
-            None,
-            None,
-        )
-        .unwrap_or(ResultCode::ERROR);
-    if rc != ResultCode::OK {
-        unsafe { crsql_freeExtData(ext_data) };
-        return null_mut();
-    }
-
-    // TODO: convert this function to a proper rust function
-    // and have rust free:
-    // 1. site_id_buffer
-    // 2. ext_data
-    // automatically.
-
-    let site_id_buffer =
-        sqlite::malloc((consts::SITE_ID_LEN as usize) * mem::size_of::<*const c_char>());
-    let rc = crate::bootstrap::crsql_init_site_id(db, site_id_buffer);
-    if rc != ResultCode::OK as c_int {
-        sqlite::free(site_id_buffer as *mut c_void);
-        unsafe { crsql_freeExtData(ext_data) };
-        return null_mut();
-    }
-
-    let rc = unsafe { crsql_initSiteIdExt(db, ext_data, site_id_buffer as *mut c_char) };
-    if rc != ResultCode::OK as c_int {
-        unsafe { crsql_freeExtData(ext_data) };
-        return null_mut();
-    }
-
-    if let Err(_) = crate::bootstrap::create_site_id_triggers(db) {
-        sqlite::free(site_id_buffer as *mut c_void);
-        return null_mut();
-    }
-
+    // After the COMMIT: registrations WITHOUT a destructor. Any failure here
+    // still owns the ext data and frees it (**Init Error-Path Frees**). The
+    // `crsql_db_version` registration, which hands the ext data to SQLite, is
+    // NOT here: it is init's last fallible step, `crsql_register_db_version`,
+    // called by `sqlite3_crsqlite_init` after the `crsql_changes` module.
     let rc = db
         .create_function_v2(
             "crsql_site_id",
-            0,
+            init_fault::n_arg(InitStep::PostCommitRegistrations, 0),
             sqlite::UTF8 | sqlite::INNOCUOUS | sqlite::DETERMINISTIC,
             Some(ext_data as *mut c_void),
             Some(x_crsql_site_id),
             None,
             None,
             None,
-        )
-        .unwrap_or(ResultCode::ERROR);
-    if rc != ResultCode::OK {
-        unsafe { crsql_freeExtData(ext_data) };
-        return null_mut();
-    }
-
-    let rc = db
-        .create_function_v2(
-            "crsql_db_version",
-            0,
-            sqlite::INNOCUOUS | sqlite::UTF8,
-            Some(ext_data as *mut c_void),
-            Some(x_crsql_db_version),
-            None,
-            None,
-            Some(x_free_connection_ext_data),
         )
         .unwrap_or(ResultCode::ERROR);
     if rc != ResultCode::OK {
@@ -703,6 +652,226 @@ pub extern "C" fn sqlite3_crsqlcore_init(
     }
 
     return ext_data as *mut c_void;
+}
+
+/// SQLite's own `sqlite3_free`, as a destructor that outlives this library
+/// (**Failed Load Unmapped Callback**). On the loadable path it comes from the
+/// API routines SQLite passed in (`pApi->free`); statically linked, it is the
+/// symbol itself.
+fn sqlite_free_destructor(
+    api: *mut sqlite::api_routines,
+) -> Option<unsafe extern "C" fn(*mut c_void)> {
+    #[cfg(feature = "loadable_extension")]
+    {
+        unsafe { (*api).free }
+    }
+    #[cfg(not(feature = "loadable_extension"))]
+    {
+        let _ = api;
+        Some(sqlite::bindings::sqlite3_free)
+    }
+}
+
+/// **Atomic Init Transaction** (docs/CRSQLITE_INIT_RACE_FIX.md).
+///
+/// - Host already in a transaction (only possible under `load_extension`):
+///   one `SAVEPOINT crsql_init`, rolled back to on failure. Never waits.
+/// - Otherwise the fast path: `BEGIN DEFERRED`, the **Init Completeness
+///   Check**, and -- if complete -- the existing sequence inside that one read
+///   transaction, which writes nothing on a complete file.
+/// - If incomplete: end the read transaction, `BEGIN IMMEDIATE`, re-check
+///   under the lock. A file another connection finished meanwhile is
+///   committed at once and re-enters the fast path; otherwise the sequence
+///   runs under the write lock and commits once.
+///
+/// On success the returned ext data owns the site-id buffer; on failure
+/// nothing is left to free and the transaction is rolled back.
+fn init_persistent_state(
+    db: *mut sqlite::sqlite3,
+    err_msg: *mut *mut c_char,
+) -> Result<*mut c::crsql_ExtData, ResultCode> {
+    use bootstrap::{is_init_complete, InitTxn};
+
+    if !db.get_autocommit() {
+        let txn = InitTxn::savepoint(db)?;
+        let ext_data = init_sequence(db, err_msg)?;
+        return commit_or_free(txn, ext_data);
+    }
+
+    // The re-check can send the slow path back to the fast path; a file that
+    // keeps flipping between complete and incomplete is not expected, so the
+    // loop is bounded.
+    for _ in 0..3 {
+        let txn = InitTxn::begin_read(db)?;
+        if fail_at(InitStep::ReadTxn) {
+            return Err(ResultCode::BUSY);
+        }
+        if is_init_complete(db)? {
+            let ext_data = init_sequence(db, err_msg)?;
+            return commit_or_free(txn, ext_data);
+        }
+        // Wrote nothing: this only releases SHARED, so the slow path cannot
+        // wait on this connection's own read lock.
+        txn.commit()?;
+
+        if fail_at(InitStep::BeginImmediate) {
+            return Err(ResultCode::BUSY);
+        }
+        let txn = InitTxn::begin_immediate(db)?;
+        if is_init_complete(db)? {
+            // Another connection finished while this one waited. End the
+            // transaction now (it wrote nothing) instead of holding RESERVED
+            // through the sequence, and take the fast path.
+            txn.commit()?;
+            continue;
+        }
+        let ext_data = init_sequence(db, err_msg)?;
+        return commit_or_free(txn, ext_data);
+    }
+    Err(ResultCode::BUSY)
+}
+
+/// Commit init's transaction; on failure free the ext data (which owns the
+/// site-id buffer) and let the guard roll back.
+fn commit_or_free(
+    txn: bootstrap::InitTxn,
+    ext_data: *mut c::crsql_ExtData,
+) -> Result<*mut c::crsql_ExtData, ResultCode> {
+    let committed = if fail_at(InitStep::Commit) {
+        Err(ResultCode::BUSY)
+    } else {
+        txn.commit()
+    };
+    if let Err(rc) = committed {
+        unsafe { crsql_freeExtData(ext_data) };
+        return Err(rc);
+    }
+    Ok(ext_data)
+}
+
+/// The existing init sequence, in its existing order, run inside init's
+/// transaction. Ownership (**Init Error-Path Frees**):
+/// - before `crsql_newExtData`: nothing of init's to free;
+/// - until `crsql_initSiteIdExt`: free the site-id buffer and the ext data
+///   separately;
+/// - from `crsql_initSiteIdExt` on: the ext data owns the buffer, so only
+///   `crsql_freeExtData` -- never a bare free of the buffer.
+/// Every failure path therefore finalizes every statement the ext data
+/// prepared, so a failed open can always be closed.
+fn init_sequence(
+    db: *mut sqlite::sqlite3,
+    err_msg: *mut *mut c_char,
+) -> Result<*mut c::crsql_ExtData, ResultCode> {
+    if fail_at(InitStep::PeerTrackingTable) {
+        return Err(ResultCode::BUSY);
+    }
+    let rc = crate::bootstrap::crsql_init_peer_tracking_table(db);
+    if rc != ResultCode::OK as c_int {
+        return Err(ResultCode::ERROR);
+    }
+
+    if fail_at(InitStep::DbVersionsTable) {
+        return Err(ResultCode::BUSY);
+    }
+    let rc = crate::bootstrap::crsql_init_db_versions_table(db);
+    if rc != ResultCode::OK as c_int {
+        return Err(ResultCode::ERROR);
+    }
+
+    let rc = crate::bootstrap::crsql_maybe_update_db(db, err_msg);
+    if rc != ResultCode::OK as c_int {
+        return Err(ResultCode::ERROR);
+    }
+
+    // allocate ext data earlier in the init process because we need its
+    // pointer to be available for the crsql_update_site_id function.
+    let ext_data = unsafe { crsql_newExtData(db) };
+    if ext_data.is_null() {
+        return Err(ResultCode::ERROR);
+    }
+
+    // No destructor, so it may sit inside the transaction. It must be
+    // registered before `crsql_init_site_id`: inserting into an existing
+    // `crsql_site_id` prepares its triggers, which call it.
+    let rc = db
+        .create_function_v2(
+            "crsql_update_site_id",
+            init_fault::n_arg(InitStep::UpdateSiteIdRegistration, 2),
+            sqlite::UTF8 | sqlite::INNOCUOUS | sqlite::DETERMINISTIC,
+            Some(ext_data as *mut c_void),
+            Some(x_crsql_update_site_id),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or(ResultCode::ERROR);
+    if rc != ResultCode::OK {
+        unsafe { crsql_freeExtData(ext_data) };
+        return Err(rc);
+    }
+
+    let site_id_buffer =
+        sqlite::malloc((consts::SITE_ID_LEN as usize) * mem::size_of::<*const c_char>());
+    if site_id_buffer.is_null() {
+        unsafe { crsql_freeExtData(ext_data) };
+        return Err(ResultCode::NOMEM);
+    }
+    let rc = if fail_at(InitStep::InitSiteId) {
+        ResultCode::BUSY as c_int
+    } else {
+        crate::bootstrap::crsql_init_site_id(db, site_id_buffer)
+    };
+    if rc != ResultCode::OK as c_int {
+        sqlite::free(site_id_buffer as *mut c_void);
+        unsafe { crsql_freeExtData(ext_data) };
+        return Err(ResultCode::ERROR);
+    }
+
+    // From here on the ext data owns `site_id_buffer`.
+    let mut rc = unsafe { crsql_initSiteIdExt(db, ext_data, site_id_buffer as *mut c_char) };
+    if fail_at(InitStep::InitSiteIdExt) {
+        rc = ResultCode::BUSY as c_int;
+    }
+    if rc != ResultCode::OK as c_int {
+        unsafe { crsql_freeExtData(ext_data) };
+        return Err(ResultCode::ERROR);
+    }
+
+    if fail_at(InitStep::SiteIdTriggers) || crate::bootstrap::create_site_id_triggers(db).is_err() {
+        unsafe { crsql_freeExtData(ext_data) };
+        return Err(ResultCode::ERROR);
+    }
+
+    Ok(ext_data)
+}
+
+/// The **ownership handoff**: registers `crsql_db_version` with the
+/// destructor `x_free_connection_ext_data`, which hands the ext data to
+/// SQLite. Called by `sqlite3_crsqlite_init` as init's LAST fallible step,
+/// after the `crsql_changes` module.
+///
+/// If the registration fails, SQLite has already run the destructor (it does
+/// when a registration takes no reference), so the caller must NOT free the
+/// ext data. Nothing fallible may follow this call: a later failure would
+/// have to call `crsql_finalize(ext_data)` (statements only; the destructor
+/// frees the struct), or the host's `sqlite3_close_v2` leaves a zombie
+/// connection.
+#[no_mangle]
+pub extern "C" fn crsql_register_db_version(
+    db: *mut sqlite::sqlite3,
+    ext_data: *mut c_void,
+) -> c_int {
+    db.create_function_v2(
+        "crsql_db_version",
+        init_fault::n_arg(InitStep::OwnershipHandoff, 0),
+        sqlite::INNOCUOUS | sqlite::UTF8,
+        Some(ext_data),
+        Some(x_crsql_db_version),
+        None,
+        None,
+        Some(x_free_connection_ext_data),
+    )
+    .unwrap_or(ResultCode::ERROR) as c_int
 }
 
 /**
@@ -1237,6 +1406,9 @@ unsafe extern "C" fn x_free_connection_ext_data(data: *mut c_void) {
     crsql_freeExtData(ext_data);
 }
 
+// NEVER register this as a destructor: it is code in this library, which SQLite
+// unloads at once after a failed `load_extension` (**Failed Load Unmapped
+// Callback**). Use `sqlite_free_destructor` instead.
 pub unsafe extern "C" fn crsql_sqlite_free(ptr: *mut c_void) {
     sqlite::free(ptr);
 }

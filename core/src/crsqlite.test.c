@@ -795,6 +795,7 @@ static void testBuildIdReportsFeatureMarker() {
   // token, so a substring match must keep working as capabilities are appended.
   assert(strstr(buildId, "e2-tbl-pushdown") != 0);
   assert(strstr(buildId, "e3-tbl-collate-gate") != 0);
+  assert(strstr(buildId, "e4-init-atomic") != 0);
   sqlite3_finalize(pStmt);
 
   assert(crsql_close(db) == SQLITE_OK);

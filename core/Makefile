@@ -71,6 +71,7 @@ prefix=./dist
 dbg_prefix=./dbg
 bundle=bundle_static
 valgrind: bundle = integration_check
+valgrind-strict: bundle = integration_check
 test: bundle = integration_check
 ubsan: bundle = integration_check
 asan: bundle = integration_check
@@ -124,6 +125,13 @@ correctness: $(TARGET_LOADABLE) FORCE
 	cd ../py/correctness && pytest
 valgrind: $(TARGET_TEST)
 	valgrind $(prefix)/test
+# Strict valgrind: fails (exit 1) on memory errors and on definite or indirect
+# leaks. `make valgrind` above only reports. See docs/CRSQLITE_INIT_RACE_FIX.md
+# (**What to run**). Suppressions, if any, name only pre-existing records.
+valgrind-strict: $(TARGET_TEST)
+	valgrind --error-exitcode=1 --leak-check=full \
+	  --errors-for-leak-kinds=definite,indirect --show-leak-kinds=definite,indirect \
+	  $(prefix)/test
 analyzer:
 	scan-build $(MAKE) clean loadable
 asan: export RUSTFLAGS=-Zsanitizer=address
@@ -214,6 +222,7 @@ $(TARGET_DBG_LOADABLE): $(dbg_prefix) $(ext_files) $(sqlite3.c) $(rs_lib_dbg_loa
 $(TARGET_SQLITE3): $(prefix) $(TARGET_SQLITE3_EXTRA_C) $(rs_lib_dbg_static_cpy) $(shell.c) $(ext_files)
 	$(CC) -g \
 	-DSQLITE_THREADSAFE=0 \
+	-DHAVE_USLEEP=1 \
 	-DSQLITE_OMIT_LOAD_EXTENSION=1 \
 	-DSQLITE_EXTRA_INIT=core_init \
 	-DSQLITE_ENABLE_BYTECODE_VTAB \
@@ -253,6 +262,7 @@ $(TARGET_SQLITE3_EXTRA_C): $(prefix) $(sqlite3.c) src/core_init.c
 $(TARGET_TEST): $(prefix) $(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.c $(ext_files) $(rs_lib_dbg_static_cpy)
 	$(CC) -g -Wall \
 	-DSQLITE_THREADSAFE=0 \
+	-DHAVE_USLEEP=1 \
 	-DSQLITE_OMIT_LOAD_EXTENSION=1 \
 	-DSQLITE_EXTRA_INIT=core_init \
 	-DUNIT_TEST=1 \
@@ -263,6 +273,7 @@ $(TARGET_TEST): $(prefix) $(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.c $(e
 $(TARGET_TEST_ASAN): $(prefix) $(TARGET_SQLITE3_EXTRA_C) src/tests.c src/*.test.c $(ext_files) $(rs_lib_dbg_static_cpy)
 	$(CC) -fsanitize=address -g -fno-omit-frame-pointer -Wall \
 	-DSQLITE_THREADSAFE=0 \
+	-DHAVE_USLEEP=1 \
 	-DSQLITE_OMIT_LOAD_EXTENSION=1 \
 	-DSQLITE_EXTRA_INIT=core_init \
 	-DUNIT_TEST=1 \
@@ -286,6 +297,7 @@ $(TARGET_FUZZ): $(prefix) $(TARGET_SQLITE3_EXTRA_C) src/fuzzer.cc $(ext_files)
 	sqlite3 \
 	correctness \
 	valgrind \
+	valgrind-strict \
 	ubsan analyzer fuzz asan static
 
 FORCE: ;

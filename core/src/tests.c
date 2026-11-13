@@ -40,6 +40,7 @@ void rowsImpactedTestSuite();
 void crsqlChangesVtabRowidTestSuite();
 void crsqlSandboxSuite();
 void crsql_integration_check();
+void crsql_init_race_check();
 
 int main(int argc, char *argv[]) {
   char *suite = "all";
@@ -57,6 +58,7 @@ int main(int argc, char *argv[]) {
   SUITE("rows_impacted") rowsImpactedTestSuite();
   SUITE("rowid") crsqlChangesVtabRowidTestSuite();
   SUITE("sandbox") crsqlSandboxSuite();
+  SUITE("init_race") crsql_init_race_check();
   SUITE("rust_integration") crsql_integration_check();
 
   sqlite3_shutdown();

@@ -1,6 +1,7 @@
 pub mod automigrate;
 pub mod backfill;
 pub mod fract;
+pub mod init_race;
 pub mod pack_columns;
 pub mod pk_only_tables;
 pub mod pk_update;

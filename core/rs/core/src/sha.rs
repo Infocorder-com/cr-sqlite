@@ -21,7 +21,13 @@ pub const SHA: &'static str = core::env!("CRSQLITE_COMMIT_SHA");
 //                    `table` constraint under a non-BINARY collation, so
 //                    `WHERE "table" = 'X' COLLATE NOCASE` is answered correctly
 //                    instead of being pruned under BINARY (Release B)
+//   e4-init-atomic   extension init is one atomic transaction, a Half-Initialized
+//                    Database (empty `crsql_master`, no cr-sqlite state) is healed,
+//                    and opens through `sqlite3_crsqlite_autoext_init` wait up to
+//                    2 s in total for a competing connection
+//                    (docs/CRSQLITE_INIT_RACE_FIX.md). The token does NOT show
+//                    which entry point a host registered.
 pub const BUILD_ID: &'static str = concat!(
-    "e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate ",
+    "e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic ",
     core::env!("CRSQLITE_COMMIT_SHA")
 );

@@ -1,7 +1,10 @@
 # Making cr-sqlite's per-connection init atomic — the init race wedge
 
-**Status:** 📋 **Plan, not built** (2026-11-13; revised the same day after two adversarial reviews and
-the operator's rulings). Docs only; no code has changed.
+**Status:** ✅ **Built and verified in the working tree, not yet committed** (2026-11-13). Every part
+below is implemented; `make test`, `make valgrind-strict`, `py/correctness` and the stress script are
+green, and the key guarantees are mutation-verified. Where the build made a choice the plan left open,
+or added to it, **Build record** says so. The plan was revised twice after adversarial reviews and the
+operator's rulings before it was built.
 **Area:** extension init — `core/rs/core/src/lib.rs` `sqlite3_crsqlcore_init`,
 `core/rs/core/src/bootstrap.rs`, `core/src/ext-data.c`, `core/src/crsqlite.c` (`sqlite3_crsqlite_init`
 and a new auto-extension entry point, `sqlite3_crsqlite_autoext_init`), `core/src/ext.h` and
@@ -111,13 +114,13 @@ connection can jump into unmapped code (**Failed Load Unmapped Callback**).
 
 | part | what it changes | status |
 |---|---|---|
-| **Atomic Init Transaction** | wraps every persistent write of init in one `BEGIN IMMEDIATE` … `COMMIT`, entered only when a read-only check says the file needs initializing. Every registration that carries a destructor is outside the transaction: `crsql_internal_sync_bit` registers **before** it, and `crsql_db_version` is init's **last** fallible step, after it | ✅ required — this is the fix |
-| **Init Residue Heal** | treats a data-free Half-Initialized Database as a blank slate, application tables allowed | ✅ required; scope ruled broad |
-| **Init Busy Timeout** | the new entry point `sqlite3_crsqlite_autoext_init` installs a busy handler with a 2 s per-open budget before init and clears it after; nothing changes on the `load_extension` path | ✅ ruled: ship it; the per-open budget is recommended (**The per-open budget**) |
-| **Init Host Rollback** | error paths roll back to their own savepoint instead of issuing a bare `ROLLBACK` | ✅ required (falls out of the transaction rewrite) |
-| **Init Error-Path Frees** | one owner for the ext data and the site-id buffer at every point of init; no failure can leave unfinalized statements behind, so a failed open always closes | ✅ required (falls out of the transaction rewrite) |
-| **Failed Load Unmapped Callback** | `crsql_internal_sync_bit`'s destructor becomes SQLite's own `sqlite3_free`; no destructor that lives in the extension library is registered before the last fallible step; the README says a failed `load_extension` leaves the connection unusable | ✅ required |
-| `crsql_build_id()` token | appends `e4-init-atomic` | ✅ required, so hosts can gate on the fix |
+| **Atomic Init Transaction** | wraps every persistent write of init in one `BEGIN IMMEDIATE` … `COMMIT`, entered only when a read-only check says the file needs initializing. Every registration that carries a destructor is outside the transaction: `crsql_internal_sync_bit` registers **before** it, and `crsql_db_version` is init's **last** fallible step, after it | ✅ built — this is the fix |
+| **Init Residue Heal** | treats a data-free Half-Initialized Database as a blank slate, application tables allowed | ✅ built; scope ruled broad |
+| **Init Busy Timeout** | the new entry point `sqlite3_crsqlite_autoext_init` installs a busy handler with a 2 s per-open budget before init and clears it after; nothing changes on the `load_extension` path | ✅ built, with the per-open budget handler (**The per-open budget**) |
+| **Init Host Rollback** | error paths roll back to their own savepoint instead of issuing a bare `ROLLBACK` | ✅ built (falls out of the transaction rewrite) |
+| **Init Error-Path Frees** | one owner for the ext data and the site-id buffer at every point of init; no failure can leave unfinalized statements behind, so a failed open always closes | ✅ built (falls out of the transaction rewrite) |
+| **Failed Load Unmapped Callback** | `crsql_internal_sync_bit`'s destructor becomes SQLite's own `sqlite3_free`; no destructor that lives in the extension library is registered before the last fallible step; the README says a failed `load_extension` leaves the connection unusable | ✅ built |
+| `crsql_build_id()` token | appends `e4-init-atomic` | ✅ built, so hosts can gate on the fix |
 
 **Recommendation:** ship all of them together as one release (`e4-init-atomic`).
 
@@ -927,6 +930,150 @@ and the coordination doc's **Pin this** sections):
 - **Verification to record:** the `main` valgrind baseline; `make test` and `make valgrind-strict`
   green; `py/correctness` green; the stress numbers before and after, in every mode, with the setting
   that reproduced; the `crsql_build_id()` output.
+
+---
+
+## Build record — what was built, and the choices the plan left open
+
+Built 2026-11-13 on stable Rust 1.95.0 (asdf), gcc, Linux x86_64, against this fork's HEAD `8d153fc2`.
+Not yet committed: the release SHA and the coordination doc's **Pin this** table are filled in when the
+operator commits.
+
+### Where the code is
+
+| part | location |
+|---|---|
+| **Atomic Init Transaction** | `lib.rs`: `init_persistent_state` (fast path, slow path, host-transaction savepoint), `init_sequence` (the existing sequence, in its existing order), `commit_or_free`. `bootstrap.rs`: `InitTxn` (the RAII guard) and `is_init_complete` (the **Init Completeness Check**) |
+| **Init Residue Heal** | `bootstrap.rs`: `is_init_residue`, called from `maybe_update_db_inner` |
+| **Init Busy Timeout** | `crsqlite.c`: `sqlite3_crsqlite_autoext_init`, `crsql_init_busy_handler`, `CRSQL_INIT_BUSY_TIMEOUT_MS` = 2000. Declared in `ext.h`; registered by `core_init.c` |
+| **Init Error-Path Frees**, the **ownership handoff** | `lib.rs`: `crsql_register_db_version` (a new internal export, not API), called by `sqlite3_crsqlite_init` after `crsql_changes`; the comment there says nothing fallible may follow |
+| **Failed Load Unmapped Callback** | `lib.rs`: `sqlite_free_destructor` (`api.free` on the loadable path, the `sqlite3_free` symbol statically) |
+| **Init Host Rollback** | `bootstrap.rs`: `ROLLBACK TO <savepoint>; RELEASE <savepoint>` in both init savepoints; `InitTxn`'s savepoint form |
+| `config.%` loop | `ext-data.c`: fails the open on any final step result but `SQLITE_DONE`; finalizes the statement on the broken-setting and prepare-failure paths |
+| fault injection | `init_fault.rs` (`InitStep`, `fail_at`, `n_arg`), `test_exports.rs` (the static, `crsql_test_fail_init_at`, `crsql_test_init_fail_step`); C hooks declared in `crsqlite.h` under `UNIT_TEST` |
+| tests | `core/rs/integration_check/src/t/init_race.rs`; `py/correctness/tests/test_init_race.py`; `tools/init_race_stress.sh` |
+
+### Choices the plan left open (each the conservative one)
+
+- **The `init_race_*` tests run as their own C suite**, `dist/test init_race` (`SUITE("init_race")` in
+  `tests.c`), not inside `rust_integration`. Each test returns a result, so one run reports every
+  failure; `CRSQL_INIT_RACE_ONLY=<name>` runs one test, and two diagnostic switches exist:
+  `CRSQL_INIT_RACE_VERBOSE=1` and `CRSQL_INIT_RACE_SKIP_STEP=<n>`. That was needed to see every red test
+  on the unfixed code, where step 17 aborts the process with a double free.
+- **A connection without cr-sqlite** is opened by `sqlite3_reset_auto_extension()`, open, then
+  `core_init(0)`, which re-registers whichever entry point the build uses.
+- **Three tests beyond the plan's table:**
+  - `init_race_step_count` asserts `InitStep::COUNT`.
+  - `init_race_config_broken_setting_closes` pins the statement leak on the broken-setting path.
+  - ⭐ `init_race_budget_is_per_open` is the only test that can tell the per-open budget from a per-wait
+    timeout. On one thread, every other blocking test fails at its first exhausted wait, so a per-wait
+    `sqlite3_busy_timeout` passes them all. This test installs a default-VFS shim whose `xSleep` counts
+    the time slept. When the open has slept 500 ms at `BEGIN IMMEDIATE`, the lock holder swaps its write
+    lock for a read lock, so the open reaches `COMMIT` and waits again. It asserts the total time slept,
+    not wall time, so it is deterministic under valgrind.
+- **Fault-injection placement:**
+  - `InitStep` lives in its own module, `init_fault.rs`; the static is in `test_exports.rs`.
+  - `ReadTxn` (3) fires after `BEGIN DEFERRED`, so the guard's rollback runs.
+  - `NewExtData` (9) fires in C after allocation and the prepares, so the free path is exercised.
+  - `InitSiteIdExt` (12) runs the real call and replaces its result, so the failure happens with the
+    buffer already owned by the ext data.
+  - `Commit` (14) is the `COMMIT` that ends the sequence's transaction, on either path. It is not the
+    commit that only releases the read transaction before the slow path.
+- **The heal predicate runs only when `crsql_master` has no `crsqlite_version` row**, inside
+  `maybe_update_db_inner`, so it never runs on the fast path, where the check requires that row. Rule 2
+  checks each table's existence first, as written.
+- **The completeness check** compares `CAST(value AS INTEGER) >= CRSQLITE_VERSION`, matching the
+  sequence's `column_int` read.
+- **The fast-path/slow-path loop is bounded at three passes.** A file that keeps flipping between
+  complete and incomplete fails the open with `SQLITE_BUSY` rather than looping.
+- **Site-ID Index Gap:** closed for every database initialized from now on. An existing file whose
+  `crsql_site_id` already lacks the unique index is **not** repaired, and the check does not require the
+  index. Creating a unique index on an existing table can fail on duplicates, which would turn a working
+  open into a failing one.
+- **The busy handler counts `max(requested, reported)` sleep.** On a VFS that rounds sleeps up to whole
+  seconds, the budget then stays a bound on the time actually slept.
+- **`-DHAVE_USLEEP=1`** is in the test binary, `dist/sqlite3` and the asan test binary, which runs the same
+  timing tests.
+- **The `py/correctness` tests run with `PYTHONPATH=src`.** The harness package is not installed in this
+  environment. Each test that fails a load on purpose closes its connection in a `finally` block, before
+  the keeper releases the library. Without that, an assertion failure left the connection to be closed
+  after the keeper, which crashed pytest with exactly the defect under test.
+- **Small fixes found on the way:** `crsql_newExtData` now checks its allocation, and finalizes the
+  `config.%` statement when an earlier prepare failed. The site-id buffer allocation is checked.
+- **Not changed:** `crsql_as_table` still recovers with a bare `ROLLBACK`. It is the same class of defect
+  as **Init Host Rollback**, but it is not init, and this release keeps its diff to init.
+
+### Verification
+
+**Baseline on unchanged code (`8d153fc2`):**
+
+| check | result |
+|---|---|
+| `make test` | green: 32 C test cases and 11 Rust suites |
+| `make valgrind-strict` | 0 errors, 0 bytes in use at exit. No suppressions needed |
+| `py/correctness` | 156 passed |
+
+**Red before the fix.** The test plumbing was added at the existing call sites first, with no behaviour
+change:
+
+| test | how it failed on unchanged code |
+|---|---|
+| `heals_field_sample`, `heals_synthesized_residue`, `heal_app_tables` | the version-0 refusal |
+| `heal_refuses_v0_12`, `heal_refuses_v0_13_v0_15` | the file bytes changed (the **free red→green**) |
+| `atomic_at_each_step` | residue left at steps 2 and 6–13; steps 3, 4 and 14 do not exist yet |
+| `error_paths_free_once` | a double free at step 17, which aborts the binary; with step 17 skipped, steps 3, 4 and 14 also fail |
+| `late_failure_no_zombie` | zombie file descriptors at steps 13 and 16; a double free at 17 |
+| `loser_writes_nothing`, `commit_busy` | gave up after 0–1 ms |
+| `config_busy_fails` | the open succeeded |
+| `config_broken_setting_closes` | leaked a file descriptor |
+| py `host_txn_preserved` | the host transaction was rolled back |
+| py `failed_load_close` | the subprocess died with SIGSEGV |
+
+Green before the fix, as expected: `reopen_writes_nothing`, `heal_refuses_nonempty`,
+`heal_refuses_crsql_object`, and py `heal_case_sensitive_like`. These guard against regressions rather
+than show the defect.
+
+**After the fix:**
+
+| check | result |
+|---|---|
+| `make test` | green: 32 C test cases, 17 `init_race`, 11 Rust suites |
+| `make valgrind-strict` | 0 errors, 0 bytes in use, all 17 `init_race` passing under valgrind |
+| `py/correctness` | 159 passed, including the 3 `init_race` tests |
+
+**Stress** (`tools/init_race_stress.sh 1500 10`, tmpfs, 10 processes, barrier spread ≤ 11 ms). It
+reproduced on the first setting tried, so no fallback setting was needed.
+
+| mode | before (`8d153fc2`) | after |
+|---|---|---|
+| fresh | 13,765 / 15,000 opens failed, 1500 / 1500 rounds; **57 files wedged** (every later open failed), 248 partial | 0 failed opens, 0 wedged, 0 partial, 0 hangs |
+| initialized WAL | 76 failed opens in 61 rounds | 0 failed opens |
+| rollback, switching to WAL | 1,167 failed opens in 456 rounds; 645 switcher `PRAGMA` lock failures | 0 failed opens; 1,048 switcher `PRAGMA` lock failures |
+
+The switcher's `PRAGMA journal_mode=WAL` runs after a successful open, with no host busy timeout in the
+shell, so its lock failures are counted separately and are not init's.
+
+**Mutation verification.** Each part was reverted, built, tested and restored in one command. The tree was
+then compared against a snapshot.
+
+| guarantee | mutation | result |
+|---|---|---|
+| the transaction | `COMMIT; BEGIN IMMEDIATE` inserted before `crsql_init_site_id` | `atomic_at_each_step` red at steps 11–14 |
+| heal rule 3 | rule 3 disabled | `heal_refuses_v0_12` and `heal_refuses_crsql_object` red |
+| heal rule 3 via `LIKE` | `name LIKE '%crsql%'` | py `heal_case_sensitive_like` red |
+| the busy timeout | handler not installed | `loser_writes_nothing`, `commit_busy` and `budget_is_per_open` red |
+| the per-open budget | `sqlite3_busy_timeout(db, budget)` | `budget_is_per_open` red (slept 1528 ms against a 1000 ms budget); the plan's two timing tests stay green |
+| error-path frees: the double free | `crsql_freeExtData` after a failed handoff | `error_paths_free_once` red under strict valgrind: 90 errors, `Invalid free` |
+| error-path frees: the leak | the free removed from the `crsql_changes` failure path | `late_failure_no_zombie` red at step 16 |
+| the ownership handoff | `crsql_db_version` registered right after `crsql_site_id` | double free at step 16 in `error_paths_free_once` and `late_failure_no_zombie` |
+| the `config.%` loop | final step result ignored | `config_busy_fails` red |
+| the sync-bit destructor | `crsql_sqlite_free` restored | py `failed_load_close` red |
+| nothing fallible after the handoff | the step-16 failure moved after the handoff | `late_failure_no_zombie` red |
+
+**`crsql_build_id()`:** `e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic <sha>`.
+
+**Not verified here:** macOS and Windows builds; the libSQL build (this fork has none); a disk-backed
+stress run (tmpfs reproduced, so the fallback was not needed).
 
 ---
 

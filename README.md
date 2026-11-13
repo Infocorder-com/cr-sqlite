@@ -23,7 +23,7 @@ It also vendors a **different `sqlite-rs-embedded`**: the submodule points at [`
 
 ```
 sqlite> SELECT crsql_build_id();
-e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate 6cf126543be0818741ec28905d5fd4749509d554
+e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic <commit-sha>
 ```
 
 | token | capability |
@@ -31,6 +31,7 @@ e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate 6cf126543be0818741ec28905d5fd474
 | `e1-fd-close` | change 1 — file descriptors released on connection close |
 | `e2-tbl-pushdown` | change 2 — `crsql_changes WHERE "table" = ?` pushed into the clock union |
 | `e3-tbl-collate-gate` | change 2's collation gate — the pushdown is declined under a non-`BINARY` collation |
+| `e4-init-atomic` | change 4 — extension init is atomic, a Half-Initialized Database is healed, and opens through `sqlite3_crsqlite_autoext_init` wait for a competing connection. ⚠️ The token does not show which entry point a host registered |
 
 Upstream cr-sqlite has no `crsql_build_id()` at all, so its absence distinguishes a stock build from this fork.
 
@@ -64,6 +65,25 @@ This fork builds on **stable Rust 1.95.0**, pinned in each crate's `rust-toolcha
 - **Benefit:** no nightly pin, and no build-time patching of feature gates. One less way for a toolchain change to break the build — which had already happened once, when `concat_idents` was removed.
 - **Cost / who should be careful:** `make asan` still needs nightly, because `-Zbuild-std` is a nightly-only flag; the same applies to the cross-compiled targets (`CI_MAYBE_TARGET`, iOS, Android), which are untouched here. Native `make loadable` / `make static` need only stable. Both `Cargo.lock` files are now lockfile **v4**, which requires cargo ≥ 1.78 — so build this ref with the toolchain it pins, and don't pair a new ref with an old nightly.
 
+### 4. Atomic extension init, Half-Initialized Database heal, and an init busy timeout (`e4-init-atomic`)
+
+Stock cr-sqlite runs a setup routine on every new connection, and on a brand-new file it writes its bookkeeping tables in **several separately committed steps**, inside `sqlite3_open_v2`, before the host can set a busy timeout. When a connection pool opens one fresh file from several connections at once, most opens fail with `SQLITE_BUSY` — and one interleaving leaves a file with an **empty** `crsql_master` table that every later open refuses forever with *"Opening a db created with cr-sqlite version 0 is not supported"* (the **Init Race Wedge**; the file is a **Half-Initialized Database**). A crash, a full disk or an I/O error between those commits does the same with a single connection. This fork:
+
+- runs every write of init in **one transaction** (`BEGIN IMMEDIATE`, entered only when a read-only check says the file needs initializing), so a file is either untouched or fully initialized; re-opening an initialized file still writes nothing and takes no write lock;
+- **heals** a Half-Initialized Database that holds no cr-sqlite state at all (an empty `crsql_master`, empty bookkeeping tables, and no other object whose name contains `crsql`; application tables are allowed), initializing it as if it were new. Genuine older databases, including v0.12-era files with an empty `crsql_master`, are still refused;
+- adds a second entry point, **`sqlite3_crsqlite_autoext_init`**, which runs init under a busy handler that allows **2 s of lock waiting in total per open**, and clears it before returning;
+- fixes init's error paths: a failed init rolls back to its own savepoint instead of the host's transaction, frees everything exactly once, and never leaves unfinalized statements behind, so a failed open can always be closed.
+
+See [`docs/CRSQLITE_INIT_RACE_FIX.md`](docs/CRSQLITE_INIT_RACE_FIX.md).
+
+- **Benefit:** pool start on a fresh file no longer fails opens or wedges the file, and a file wedged by an earlier build opens again. Opens of initialized files no longer fail when a pool-mate holds a lock for a moment (for example while switching the file to WAL).
+- **Cost / who should be careful:**
+  - **Static hosts must register `sqlite3_crsqlite_autoext_init`** with `sqlite3_auto_extension` to get the wait. A host that keeps registering `sqlite3_crsqlite_init` gets the atomic init and the heal, but its opens still fail at once under contention (cleanly now). `core/src/core_init.c` registers the new entry point.
+  - ⛔ **Never use `sqlite3_crsqlite_autoext_init` with `load_extension`.** It installs and then clears the connection's busy handler, which on the `load_extension` path would remove the host's own. `sqlite3_crsqlite_init` stays the `load_extension` entry point and does not touch the busy handler.
+  - An open through the new entry point **can spend up to 2 s waiting** for a competing connection (plus init's own work). On a host that opens on a bounded thread pool (for example a dirty I/O scheduler), several waiting opens occupy several threads for up to that long.
+  - ⛔ **A failed `load_extension` of cr-sqlite leaves the connection unusable.** SQLite unloads the library immediately, but the functions and virtual-table modules init registered before the failure stay registered and point into the unloaded library. Close the connection, and do not call any `crsql_*` function or use `crsql_changes` on it. Closing is safe: init registers no destructor that lives in the library until its last fallible step.
+  - A Half-Initialized Database now **opens** instead of failing; a host that parsed the version-0 message to detect wedged files will stop seeing it.
+
 ### Especially poor fits for this fork
 
 - You want a **drop-in, binary-compatible** replacement for stock cr-sqlite, or need to **track `vlcn-io` / `superfly` upstream exactly** — this fork intentionally diverges and is maintained for Infocorder's needs, not general parity.
@@ -72,7 +92,7 @@ This fork builds on **stable Rust 1.95.0**, pinned in each crate's `rust-toolcha
 - You need the **cross-compiled or sanitizer targets** (iOS, Android, `CI_MAYBE_TARGET`, `make asan`) — those still require nightly; change 3 only makes the native builds stable.
 - You need to **keep receiving upstream fixes and features** — see the drift warning below.
 
-For everyone else, this fork is effectively a superset of `superfly`'s behavior: `crsql_changes` result sets are byte-identical for every query shape (change 2 is faster for table-scoped reads, not different), and the on-disk format, the wire/changeset format and the public API are all unchanged. The only additions to the API surface are `crsql_build_id()` and change 1's teardown behaviour.
+For everyone else, this fork is effectively a superset of `superfly`'s behavior: `crsql_changes` result sets are byte-identical for every query shape (change 2 is faster for table-scoped reads, not different), and the on-disk format, the wire/changeset format and the public API are all unchanged. The only additions to the API surface are `crsql_build_id()`, change 1's teardown behaviour, and change 4's auto-extension entry point `sqlite3_crsqlite_autoext_init`.
 
 ### ⚠️ Upstream drift is the biggest risk of depending on this repo
 

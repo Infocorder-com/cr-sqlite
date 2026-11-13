@@ -1225,3 +1225,51 @@ the submodule-rides-with-ref fact; the toolchain-aware cache stamp (ref changed)
   query shape" claim. `e3` is proven both sides.
 - **Still open:** James's macOS + Windows stable passes (A1 Stage 2 + A2 ride together on `6cf12654`). S0 remains
   the separate app-level follow-up.
+
+---
+
+## 14. Init race fix (`e4-init-atomic`) — BUILT ✅, awaiting commit (upstream, 2026-11-13)
+
+Design and full verification: the fork's `docs/CRSQLITE_INIT_RACE_FIX.md` (**Build record**). Downstream
+integration: `docs/CRSQLITE_INIT_RACE_FIX_INTEGRATION.md` here.
+
+### Pin this
+
+| | |
+|---|---|
+| **`CRSQLITE_REF`** | ⏸ **not yet assigned** — the commit the operator makes from the verified working tree. ⛔ Do not bump until it is on GitHub |
+| **submodule pin** | **unchanged**: `c3c01fb84622b29bdf356d060254f36c9f4ca9ce`. No submodule push is needed |
+| `crsql_build_id()` | `e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic <sha>` |
+| toolchain | stable `1.95.0` (unchanged) |
+
+### What downstream must change with the pin bump
+
+- ⛔ **The startup shim, in the same change as the pin.**
+  `monkeypatched_deps/exqlite_crsqlite_init.c` must register the new entry point:
+  `sqlite3_auto_extension((void *)sqlite3_crsqlite_autoext_init)`. The signature is the same as
+  `sqlite3_crsqlite_init`'s. A pin bump **without** it links cleanly and passes every `e4-init-atomic`
+  gate, but ships without the busy wait. The token cannot tell the two apart.
+- **Declare the symbol** where the shim declares `sqlite3_crsqlite_init`, or include the fork's
+  `core/src/ext.h`, which now declares both.
+- **Never** pass `sqlite3_crsqlite_autoext_init` to `load_extension`. `sqlite3_crsqlite_init` stays the
+  `load_extension` entry point.
+- **Gates** keyed on `e2-tbl-pushdown` / `e3-tbl-collate-gate` keep working (substring match). Add an
+  `e4-init-atomic` gate where the fix must be present.
+- **Unchanged:** the on-disk format, the wire format, the public SQL API, and the submodule.
+
+### Verification (upstream, stable 1.95.0, Linux)
+
+- `make test` green: 32 C test cases, 17 `init_race`, 11 Rust suites.
+- `make valgrind-strict` (a new target that fails on leaks and memory errors): 0 errors, 0 bytes in use.
+  The baseline on `8d153fc2` was also clean.
+- `py/correctness`: 159 passed (156 before, plus 3 `init_race`).
+- `tools/init_race_stress.sh 1500 10`, before and after:
+
+  | mode | before | after |
+  |---|---|---|
+  | fresh | 13,765 / 15,000 opens failed; **57 files wedged** | 0 failed opens, 0 wedged |
+  | initialized WAL | 76 failed | 0 |
+  | rollback, switching to WAL | 1,167 failed | 0 |
+
+- 11 mutations of the key guarantees, each red, each restored and checked.
+- ⚠️ **Not verified upstream:** macOS and Windows builds.
