@@ -152,17 +152,22 @@ Authoritative facts, with line numbers:
 ## 5. Lockfile state
 
 - `core/rs/bundle_static/Cargo.lock` (in the fork): **required** bump `bindgen 0.68.1 → 0.72.1` (the new submodule's
-  `Cargo.toml` demands it). Stays at lockfile **v3** (backward-compatible).
+  `Cargo.toml` demands it). It was lockfile **v3** at `653012a9`; the stable-Rust port moved it, and
+  `integration_check`'s, to **v4** by `578ef5d6` (verified with `git show`), and `85faa868` moved the other four.
   **[upstream] ✅ Already committed** in `653012a9`; fork working tree is clean. §6 action 4 is done.
 - **`rustc-hash 2.1.1`** is an undocumented leftover pin from the upstream MSRV bisection.
   **[upstream] Recommend leaving it, not floating it.** Floating resolves to `2.1.3`, whose ≥1.77 floor is now
   irrelevant (the toolchain floor is already 1.93), so the change buys nothing and costs a lockfile commit. If it
   ever *is* touched, fold it into the next lockfile change rather than doing it standalone.
-- ⚠️ **v3→v4 hazard:** any `cargo` command run with a modern *stable* toolchain rewrites this lockfile to `version = 4`,
-  which the nightly can't parse. Always put the intended toolchain on PATH first; check `git diff` on `Cargo.lock`.
-- **[upstream] 2026-11-13 — Dependabot security bumps (in the tree, uncommitted).** All six fork lockfiles (the
-  five under `core/rs/` plus `tools/`) are now lockfile **v4**; that supersedes "stays at v3" above, because the
-  stable-Rust port pins cargo 1.95, which writes v4. Alerted crates: `bytes 1.5.0 → 1.11.1` (`core`, `bundle`,
+- ⚠️ **Lockfile version follows the ref's toolchain.** Every fork lockfile is **v4** from `85faa868` on
+  (`bundle_static` and `integration_check` already from `578ef5d6`), which is correct: those refs pin stable
+  cargo 1.95, which writes and needs v4. A v4 lockfile cannot be parsed by a toolchain older than cargo 1.78,
+  such as `nightly-2023-10-05`, which `653012a9` pins. Build a ref with the toolchain it pins, put
+  that toolchain on PATH first, and check `git diff` on `Cargo.lock` after a build.
+- **[upstream] 2026-11-13 — Dependabot security bumps (committed in `85faa868`).** ⛔ They contain a release
+  blocker: `bytes` 1.11.1 broke reading blob primary keys (section 14, **Status**). **Never pin `85faa868`, or
+  any commit from it up to the fix.** All six fork lockfiles (the five under `core/rs/` plus `tools/`) are
+  lockfile **v4**. Alerted crates: `bytes 1.5.0 → 1.11.1` (`core`, `bundle`,
   `bundle_static`, `integration_check`); `shlex → 1.3.0` (those four plus `fractindex-core`); `rustix 0.38.13 →
   0.38.19`, dragging `linux-raw-sys 0.4.7 → 0.4.15` (`integration_check`); `rand 0.8.5 → 0.8.6` (`fractindex-core`,
   `tools`). ⚠️ The `core`, `bundle` and `fractindex-core` lockfiles were **stale** — they still pinned `bindgen
@@ -398,6 +403,10 @@ the pushdown, on its own, with its own 3-platform verification. Windows/MinGW lo
 - **2026-11-13 (upstream, FYI):** Dependabot security bumps across the fork's Cargo lockfiles and
   `py/correctness`, recorded under **Lockfile state**. No `Cargo.toml` changed and no `CRSQLITE_REF` bump is
   implied. `make test`, `make valgrind-strict`, the correctness suite and the init-race stress run all pass.
+- **2026-11-13 (upstream, release blocker):** ⛔ those bumps, committed in `85faa868`, broke reading packed
+  blob primary keys (`bytes` 1.11 sign-extends `get_int`); none of the suites above had a blob key of 128 bytes
+  or more. The fix is in the fork's working tree, awaiting commit; details in section 14. Never pin `85faa868`
+  or anything from it up to the fix. The py suite's pins need Python ≥ 3.10 (pytest 9).
 
 ## 9. Next release — the `crsql_changes` table-filter pushdown (Release A)
 
@@ -1242,20 +1251,35 @@ the submodule-rides-with-ref fact; the toolchain-aware cache stamp (ref changed)
 
 ---
 
-## 14. Init race fix (`e4-init-atomic`) — committed in `578ef5d6`; review follow-up awaiting commit (upstream, 2026-11-13)
+## 14. Init race fix (`e4-init-atomic`) — committed; adopted downstream at a provisional pin (2026-11-13)
 
 Design and full verification: the fork's `docs/CRSQLITE_INIT_RACE_FIX.md` (**Build record**). Downstream
-integration: `docs/CRSQLITE_INIT_RACE_FIX_INTEGRATION.md` here.
+integration: `docs/CRSQLITE_INIT_RACE_FIX_INTEGRATION.md` in silicon_brain (**Adoption Record**).
 
-**Status.** The fix is committed in the fork as `578ef5d6`. A follow-up that fixes the code review's
-findings (the fork doc's **Code review follow-up**) is in the fork's working tree, verified, and
-awaiting the operator's commit. ⛔ **Pin the commit that includes the follow-up, not `578ef5d6`.**
+**Status.** The fix is committed in the fork as `578ef5d6`, with the code review's follow-up
+(`f39caadd`), dependency bumps (`85faa868`) and a test fix (`ba3c7ff5`) on top, all on `origin/main`.
+Downstream pinned `ba3c7ff5` **provisionally**: ⛔ a review of `578ef5d6..ba3c7ff5` found a release blocker
+in the dependency bumps (`bytes` 1.11.1 makes `Buf::get_int` sign-extend, so `pack_columns.rs` misdecodes
+blob primary-key lengths 128–255 and 32768–65535, and `crsql_changes` reads and merges abort). The pin is
+to be updated to the fixed release.
+
+**The fix** (**Packed Blob Length Sign-Extension**, in the fork doc's **Build record**) is in the fork's
+working tree, verified, and **awaiting the operator's commit** (2026-11-13). Its SHA is not known yet, so
+the pin below stays provisional until that commit is on `origin/main`. ⛔ **Never pin `85faa868` alone, or
+any commit from it up to the fix — `ba3c7ff5` included.** What it fixes:
+- blob lengths 128–255, 32768–65535 and 2^23 to 2^24−1 are decoded zero-extended again; an empty blob key
+  (`x''`) no longer panics a debug build. `bytes` stays at 1.11.1;
+- a malformed packed primary key (empty, or declaring more than 8 length bytes) is an error instead of a
+  process abort. A peer's merge could trigger that abort in release builds; by the `bytes` 1.5.0 source it predates
+  `85faa868` (not run on a pre-`85faa868` build);
+- a failed init always reports a valid SQLite code: an empty stored site id gave `unknown error`, and rc
+  136 through an auto-extension open; it is now `SQLITE_ERROR` with `cr-sqlite init: SQL logic error`.
 
 ### Pin this
 
 | | |
 |---|---|
-| **`CRSQLITE_REF`** | ⏸ **`<TO BE FILLED AT ADOPTION>`** — the fork commit that includes the review follow-up (after `578ef5d6`). Placeholder, not a SHA. ⛔ Do not bump until it is on GitHub |
+| **`CRSQLITE_REF`** | ⚠️ **`ba3c7ff5721fa45789abff9539c4d824b374bcae`** — PROVISIONAL, to be updated to the fixed release (see **Status**). Lives only in silicon_brain's `scripts/build_crsqlite_static.sh` |
 | **submodule pin** | **unchanged**: `c3c01fb84622b29bdf356d060254f36c9f4ca9ce`. No submodule push is needed |
 | `crsql_build_id()` | `e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic <sha>` |
 | toolchain | stable `1.95.0` (unchanged) |
@@ -1273,7 +1297,10 @@ awaiting the operator's commit. ⛔ **Pin the commit that includes the follow-up
   `load_extension` entry point.
 - **Gates** keyed on `e2-tbl-pushdown` / `e3-tbl-collate-gate` keep working (substring match). Add an
   `e4-init-atomic` gate where the fix must be present.
-- **Unchanged:** the on-disk format, the wire format, the public SQL API, and the submodule.
+- **Unchanged:** the on-disk format, the public SQL API, and the submodule. The bytes of the wire format
+  (packed primary keys in `crsql_changes`) are unchanged too, but ⛔ `85faa868` through `ba3c7ff5` cannot
+  **read** blob primary keys of 128–255, 32768–65535 or 2^23 to 2^24−1 bytes, so they fail to merge them
+  from any peer. The fixed release reads them again and interoperates with builds before `85faa868`.
 - **What a failed init now reports** (changed by the review follow-up). A lock failure is no longer
   rc 1 with an empty message. Through the auto-extension (Exqlite's open): rc **`SQLITE_BUSY` (5)**,
   message `automatic extension loading failed: cr-sqlite init: database is locked`. Through
@@ -1301,4 +1328,9 @@ awaiting the operator's commit. ⛔ **Pin the commit that includes the follow-up
 - 11 mutations of the key guarantees at `578ef5d6`, and 6 more for the follow-up, each red (or, for the
   fd fallback, reporting SKIPPED), each restored and checked. The follow-up's stress run
   (`tools/init_race_stress.sh 200 10`, all three modes) had 0 failed opens and 0 wedged files.
+- With the blocker fix (working tree): `make test` green with 33 C test cases, 23 `init_race`, 11 Rust
+  suites; `make valgrind-strict` 0 errors, 0 bytes in use; `py/correctness` 265 passed (104 new boundary
+  and malformed-package cases; the pins need Python ≥ 3.10); `tools/init_race_stress.sh 100 8`, all three
+  modes, 0 failed opens and 0 wedged; `make static` and `make loadable` build; 7 mutations each red (or
+  SKIPPED), restored and checked.
 - ⚠️ **Not verified upstream:** macOS and Windows builds.

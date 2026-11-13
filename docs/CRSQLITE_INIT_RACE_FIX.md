@@ -1,17 +1,25 @@
 # Making cr-sqlite's per-connection init atomic — the init race wedge
 
-**Status:** ✅ **Built, verified and committed in `578ef5d6`** (2026-11-13). A follow-up that fixes
-the code review's findings (**Code review follow-up**, in the **Build record**) is in the working
-tree, verified, and awaiting the operator's commit; the release SHA to pin is the commit that includes
-it. Every part below is implemented; `make test`, `make valgrind-strict`, `py/correctness` and the
-stress script are green, and the key guarantees are mutation-verified. Where the build made a choice the plan left open,
+**Status:** ✅ **Built, verified and committed in `578ef5d6`** (2026-11-13), with the code review's
+follow-up (**Code review follow-up**, in the **Build record**) committed in `f39caadd`. ⛔ The dependency
+bumps committed next, in `85faa868`, broke the decoding of packed primary keys
+(**Packed Blob Length Sign-Extension**, in the **Build record**); the fix is in the working tree,
+verified, and awaiting the operator's commit. The release SHA to pin is the commit that includes that
+fix. ⛔ **Never pin `85faa868`, or any commit from it up to the fix (including `ba3c7ff5`).** Every
+part below is implemented; `make test`, `make valgrind-strict`, `py/correctness` and the stress script
+are green, and the key guarantees are mutation-verified. Where the build made a choice the plan left open,
 or added to it, **Build record** says so. The plan was revised twice after adversarial reviews and the
 operator's rulings before it was built.
 **Area:** extension init — `core/rs/core/src/lib.rs` `sqlite3_crsqlcore_init`,
 `core/rs/core/src/bootstrap.rs`, `core/src/ext-data.c`, `core/src/crsqlite.c` (`sqlite3_crsqlite_init`
 and a new auto-extension entry point, `sqlite3_crsqlite_autoext_init`), `core/src/ext.h` and
 `core/src/core_init.c`.
-**Compatibility:** no wire or changeset format change. One new exported C symbol,
+**Compatibility:** the init fix itself changes no wire or changeset format. ⛔ The dependency bumps of
+`85faa868` did break the **reading** of the packed primary-key format, though the bytes written are
+unchanged: blob primary keys of 128–255, 32768–65535 and 2^23 to 2^24−1 bytes could not be read
+from `crsql_changes`, unpacked or merged (**Packed Blob Length Sign-Extension**). The working-tree fix
+restores the decoding; the format itself never changed, so a fixed build and a pre-`85faa868` build
+exchange changes normally. One new exported C symbol,
 `sqlite3_crsqlite_autoext_init` (the auto-extension entry point of **Init Busy Timeout**); existing
 exported API symbols are unchanged (the internal Rust init symbols `sqlite3_crsqlrustbundle_init` and
 `sqlite3_crsqlcore_init`, which only `crsqlite.c` calls, gained an `rc_out` parameter for
@@ -780,7 +788,9 @@ checks this claim by claim (**Litestream Compatibility**).
 - `make vanilla` builds `dist/vanilla-sqlite3`, a shell **without** cr-sqlite; the stress script uses
   it to inspect files cr-sqlite-free.
 - `py/correctness` (pytest, against `make loadable`) is the other harness; it loads the extension with
-  Python's `Connection.load_extension` (the C API, not `SELECT load_extension`). ⚠️ Its prior-version
+  Python's `Connection.load_extension` (the C API, not `SELECT load_extension`). Its pins
+  (`requirements.txt`) need **Python ≥ 3.10**, because pytest 9 does. Run it as
+  `cd py/correctness && PYTHONPATH=src python -m pytest tests` from a Python 3.10+ venv. ⚠️ Its prior-version
   test, `py/correctness/tests/test_prior_versions.py`, is **entirely commented out** ("We no longer
   support these versions"), so `pytest -k prior` runs nothing. The prior-version refusals are covered by
   the C tests below instead.
@@ -800,7 +810,7 @@ Name them so a grep finds them all: prefix `init_race_`.
 | `init_race_heal_app_tables` | residue plus an application table with rows | heals (broad scope); app rows untouched |
 | `init_race_atomic_at_each_step` | fault injection (**Fault injection**) fails init at each persistent step, from `crsql_init_peer_tracking_table` through `create_site_id_triggers`, and at `COMMIT` | open fails; afterwards `sqlite_master` contains **no** `crsql` object; next open succeeds |
 | `init_race_error_paths_free_once` | the same injection at every registration and at the `crsql_changes` module, before and after the commit, including the handoff itself; each open is closed with `sqlite3_close_v2`, as Exqlite does | open fails, close returns `SQLITE_OK`; under the strict valgrind target: no leak, no invalid free, no use after free |
-| `init_race_late_failure_no_zombie` | for every injection point from `crsql_newExtData` on (including `crsql_changes` and the handoff): count the process's open file descriptors (`/proc/self/fd` on Linux, `/dev/fd` on macOS and the BSDs; reported as **SKIPPED**, never ok, where neither exists), open a file-backed database with the injection set, `sqlite3_close_v2` it | the descriptor count is back to its value before the open — a zombie keeps the database descriptor open. Pins the **Init Error-Path Frees** zombie |
+| `init_race_late_failure_no_zombie` | for every injection point from `crsql_newExtData` on (including `crsql_changes` and the handoff): count the process's open file descriptors (`/proc/self/fd` on Linux, `/dev/fd` on macOS and the BSDs, each used only if opening one more file adds exactly one entry; reported as **SKIPPED**, never ok, where no directory qualifies — Windows, and FreeBSD without `fdescfs`, whose `/dev/fd` lists only 0–2), open a file-backed database with the injection set, `sqlite3_close_v2` it | the descriptor count is back to its value before the open — a zombie keeps the database descriptor open. Pins the **Init Error-Path Frees** zombie |
 | `init_race_loser_writes_nothing` | plain, cr-sqlite-free connection P holds `BEGIN IMMEDIATE` on a fresh file; budget overridden to 200 ms; open C with cr-sqlite; time the open with a monotonic clock | C's open fails; ⏱ **elapsed ≥ 150 ms** (it waited, rather than failing at once) and **elapsed < 200 ms + 1 s** (it gave up within the budget); after P rolls back the file is still empty. ⚠️ Before the fix C fails at once and the file is also empty, so **only the lower timing bound** distinguishes the fix |
 | `init_race_commit_busy` | P is a **plain, cr-sqlite-free** connection that holds `SHARED` (`BEGIN; SELECT count(*) FROM sqlite_master;`) on a fresh file; budget 200 ms; open C with cr-sqlite; time it | C's `COMMIT` waits out the budget (P cannot release on one thread) and rolls back: ⏱ **elapsed ≥ 150 ms** and **< 200 ms + 1 s**; the file is still empty; after P ends, C's next open succeeds. ⚠️ Before the fix C's first separately committed `CREATE TABLE` fails at once and rolls back, leaving the file empty too, so again **only the lower timing bound** is red before the fix |
 | `init_race_reopen_writes_nothing` | fully initialized file; open it read-write while P holds `BEGIN IMMEDIATE`; separately open it read-only (`SQLITE_OPEN_READONLY`) | both opens succeed at once (elapsed well under the budget). ⭐ The read-write half is the one that proves the fast path takes no write lock; the read-only half cannot detect an over-strict check (**Keeping the re-open path read-only**) |
@@ -987,9 +997,11 @@ and the coordination doc's **Pin this** sections):
 ## Build record — what was built, and the choices the plan left open
 
 Built 2026-11-13 on stable Rust 1.95.0 (asdf), gcc, Linux x86_64, against this fork's HEAD `8d153fc2`,
-and committed as `578ef5d6`. The **Code review follow-up** below is in the working tree, awaiting the
-operator's commit. The release SHA to pin is the commit that includes the follow-up; the coordination
-doc's **Pin this** table carries a placeholder until then.
+and committed as `578ef5d6`. The **Code review follow-up** below is committed in `f39caadd`; the
+dependency bumps in `85faa868` and a test fix in `ba3c7ff5` followed. The fix for the release blocker
+those bumps introduced (**Packed Blob Length Sign-Extension**, below) is in the working tree, awaiting
+the operator's commit. The release SHA to pin is the commit that includes it; the coordination doc's
+**Pin this** table carries a provisional pin until then.
 
 ### Where the code is
 
@@ -1132,7 +1144,7 @@ stress run (tmpfs reproduced, so the fallback was not needed).
 ### Code review follow-up
 
 A code review of `578ef5d6` found five fixable defects. The operator approved fixing them on
-2026-11-13; they are in the working tree, awaiting commit. Built the same way (stable 1.95.0, the
+2026-11-13; the fixes are committed in `f39caadd`. Built the same way (stable 1.95.0, the
 populated cargo cache, offline). Each new test was red before its fix.
 
 | finding | fix | test — how it failed before the fix |
@@ -1175,6 +1187,81 @@ on the app's startup shim registering `sqlite3_crsqlite_autoext_init` (documente
 WASM; the site-id state after a host `ROLLBACK`, which predates this fix; and `crsql_as_table`'s bare
 `ROLLBACK` (**Not changed**, above).
 
+### Packed Blob Length Sign-Extension — the release blocker in `85faa868`, and its fix
+
+**In the working tree, awaiting the operator's commit** (2026-11-13). A review of `578ef5d6..ba3c7ff5`
+found that the Dependabot bump of `bytes` from 1.5.0 to 1.11.1 (`85faa868`) broke the decoding of
+packed primary keys. The bytes written never changed; reading them did.
+
+**What broke.** A packed column stores a blob's or a text's length in the fewest big-endian bytes that
+hold it. `unpack_columns` (`core/rs/core/src/pack_columns.rs`) read a **blob** length with
+`buf.get_int(n)`. In `bytes` 1.5.0 that zero-extended; 1.11.1 sign-extends it. So a blob length whose
+top encoded byte has bit 7 set — 128–255, 32768–65535 and 2^23 to 2^24−1 — decoded as negative, became
+a huge `usize`, and the decode returned ABORT. For a table with blob primary keys of those lengths,
+`SELECT * FROM crsql_changes` failed with `query aborted`, `crsql_unpack_columns` with
+`SQL logic error`, and merges failed. An empty blob key (`x''`) made `get_int(0)` shift by 64, which
+panics in a debug build and aborts the process. Text lengths and integer values already used
+`get_uint` and were not affected.
+
+**The fix.** Every integer that follows a type byte is decoded **zero-extended** (`get_packed_uint`):
+the encoder writes the low *n* bytes, and it uses fewer than 8 only for a value whose dropped bytes are
+zero (a length, or a non-negative integer); a negative integer always takes all 8 and carries its own
+sign. Zero bytes return 0 without calling into `bytes`. `bytes` stays at 1.11.1.
+
+The same review of the decoder found that a **malformed** package aborted the host process, release
+build included, because `bytes` panics and this crate is built `panic = "abort"`: an empty package, or a
+type byte declaring more than 8 length bytes with enough bytes following. A package arrives from a peer
+in every `crsql_changes` merge, so a peer could crash a node. By the `bytes` 1.5.0 source this predates the bump (not run on a
+pre-`85faa868` build). Both now return
+an error.
+
+The same change carries the review's smaller findings:
+
+| finding | fix | test — how it failed before the fix |
+|---|---|---|
+| blob lengths 128–255, 32768–65535, 2^23 to 2^24−1 undecodable; `x''` panics in debug | `get_packed_uint` / `get_packed_bytes`, zero-extended, no call for 0 bytes | Rust `pack_columns` suite, `test_boundary_lengths`: the debug panic `attempt to shift left with overflow` at length 0. py `test_pack_columns_boundaries.py` against the HEAD build: 12 failed (`pack_unpack_round_trip` and `changes_read_and_merge` for blob 128, 255, 32768, 65535, 2^23, 2^24−1) |
+| a malformed package aborts the process | an empty package, more than 8 length bytes, or too few bytes is ABORT | Rust `test_malformed_packages`; py `test_malformed_package_is_an_error_not_a_crash`: 5 cases killed their child process (SIGILL) |
+| `init_rc` passed sqlite_nostd's sentinel `ResultCode::NULL` (5000) through: an empty stored site id gave `cr-sqlite init: unknown error`, and an auto-extension open returned 5000 & 0xff = 136 | **Init Failure Code and Message** now clamps: `init_error_code` (Rust, applied in `init_rc` and at the `rc_out` write) and `crsql_init_failed` (C) pass a real primary or extended code through and turn anything else into `SQLITE_ERROR` | `init_race_corrupt_site_id_reports_valid_code`: rc 136, `cr-sqlite init: unknown error`. `init_race_init_error_code_is_valid` pins the rule |
+| `crsql_initSiteIdExt` summed the codes of its two prepares | returns the first failure | C `InitSiteIdExtReportsFirstFailure` (no `crsql_site_id` table, so both prepares fail): rc 2, `SQLITE_INTERNAL` |
+| `fd_count` trusted any `/dev/fd`; FreeBSD without `fdescfs` lists only 0–2, so the zombie test would pass vacuously | a directory counts only if opening one more file adds exactly one entry; otherwise **SKIPPED** | not red-first; mutation below |
+| the test binary declared `sqlite3_crsqlite_init` with `const void *` and no LIBSQL argument | declared as `core/src/ext.h` does (`*const sqlite3_api_routines`, plus the LIBSQL fourth argument under the `libsql` feature). The declaration is Rust, so it cannot include `ext.h` | — |
+| `test_unpack_columns` asserted `i == i` (shadowed), checking nothing | compares the unpacked value with the input | — |
+
+**Verification** (stable 1.95.0, Linux x86_64):
+
+| check | result |
+|---|---|
+| `make test` | green: 33 C test cases, 23 `init_race` (23 passed, 0 skipped), 11 Rust suites |
+| `make valgrind-strict` | 0 errors, 0 bytes in use at exit, all 23 `init_race` passing under valgrind |
+| `py/correctness` | 265 passed (161 plus 104 in `test_pack_columns_boundaries.py`) |
+| `tools/init_race_stress.sh 100 8` (all three modes) | 0 failed opens, 0 wedged, 0 hangs (switch mode: 63 switcher `PRAGMA` lock failures, which are not init's) |
+| `make static`, `make loadable`, `make loadable_dbg` | build; the static archive still exports `sqlite3_crsqlite_autoext_init` |
+| the reviewer's probes (`blobpk.py`, `emptyblob.py`) on the release and the debug `.so` | every length reads, unpacks and merges; `x''` round-trips with no crash |
+
+**Mutations**, each bounded with `timeout`, restored in the same command and checked with `cmp`:
+
+| guarantee | mutation | result |
+|---|---|---|
+| zero-extended blob length | the blob arm decodes with `get_int` again (0 bytes still guarded) | `pack columns suite: ABORT` at blob 128 |
+| zero-extension for every field | `get_packed_uint` uses `get_int` | the existing integer case red: `assertion failed: i == 10000000` |
+| at most 8 length bytes | the `nbytes > 8` check removed | panic `size too large … nbytes is 9` (process abort) |
+| empty package | the empty check removed | panic `advance out of bounds` (process abort) |
+| both clamps | `init_error_code` and `crsql_init_failed` pass the code through | `corrupt_site_id_reports_valid_code` red (rc 136, `unknown error`); `init_error_code_is_valid` red |
+| first failure | `crsql_initSiteIdExt` sums again | `InitSiteIdExtReportsFirstFailure` red (`rc == SQLITE_ERROR` assertion) |
+| fd directory probe | both fd directories replaced by `/`, which does not track opens | with the probe: `late_failure_no_zombie` SKIPPED; with the old unprobed count: it passes, vacuously |
+
+⚠️ **Two layers by design.** With only the C clamp removed, `corrupt_site_id_reports_valid_code` stays green: the Rust clamp
+already delivers a valid code, and no C-side step returns an invalid one. The C clamp is a backstop and
+is not independently tested. Likewise the zero-byte early return is a backstop: `get_uint(0)` is safe in
+`bytes` 1.11.1, so removing it alone is not red.
+
+**Not changed:** a stored site id of the wrong non-zero length (for example 15 bytes) is still reported
+as `cr-sqlite init: column index out of range` (`SQLITE_RANGE`), a valid code with an unhelpful
+message. Text in a package is still taken as UTF-8 unchecked, as before.
+
+**Not verified:** macOS, Windows and FreeBSD (the `fdescfs` case was exercised only by the mutation
+above, on Linux).
+
 ---
 
 ## Risks
@@ -1213,6 +1300,15 @@ WASM; the site-id state after a host `ROLLBACK`, which predates this fix; and `c
 - **Fleet mix.** A device still running an older build can wedge a new file until it upgrades. The
   heal then rescues that file the first time an upgraded build opens it. Rollout belongs to the
   integration doc.
+- **Changed signature of two exported internal symbols** (a note; no code change). `sqlite3_crsqlcore_init`
+  and `sqlite3_crsqlrustbundle_init` are exported, and both gained a fourth argument, `rc_out`
+  (**Init Failure Code and Message**). Only `crsqlite.c` calls them, and no external caller is known. A
+  host that called either directly with three arguments would pass garbage as `rc_out`; such a host must
+  call `sqlite3_crsqlite_init` instead.
+- **A dependency bump can change behaviour without changing the manifest.** `85faa868` changed no
+  `Cargo.toml`, yet `bytes` 1.11 changed what `get_int` returns, which broke reading packed primary keys
+  (**Packed Blob Length Sign-Extension**). Guarded now by the boundary tests in the Rust `pack_columns`
+  suite and in `py/correctness/tests/test_pack_columns_boundaries.py`; run both on every dependency bump.
 
 ---
 

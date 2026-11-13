@@ -59,13 +59,17 @@ extern "C" {
     #[cfg(unix)]
     fn closedir(dir: *mut c_void) -> c_int;
 
-    // core/src/crsqlite.c: the load_extension entry point. This binary is
-    // built with SQLITE_OMIT_LOAD_EXTENSION, so SQLITE_EXTENSION_INIT2
-    // ignores the API routines pointer and a null one is correct here.
+    // core/src/crsqlite.c: the load_extension entry point, declared as
+    // core/src/ext.h declares it -- including the fourth argument a LIBSQL
+    // build adds (libsql_api_routines has no binding here, so it is opaque).
+    // This binary is built with SQLITE_OMIT_LOAD_EXTENSION, so
+    // SQLITE_EXTENSION_INIT2 ignores the API routines pointer and a null one
+    // is correct here.
     fn sqlite3_crsqlite_init(
         db: *mut b::sqlite3,
         pz_err_msg: *mut *mut c_char,
-        api: *const c_void,
+        api: *const b::sqlite3_api_routines,
+        #[cfg(feature = "libsql")] libsql_api: *const c_void,
     ) -> c_int;
 
     // core/src/core_init.c: registers this build's auto-extension entry point.
@@ -79,6 +83,7 @@ extern "C" {
 const OPEN_RW: c_int = (b::SQLITE_OPEN_READWRITE | b::SQLITE_OPEN_CREATE) as c_int;
 const OPEN_RO: c_int = b::SQLITE_OPEN_READONLY as c_int;
 const SQLITE_OK: c_int = 0;
+const SQLITE_ERROR: c_int = 1;
 const SQLITE_BUSY: c_int = 5;
 const SQLITE_READONLY: c_int = 8;
 /// What `sqlite3AutoLoadExtensions` prefixes to an auto-extension's message.
@@ -198,25 +203,49 @@ fn now_ms() -> i64 {
 }
 
 /// Where the open file descriptors of this process are listed: Linux, then
-/// macOS and the BSDs.
+/// macOS and the BSDs. FreeBSD's `/dev/fd` lists only 0-2 unless `fdescfs` is
+/// mounted on it, so a directory is used only after `fd_dir_tracks_opens`
+/// shows it lists a descriptor this process just opened.
 #[cfg(unix)]
 const FD_DIRS: [&str; 2] = ["/proc/self/fd", "/dev/fd"];
 
+#[cfg(unix)]
+fn count_entries(dir: &str) -> Option<usize> {
+    let d = unsafe { opendir(cstr(dir).as_ptr()) };
+    if d.is_null() {
+        return None;
+    }
+    let mut n = 0;
+    while !unsafe { readdir(d) }.is_null() {
+        n += 1;
+    }
+    unsafe { closedir(d) };
+    Some(n)
+}
+
+/// Whether `dir` lists this process's real descriptors: opening one more
+/// file must add exactly one entry.
+#[cfg(unix)]
+fn fd_dir_tracks_opens(dir: &str) -> bool {
+    let before = count_entries(dir);
+    let f = unsafe { fopen(cstr("/dev/null").as_ptr(), cstr("r").as_ptr()) };
+    if f.is_null() {
+        return false;
+    }
+    let during = count_entries(dir);
+    unsafe { fclose(f) };
+    matches!((before, during), (Some(b), Some(d)) if d == b + 1)
+}
+
 /// Open file descriptors of this process, or None where no fd directory
-/// exists (Windows). Tests that need it report SKIPPED then, never ok.
+/// lists them (Windows; FreeBSD without `fdescfs`). Tests that need it report
+/// SKIPPED then, never ok.
 #[cfg(unix)]
 fn fd_count() -> Option<usize> {
     for dir in FD_DIRS {
-        let d = unsafe { opendir(cstr(dir).as_ptr()) };
-        if d.is_null() {
-            continue;
+        if fd_dir_tracks_opens(dir) {
+            return count_entries(dir);
         }
-        let mut n = 0;
-        while !unsafe { readdir(d) }.is_null() {
-            n += 1;
-        }
-        unsafe { closedir(d) };
-        return Some(n);
     }
     None
 }
@@ -229,7 +258,8 @@ fn skipped(reason: &str) -> String {
     format!("{}{}", SKIP_PREFIX, reason)
 }
 
-const NO_FD_DIR: &str = "no fd directory (/proc/self/fd or /dev/fd) to count file descriptors";
+const NO_FD_DIR: &str =
+    "no fd directory (/proc/self/fd or /dev/fd) that lists this process's descriptors";
 
 struct Opened {
     rc: c_int,
@@ -867,7 +897,10 @@ fn init_race_config_broken_setting_closes() -> TResult {
 /// `test_init_race_busy_load_message`.
 fn load_path_init(db: *mut b::sqlite3) -> (c_int, Option<String>) {
     let mut err: *mut c_char = null_mut();
+    #[cfg(not(feature = "libsql"))]
     let rc = unsafe { sqlite3_crsqlite_init(db, &mut err, core::ptr::null()) };
+    #[cfg(feature = "libsql")]
+    let rc = unsafe { sqlite3_crsqlite_init(db, &mut err, core::ptr::null(), core::ptr::null()) };
     let msg = if err.is_null() {
         None
     } else {
@@ -1017,6 +1050,110 @@ fn init_race_version_read_is_64_bit() -> TResult {
     })();
     remove_db(&path);
     r
+}
+
+unsafe extern "C" fn noop_fn(
+    _ctx: *mut b::sqlite3_context,
+    _argc: c_int,
+    _argv: *mut *mut b::sqlite3_value,
+) {
+}
+
+/// A failed init reports a real SQLite error code, never sqlite_nostd's
+/// sentinel `ResultCode::NULL` (5000). A stored site id that is an empty blob
+/// made init's site-id step return that sentinel, which both entry points
+/// passed through: SQLite printed "unknown error" and the auto-extension open
+/// returned 5000 & 0xff = 136. Now both report SQLITE_ERROR with SQLite's own
+/// message for it (**Init Failure Code and Message**).
+fn init_race_corrupt_site_id_reports_valid_code() -> TResult {
+    let path = initialized("sidempty")?;
+    let r = (|| -> TResult {
+        let p = open_plain(&path, OPEN_RW)?;
+        // The site-id triggers call this; a plain connection lacks it.
+        let frc = unsafe {
+            b::sqlite3_create_function_v2(
+                p,
+                cstr("crsql_update_site_id").as_ptr(),
+                2,
+                b::SQLITE_UTF8 as c_int,
+                null_mut(),
+                Some(noop_fn),
+                None,
+                None,
+                None,
+            )
+        };
+        let w = if frc == SQLITE_OK {
+            exec(
+                p,
+                "UPDATE crsql_site_id SET site_id = x'' WHERE ordinal = 0",
+            )
+        } else {
+            Err(format!("create_function returned {}", frc))
+        };
+        close_v2(p);
+        w?;
+
+        let want = "cr-sqlite init: SQL logic error";
+        let o = open_cr(&path, OPEN_RW);
+        let crc = close_v2(o.db);
+        check!(
+            o.rc == SQLITE_ERROR,
+            "auto-extension open returned {} `{}`",
+            o.rc,
+            o.err
+        );
+        let want_auto = format!("{}{}", AUTOEXT_PREFIX, want);
+        check!(
+            o.err == want_auto,
+            "auto-extension message `{}`, want `{}`",
+            o.err,
+            want_auto
+        );
+        check!(crc == SQLITE_OK, "close_v2 returned {}", crc);
+
+        let l = open_plain(&path, OPEN_RW)?;
+        let (rc, msg) = load_path_init(l);
+        let crc = close_v2(l);
+        check!(rc == SQLITE_ERROR, "load path returned {} {:?}", rc, msg);
+        check!(msg.as_deref() == Some(want), "load path message {:?}", msg);
+        check!(crc == SQLITE_OK, "load path close_v2 returned {}", crc);
+        Ok(())
+    })();
+    remove_db(&path);
+    r
+}
+
+/// `init_error_code` (the Rust half of the clamp; `crsql_init_failed` is the
+/// C half) passes a real SQLite error code through and turns everything else
+/// into SQLITE_ERROR.
+fn init_race_init_error_code_is_valid() -> TResult {
+    use crsql_bundle::test_exports::init_error_code;
+    let cases: [(c_int, c_int); 12] = [
+        (5000, 1), // sqlite_nostd's ResultCode::NULL sentinel
+        (136, 1),  // 5000 & 0xff
+        (0, 1),    // OK: a failure must never read as success
+        (100, 1),  // ROW
+        (101, 1),  // DONE
+        (-1, 1),
+        (0x10005, 1), // above every extended code
+        (1, 1),
+        (5, 5),     // BUSY
+        (8, 8),     // READONLY
+        (28, 28),   // WARNING, the last primary code
+        (522, 522), // SQLITE_IOERR_SHORT_READ, an extended code
+    ];
+    for (rc, want) in cases {
+        let got = init_error_code(rc);
+        check!(
+            got == want,
+            "init_error_code({}) = {}, want {}",
+            rc,
+            got,
+            want
+        );
+    }
+    Ok(())
 }
 
 // ------------------------------------------------- per-open budget probe ---
@@ -1204,6 +1341,14 @@ const TESTS: &[(&str, fn() -> TResult)] = &[
     (
         "init_race_version_read_is_64_bit",
         init_race_version_read_is_64_bit,
+    ),
+    (
+        "init_race_corrupt_site_id_reports_valid_code",
+        init_race_corrupt_site_id_reports_valid_code,
+    ),
+    (
+        "init_race_init_error_code_is_valid",
+        init_race_init_error_code_is_valid,
     ),
 ];
 

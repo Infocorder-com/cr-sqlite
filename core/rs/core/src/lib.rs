@@ -250,7 +250,7 @@ pub extern "C" fn sqlite3_crsqlcore_init(
         Ok(ext_data) => ext_data,
         Err(rc) => {
             if !rc_out.is_null() {
-                unsafe { *rc_out = rc as c_int };
+                unsafe { *rc_out = init_error_code(rc as c_int) };
             }
             return null_mut();
         }
@@ -865,13 +865,36 @@ fn init_sequence(
     Ok(ext_data)
 }
 
-/// A step's C result code as an init error. Unknown or OK codes become
-/// SQLITE_ERROR, so a failure can never be reported as success.
-fn init_rc(rc: c_int) -> ResultCode {
-    match sqlite::convert_rc(rc) {
-        Err(code) => code,
-        Ok(_) => ResultCode::ERROR,
+/// The code a failed init may report to SQLite (**Init Failure Code and
+/// Message**): `rc` itself when it is a real SQLite error code -- a primary
+/// code from SQLITE_ERROR to SQLITE_WARNING, or an extended code whose low
+/// byte is one -- and SQLITE_ERROR otherwise. "Otherwise" covers OK, ROW and
+/// DONE (a failure must never read as success), negative numbers, and
+/// sqlite_nostd's sentinel `ResultCode::NULL` (5000), which a step returns
+/// when, for example, the stored site id is an empty blob: passed through,
+/// SQLite reported it as "unknown error", and an auto-extension open returned
+/// 5000 & 0xff = 136. The C side, `crsql_init_failed`, applies the same rule.
+pub fn init_error_code(rc: c_int) -> c_int {
+    let primary = rc & 0xff;
+    if rc <= 0
+        || rc > 0xffff
+        || primary < ResultCode::ERROR as c_int
+        || primary > ResultCode::WARNING as c_int
+    {
+        return ResultCode::ERROR as c_int;
     }
+    rc
+}
+
+/// A step's C result code as an init error, through `init_error_code`. A
+/// valid extended code `ResultCode` has no variant for becomes its primary
+/// code, never `convert_rc`'s ABORT.
+fn init_rc(rc: c_int) -> ResultCode {
+    use num_traits::FromPrimitive;
+    let rc = init_error_code(rc);
+    ResultCode::from_i32(rc)
+        .or_else(|| ResultCode::from_i32(rc & 0xff))
+        .unwrap_or(ResultCode::ERROR)
 }
 
 /// The **ownership handoff**: registers `crsql_db_version` with the

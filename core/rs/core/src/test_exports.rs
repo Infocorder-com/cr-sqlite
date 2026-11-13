@@ -1,6 +1,7 @@
 pub use crate::bootstrap;
 pub use crate::c;
 pub use crate::db_version;
+pub use crate::init_error_code;
 pub use crate::init_fault;
 pub use crate::pack_columns;
 pub use crate::tableinfo;

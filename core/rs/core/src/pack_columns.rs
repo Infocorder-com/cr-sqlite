@@ -121,10 +121,48 @@ pub enum ColumnValue {
     Text(String),
 }
 
+/// Reads the `nbytes`-byte big-endian integer that follows a type byte.
+///
+/// The encoder writes the low `nbytes` bytes of the value (`put_int`), and it
+/// uses fewer than 8 bytes only for a value whose dropped high bytes are all
+/// zero -- a length, or a non-negative integer. A negative integer always
+/// takes all 8. So every such integer is decoded ZERO-extended, with
+/// `get_uint`, never with `get_int`: bytes 1.11 made `get_int` sign-extend,
+/// which turned a blob length of 128-255, 32768-65535 or 2^23..2^24-1 into a
+/// negative number (**Packed Blob Length Sign-Extension**,
+/// docs/CRSQLITE_INIT_RACE_FIX.md), and `get_int(0)` shifts by 64, which
+/// panics in a debug build.
+///
+/// A package arrives from a peer in every `crsql_changes` merge, so a
+/// malformed one is an error, never a panic: a panic aborts the host process.
+/// `get_uint` panics for more than 8 bytes or more than remain.
+fn get_packed_uint(buf: &mut &[u8], nbytes: usize) -> Result<u64, ResultCode> {
+    if nbytes > 8 || buf.remaining() < nbytes {
+        return Err(ResultCode::ABORT);
+    }
+    if nbytes == 0 {
+        return Ok(0);
+    }
+    Ok(buf.get_uint(nbytes))
+}
+
+/// A blob's or a text's length, followed by that many bytes.
+fn get_packed_bytes(buf: &mut &[u8], nbytes: usize) -> Result<Vec<u8>, ResultCode> {
+    let len = get_packed_uint(buf, nbytes)?;
+    let len: usize = len.try_into().map_err(|_| ResultCode::ABORT)?;
+    if buf.remaining() < len {
+        return Err(ResultCode::ABORT);
+    }
+    Ok(buf.copy_to_bytes(len).to_vec())
+}
+
 // TODO: make a table valued function that can be used to extract a row per packed column?
 pub fn unpack_columns(data: &[u8]) -> Result<Vec<ColumnValue>, ResultCode> {
     let mut ret = vec![];
     let mut buf = data;
+    if !buf.has_remaining() {
+        return Err(ResultCode::ABORT);
+    }
     let num_columns = buf.get_u8();
 
     for _i in 0..num_columns {
@@ -137,15 +175,7 @@ pub fn unpack_columns(data: &[u8]) -> Result<Vec<ColumnValue>, ResultCode> {
 
         match column_type {
             Some(ColumnType::Blob) => {
-                if buf.remaining() < intlen {
-                    return Err(ResultCode::ABORT);
-                }
-                let len = buf.get_int(intlen) as usize;
-                if buf.remaining() < len {
-                    return Err(ResultCode::ABORT);
-                }
-                let bytes = buf.copy_to_bytes(len);
-                ret.push(ColumnValue::Blob(bytes.to_vec()));
+                ret.push(ColumnValue::Blob(get_packed_bytes(&mut buf, intlen)?));
             }
             Some(ColumnType::Float) => {
                 if buf.remaining() < 8 {
@@ -154,26 +184,17 @@ pub fn unpack_columns(data: &[u8]) -> Result<Vec<ColumnValue>, ResultCode> {
                 ret.push(ColumnValue::Float(buf.get_f64()));
             }
             Some(ColumnType::Integer) => {
-                if buf.remaining() < intlen {
-                    return Err(ResultCode::ABORT);
-                }
-                let unsigned = buf.get_uint(intlen);
+                // Two's complement: an 8-byte value carries its own sign.
+                let unsigned = get_packed_uint(&mut buf, intlen)?;
                 ret.push(ColumnValue::Integer(unsigned as i64));
             }
             Some(ColumnType::Null) => {
                 ret.push(ColumnValue::Null);
             }
             Some(ColumnType::Text) => {
-                if buf.remaining() < intlen {
-                    return Err(ResultCode::ABORT);
-                }
-                let len = buf.get_uint(intlen) as usize;
-                if buf.remaining() < len {
-                    return Err(ResultCode::ABORT);
-                }
-                let bytes = buf.copy_to_bytes(len);
+                let bytes = get_packed_bytes(&mut buf, intlen)?;
                 ret.push(ColumnValue::Text(unsafe {
-                    String::from_utf8_unchecked(bytes.to_vec())
+                    String::from_utf8_unchecked(bytes)
                 }))
             }
             None => return Err(ResultCode::MISUSE),

@@ -1,3 +1,6 @@
+# pytest 9 requires Python >= 3.10. On an older interpreter pip cannot install
+# these pins; use a Python 3.10+ venv (see docs/CRSQLITE_INIT_RACE_FIX.md,
+# "How this fork's tests run").
 attrs==23.1.0
 -e .
 hypothesis==6.75.9
