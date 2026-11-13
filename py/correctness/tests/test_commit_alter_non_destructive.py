@@ -35,9 +35,9 @@ def test_commit_alter():
   c.execute("UPDATE foo SET title = 'update title', owner = 'new owner' where id = 1")
   c.commit()
   next_version = c.execute("SELECT crsql_db_version()").fetchone()[0]
-  assert(next_version, current_version + 1)
+  assert next_version == current_version + 1
   next_change = c.execute("SELECT pk, cid, val FROM crsql_changes where db_version = {} ORDER BY cid".format(next_version)).fetchall()
-  print("next version: {next_version}")
+  print(f"next version: {next_version}")
   assert (next_change == [(b'\x01\t\x01', 'owner', 'new owner'),
                           (b'\x01\t\x01', 'title', 'update title')])
 
