@@ -16,7 +16,7 @@ use crate::pack_columns::bind_package_to_stmt;
 use crate::pack_columns::{unpack_columns, ColumnValue};
 use crate::stmt_cache::reset_cached_stmt;
 use crate::tableinfo::{crsql_ensure_table_infos_are_up_to_date, TableInfo};
-use crate::util::slab_rowid;
+use crate::util::{error_cstring, slab_rowid};
 
 /**
  * did_cid_win does not take into account the causal length.
@@ -111,10 +111,10 @@ fn did_cid_win(
             // ResultCode::DONE would happen if clock values exist but actual values are missing.
             // should we just allow the insert anyway?
             reset_cached_stmt(col_val_stmt.stmt)?;
-            let err = CString::new(format!(
+            let err = error_cstring(&format!(
                 "could not find row to merge with for tbl {}",
                 insert_tbl
-            ))?;
+            ));
             unsafe { *errmsg = err.into_raw() };
             return Err(ResultCode::ERROR);
         }
@@ -150,10 +150,10 @@ fn did_site_id_win(
         }
         Ok(ResultCode::DONE) => {
             reset_cached_stmt(col_site_id_stmt.stmt)?;
-            let err = CString::new(format!(
+            let err = error_cstring(&format!(
                 "could not find site_id for previous change, cr-sqlite clock table might be corrupt for tbl {}",
                 insert_tbl
-            ))?;
+            ));
             unsafe { *errmsg = err.into_raw() };
             return Err(ResultCode::ERROR);
         }
@@ -472,6 +472,27 @@ unsafe fn merge_insert(
 
     let insert_site_id = insert_site_id.blob();
 
+    // **Merge Counter Bound** (docs/CRSQLITE_INIT_RACE_FIX.md, "Merge Input
+    // Validation"): refuse a counter that no honest peer can produce, before
+    // anything is written. See `MAX_MERGED_COUNTER` for why the bound is 2^53.
+    for (name, value) in [
+        ("col_version", insert_col_vrsn),
+        ("db_version", insert_db_vrsn),
+        ("cl", insert_cl),
+        ("seq", insert_seq),
+    ] {
+        if value < 0 || value > crate::consts::MAX_MERGED_COUNTER {
+            let err = error_cstring(&format!(
+                "crsql - {} {} is out of range (0 to {})",
+                name,
+                value,
+                crate::consts::MAX_MERGED_COUNTER
+            ));
+            *errmsg = err.into_raw();
+            return Err(ResultCode::ERROR);
+        }
+    }
+
     let mut tbl_infos = mem::ManuallyDrop::new(Box::from_raw(
         (*(*tab).pExtData).tableInfos as *mut Vec<TableInfo>,
     ));
@@ -480,10 +501,12 @@ unsafe fn merge_insert(
     let tbl_info_index = tbl_infos.iter().position(|x| x.tbl_name == insert_tbl);
 
     if tbl_info_index.is_none() {
-        let err = CString::new(format!(
+        // The name is the peer's, and may contain a NUL (**Error Message NUL
+        // Escape**).
+        let err = error_cstring(&format!(
             "crsql - could not find the schema information for table {}",
             insert_tbl
-        ))?;
+        ));
         *errmsg = err.into_raw();
         return Err(ResultCode::ERROR);
     }
@@ -492,6 +515,25 @@ unsafe fn merge_insert(
 
     let tbl_info = &mut tbl_infos[tbl_info_index];
     let unpacked_pks = unpack_columns(insert_pks.blob())?;
+
+    // **Packed PK Arity Check** (docs/CRSQLITE_INIT_RACE_FIX.md, "Merge Input
+    // Validation"). The package is the peer's, and every statement below binds
+    // its values by position. With fewer values than the primary key has, the
+    // missing key columns bound as NULL and the merged value landed in a key
+    // column; the pks table recorded a NULL key, and crsql_changes sent it on
+    // to every peer. With more, a bind ran past the key. This one check, before
+    // the key lookup writes the pks table, covers every path that follows: the
+    // key lookup, column writes, the insert sentinel, deletes and resurrects.
+    if unpacked_pks.len() != tbl_info.pks.len() {
+        let err = error_cstring(&format!(
+            "crsql - primary key for table {} has {} columns but the change carries {}",
+            insert_tbl,
+            tbl_info.pks.len(),
+            unpacked_pks.len()
+        ));
+        *errmsg = err.into_raw();
+        return Err(ResultCode::ERROR);
+    }
 
     // Get or create key as the first thing we do.
     // We'll need the key for all later operations.

@@ -3,9 +3,11 @@
 **Status:** ✅ **Built, verified and committed in `578ef5d6`** (2026-11-13), with the code review's
 follow-up (**Code review follow-up**, in the **Build record**) committed in `f39caadd`. ⛔ The dependency
 bumps committed next, in `85faa868`, broke the decoding of packed primary keys
-(**Packed Blob Length Sign-Extension**, in the **Build record**); the fix is in the working tree,
-verified, and awaiting the operator's commit. The release SHA to pin is the commit that includes that
-fix. ⛔ **Never pin `85faa868`, or any commit from it up to the fix (including `ba3c7ff5`).** Every
+(**Packed Blob Length Sign-Extension**, in the **Build record**); that fix is committed in `b8c6ffb1`
+and `75d42269`. A crash-safety review of it found three older defects a peer can trigger through a merge
+(**Merge Input Validation**, in the **Build record**); their fixes are in the working tree, verified, and
+awaiting the operator's commit. The release SHA to pin is the commit that includes them.
+⛔ **Never pin `85faa868`, or any commit from it up to the sign-extension fix (including `ba3c7ff5`).** Every
 part below is implemented; `make test`, `make valgrind-strict`, `py/correctness` and the stress script
 are green, and the key guarantees are mutation-verified. Where the build made a choice the plan left open,
 or added to it, **Build record** says so. The plan was revised twice after adversarial reviews and the
@@ -17,7 +19,7 @@ and a new auto-extension entry point, `sqlite3_crsqlite_autoext_init`), `core/sr
 **Compatibility:** the init fix itself changes no wire or changeset format. ⛔ The dependency bumps of
 `85faa868` did break the **reading** of the packed primary-key format, though the bytes written are
 unchanged: blob primary keys of 128–255, 32768–65535 and 2^23 to 2^24−1 bytes could not be read
-from `crsql_changes`, unpacked or merged (**Packed Blob Length Sign-Extension**). The working-tree fix
+from `crsql_changes`, unpacked or merged (**Packed Blob Length Sign-Extension**). The fix in `b8c6ffb1`
 restores the decoding; the format itself never changed, so a fixed build and a pre-`85faa868` build
 exchange changes normally. One new exported C symbol,
 `sqlite3_crsqlite_autoext_init` (the auto-extension entry point of **Init Busy Timeout**); existing
@@ -999,9 +1001,10 @@ and the coordination doc's **Pin this** sections):
 Built 2026-11-13 on stable Rust 1.95.0 (asdf), gcc, Linux x86_64, against this fork's HEAD `8d153fc2`,
 and committed as `578ef5d6`. The **Code review follow-up** below is committed in `f39caadd`; the
 dependency bumps in `85faa868` and a test fix in `ba3c7ff5` followed. The fix for the release blocker
-those bumps introduced (**Packed Blob Length Sign-Extension**, below) is in the working tree, awaiting
-the operator's commit. The release SHA to pin is the commit that includes it; the coordination doc's
-**Pin this** table carries a provisional pin until then.
+those bumps introduced (**Packed Blob Length Sign-Extension**, below) is committed in `b8c6ffb1` and
+`75d42269`. The fixes for three older peer-reachable defects (**Merge Input Validation**, below) are in
+the working tree, awaiting the operator's commit. The release SHA to pin is the commit that includes
+them; the coordination doc's **Pin this** table carries a provisional pin until then.
 
 ### Where the code is
 
@@ -1189,7 +1192,8 @@ WASM; the site-id state after a host `ROLLBACK`, which predates this fix; and `c
 
 ### Packed Blob Length Sign-Extension — the release blocker in `85faa868`, and its fix
 
-**In the working tree, awaiting the operator's commit** (2026-11-13). A review of `578ef5d6..ba3c7ff5`
+**Committed** in `b8c6ffb1` (the Rust fix, tests and docs) and `75d42269` (the C clamp in `crsqlite.c`,
+`ext-data.c` and `ext-data.test.c`), 2026-11-13. A review of `578ef5d6..ba3c7ff5`
 found that the Dependabot bump of `bytes` from 1.5.0 to 1.11.1 (`85faa868`) broke the decoding of
 packed primary keys. The bytes written never changed; reading them did.
 
@@ -1211,9 +1215,9 @@ sign. Zero bytes return 0 without calling into `bytes`. `bytes` stays at 1.11.1.
 The same review of the decoder found that a **malformed** package aborted the host process, release
 build included, because `bytes` panics and this crate is built `panic = "abort"`: an empty package, or a
 type byte declaring more than 8 length bytes with enough bytes following. A package arrives from a peer
-in every `crsql_changes` merge, so a peer could crash a node. By the `bytes` 1.5.0 source this predates the bump (not run on a
-pre-`85faa868` build). Both now return
-an error.
+in every `crsql_changes` merge, so a peer could crash a node. This predates the bump: verified by
+running a `578ef5d6` build, where release and debug both died with SIGILL on the 5 malformed cases, and
+on NULL, text and real primary-key values. Both now return an error.
 
 The same change carries the review's smaller findings:
 
@@ -1261,6 +1265,111 @@ message. Text in a package is still taken as UTF-8 unchecked, as before.
 
 **Not verified:** macOS, Windows and FreeBSD (the `fdescfs` case was exercised only by the mutation
 above, on Linux).
+
+### Merge Input Validation — three peer-reachable defects, and their fixes
+
+**In the working tree, awaiting the operator's commit** (2026-11-13; approved by the operator the same
+day). A crash-safety review of the **Packed Blob Length Sign-Extension** fix fuzzed `crsql_changes`
+merges and found no remaining crash, but it found three older defects that any peer can trigger, because
+every row inserted into `crsql_changes` comes from another node. None is caused by the earlier fixes. All
+three are fixed in `merge_insert` (`core/rs/core/src/changes_vtab_write.rs`), before the merge writes
+anything.
+
+**Packed PK Arity Check** — data loss. A change whose packed primary key had **fewer** columns than the
+table's primary key was accepted. Every merge statement binds the package by position, so the missing key
+columns bound as NULL and the merged value landed in a key column: for `t(id PRIMARY KEY, v)`, the change
+`pk = x'00'` (zero columns), `val = 'X'` wrote the row `('X', 'X')`, recorded `id = NULL` in
+`t__crsql_pks`, and `crsql_changes` then emitted a NULL key that every peer merged in turn. A package with
+**more** columns failed with an unexplained `column index out of range`. Now a package whose column count
+differs from the primary key's is refused with `SQLITE_ERROR` and
+`crsql - primary key for table <t> has <n> columns but the change carries <m>`.
+- The check runs once, right after the package is unpacked and before `get_or_create_key`, which writes
+  the pks table. Every path that uses the peer's key goes through it: the key lookup and creation, column
+  writes, the insert sentinel, deletes (the `-1` sentinel with an even causal length), resurrects, and
+  the value lookup in `did_cid_win`.
+- **The read path needs no check.** `crsql_changes` reads build the key with
+  `crsql_pack_columns(<the table's primary-key columns>)` from the pks table
+  (`changes_vtab_read.rs`), so its arity always matches; `changes_next` unpacks only that local value.
+  The only other key binder, `backfill.rs`, reads the local table.
+- ⚠️ **It does not repair a database the defect already reached.** A NULL key recorded before the fix has
+  the right arity (one NULL column) and still syncs.
+
+**Merge Counter Bound** — wrong behaviour. A merged `col_version` of `i64::MAX` was accepted, and every
+later local update of that cell then failed with `unable to reset cached trigger stmt, code CONSTRAINT`,
+because a local write stores `col_version + 1` (the reviewer's `dbvmax.py`). Now a merge is refused with
+`SQLITE_ERROR` and `crsql - <counter> <value> is out of range (0 to 9007199254740992)` when its
+`col_version`, `db_version`, causal length (`cl`) or `seq` is negative or above 2^53
+(`MAX_MERGED_COUNTER`, `core/rs/core/src/consts.rs`). How each counter is used in this fork, checked
+before choosing the rule:
+
+| counter | how it grows | negatives? | why 2^53 is safe |
+|---|---|---|---|
+| `col_version` | +1 per local write of the cell (`col_version + 1` in the update and move statements); a merge stores the winner's value, so it is the maximum over all writers of that cell, plus one per write | no. A resurrect zeroes non-sentinel clocks to **0**, so 0 is legal and stays accepted | the cell would need 2^53 writes |
+| `db_version` | +1 per local transaction (`next_db_version`). A merged value is the **peer's own** counter: it is stored for that peer's site id (`insert_db_version`, `crsql_db_versions`) and never advances this node's counter, so it does not accumulate across peers and does not jump | no. `-1` appears only as an internal "no version yet" value in `insert_db_version`, never in a change. The first change has 1 (`MIN_POSSIBLE_DB_VERSION` is 0) | the peer would need 2^53 transactions |
+| `cl` (causal length) | +1 per delete, +1 or +2 per re-insert (`mark_locally_deleted`, `mark_locally_created`); stored as the sentinel's `col_version`; the larger one wins a merge | no. A local cl of 0 means "no row"; an incoming 0 is accepted and is a no-op (it matches an absent row's cl) | the row would need about 2^52 delete/insert cycles |
+| `seq` | position of a change within one transaction (a per-connection `i32` counter, `bump_seq`); a merged value is stored, never used in arithmetic | no; the local counter starts at 0 | a single transaction would need 2^53 changes; the local counter is an `i32` |
+
+2^53 also keeps every counter exact for a JavaScript or JSON consumer of `crsql_changes`. `seq` is
+included although it cannot overflow anything here: a hostile value is just as meaningless, and a
+consumer that orders by `(db_version, seq)` would otherwise inherit it. Values are read with
+`sqlite3_value_int64`, so a non-integer argument is judged by its integer conversion (`NULL` and a blob
+are 0, `'-1'` is -1, `1e308` saturates to `i64::MAX`).
+- ⚠️ **A node that already holds an out-of-range counter** — only possible if a peer sent one before the
+  fix — re-emits it, and fixed peers refuse that change. The refusal is per row, but a host that applies
+  a batch in one transaction loses the whole batch.
+
+**Error Message NUL Escape** — wrong error code. The table name in a change is the peer's. When it named
+no table and contained a NUL byte (`'t1' || char(0)`), building the
+`crsql - could not find the schema information for table …` message with `CString::new` failed, `?`
+turned the `NulError` into `SQLITE_NOMEM` (sqlite_nostd's mapping), and the merge reported memory
+exhaustion — which Python, for one, raises as `MemoryError`. Now `error_cstring` (`util.rs`) writes each
+NUL as the two characters `\0`, so the message keeps the rest of the name and the merge returns
+`SQLITE_ERROR`.
+- Other sites, searched: in the merge path, `did_cid_win` and `did_site_id_win` quote the table name too,
+  and now use `error_cstring`; they run only after the name matched a real table, so they could not see a
+  NUL. The new arity and counter messages use it as well. The read path's two messages
+  (`changes_vtab.rs`, `changes_next`) quote a table name from the local clock tables, not a peer's, and
+  are unchanged. `crsql_unpack_columns`' messages carry no input text. Messages set through
+  sqlite_nostd's `StrRef::set` or `result_error` already handle a NUL without `NOMEM`.
+- A column name with a NUL was never affected: no message quotes it; the lookup fails with
+  `SQLITE_ERROR`.
+
+**Tests** — `py/correctness/tests/test_merge_input_validation.py`, 55 cases, each refusal checked to
+write nothing (the table, its pks and clock tables, `crsql_changes` and `crsql_db_versions` are compared
+before and after):
+
+| fix | tests | how they failed before the fix |
+|---|---|---|
+| **Packed PK Arity Check** | `test_wrong_pk_arity_is_rejected` (zero, fewer and more key columns for a 1- and a 2-column primary key, each as a column write, an insert sentinel, a delete and a resurrect: 20 cases); `test_wrong_pk_arity_matches_existing_row_key_too`; `test_valid_merges_still_work` (inserts, updates, deletes and resurrects synced between two databases, both key shapes) | 21 red: 13 accepted (`DID NOT RAISE`); the 8 "more" cases failed with `column index out of range`, not the arity error |
+| **Merge Counter Bound** | `test_out_of_range_counter_is_rejected` (-1, 2^53+1, `i64::MAX`, `i64::MIN` for each of the four counters); `test_in_range_counter_merges` (0, 1 and 2^53 for each, then local writes); `test_col_version_at_bound_then_local_updates`; `test_dbvmax_scenario_rejected_and_local_writes_keep_working` | 17 red, all `DID NOT RAISE` |
+| **Error Message NUL Escape** | `test_nul_in_table_name_is_sqlite_error_not_nomem` (three names) | 3 red: `MemoryError` |
+
+**Verification** (stable 1.95.0, Linux x86_64):
+
+| check | result |
+|---|---|
+| `make test` | green: 33 C test cases, 23 `init_race` (23 passed, 0 skipped), 11 Rust suites |
+| `make valgrind-strict` | 0 errors, 0 bytes in use at exit |
+| `py/correctness` | 320 passed (265 plus the 55 new) |
+| `tools/init_race_stress.sh 100 8` (all three modes) | 0 failed opens, 0 wedged, 0 hangs (switch mode: 66 switcher `PRAGMA` lock failures, which are not init's) |
+| `make static`, `make loadable`, `make loadable_dbg` | build; the static archive still exports `sqlite3_crsqlite_autoext_init` |
+| the reviewer's `zerocols.py`, `dbvmax.py` and `malformed.py`, release and debug `.so` | every wrong-arity change refused and nothing written; both `dbvmax` merges refused and every local write after them succeeds; no crash |
+| the reviewer's fuzz drivers, 200,000 cases each, release and debug (`fuzz_driver.py` seeds 41 and 42, `fuzz_driver_valid.py` seeds 43 and 44, each child under `ulimit -v 2000000`) | **0 crashes** in all four runs. Every refusal by the new checks was replayed and classified: each one had a counter outside 0..2^53 (after integer conversion) or a key of the wrong arity, so **no in-range, right-arity merge was refused**. Replaying the seed-41 cases, the pre-fix build failed 11,607 merges with `SQLITE_NOMEM`, every one with a NUL in the table name; the fixed build fails none that way |
+
+**Mutations**, each bounded with `timeout`, restored in the same command and checked with `cmp`:
+
+| guarantee | mutation | result |
+|---|---|---|
+| arity | the arity check made `false &&` | all 21 arity tests red |
+| counter bound | the bound check made `false &&` | all 17 refusal tests red |
+| the bound is inclusive | `>` became `>=` | the four 2^53 cases of `test_in_range_counter_merges` and `test_col_version_at_bound_then_local_updates` red |
+| `seq` is covered | `seq` removed from the checked list | the four `seq` refusal cases red |
+| NUL escape at the call site | the schema message built with `CString::new(…)?` again | all three NUL tests red (`MemoryError`) |
+
+**Not verified:** macOS and Windows; a merge carrying an out-of-range counter or a wrong-arity key
+through the app's sync path (the app's sync tests send only well-formed changes). The two speculative
+crash paths the review left open are recorded in the coordination doc's section 14
+(**Crash surface after the merge fixes**).
 
 ---
 

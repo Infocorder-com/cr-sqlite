@@ -1260,26 +1260,66 @@ integration: `docs/CRSQLITE_INIT_RACE_FIX_INTEGRATION.md` in silicon_brain (**Ad
 (`f39caadd`), dependency bumps (`85faa868`) and a test fix (`ba3c7ff5`) on top, all on `origin/main`.
 Downstream pinned `ba3c7ff5` **provisionally**: ⛔ a review of `578ef5d6..ba3c7ff5` found a release blocker
 in the dependency bumps (`bytes` 1.11.1 makes `Buf::get_int` sign-extend, so `pack_columns.rs` misdecodes
-blob primary-key lengths 128–255 and 32768–65535, and `crsql_changes` reads and merges abort). The pin is
-to be updated to the fixed release.
+blob primary-key lengths 128–255 and 32768–65535, and `crsql_changes` reads and merges abort). That
+blocker's fix is committed in `b8c6ffb1` and `75d42269`, on `origin/main`. A crash-safety review of it then
+found three older defects a peer can trigger through a merge; their fixes are in the fork's working tree,
+verified, and **awaiting the operator's commit** (2026-11-13).
+⭐ **The pin will be the commit that includes these fixes.** Its SHA is not known yet, so the pin below
+stays provisional until that commit is on `origin/main`. ⛔ **Never pin `85faa868` alone, or any commit from it up to the sign-extension fix —
+`ba3c7ff5` included.**
 
-**The fix** (**Packed Blob Length Sign-Extension**, in the fork doc's **Build record**) is in the fork's
-working tree, verified, and **awaiting the operator's commit** (2026-11-13). Its SHA is not known yet, so
-the pin below stays provisional until that commit is on `origin/main`. ⛔ **Never pin `85faa868` alone, or
-any commit from it up to the fix — `ba3c7ff5` included.** What it fixes:
+**The sign-extension fix** (**Packed Blob Length Sign-Extension**, in the fork doc's **Build record**;
+committed in `b8c6ffb1` and `75d42269`):
 - blob lengths 128–255, 32768–65535 and 2^23 to 2^24−1 are decoded zero-extended again; an empty blob key
   (`x''`) no longer panics a debug build. `bytes` stays at 1.11.1;
 - a malformed packed primary key (empty, or declaring more than 8 length bytes) is an error instead of a
-  process abort. A peer's merge could trigger that abort in release builds; by the `bytes` 1.5.0 source it predates
-  `85faa868` (not run on a pre-`85faa868` build);
+  process abort. A peer's merge could trigger that abort in release builds. It predates `85faa868`:
+  verified by running a `578ef5d6` build, where release and debug both died with SIGILL on the 5
+  malformed cases, and on NULL, text and real primary-key values;
 - a failed init always reports a valid SQLite code: an empty stored site id gave `unknown error`, and rc
   136 through an auto-extension open; it is now `SQLITE_ERROR` with `cr-sqlite init: SQL logic error`.
+
+**The merge fixes** (**Merge Input Validation**, in the fork doc's **Build record**; working tree). Each
+refuses a peer's change in `merge_insert` with `SQLITE_ERROR` before anything is written:
+- **Packed PK Arity Check** (data loss): a packed primary key with fewer or more columns than the table's
+  primary key is refused. Fewer was accepted: the merged value landed in a key column, the pks table got a
+  NULL key, and `crsql_changes` sent that NULL key on to every peer.
+- **Merge Counter Bound** (wrong behaviour): a `col_version`, `db_version`, causal length (`cl`) or `seq`
+  that is negative or above 2^53 is refused. A merged `col_version = i64::MAX` made every later local update
+  of that cell fail with `unable to reset cached trigger stmt, code CONSTRAINT`. Honest peers never come
+  near the bound: each counter grows by at most two per write, and a merged `db_version` is the sending
+  peer's own counter, not an accumulated one. The fork doc gives the per-counter reasoning.
+- **Error Message NUL Escape** (wrong error code): a change naming a table that does not exist, with a NUL
+  byte in the name, returned `SQLITE_NOMEM` because the error message could not be built; it now returns
+  `SQLITE_ERROR`, with the NUL shown as `\0`.
+
+### Crash surface after the merge fixes
+
+The crash-safety review fuzzed `crsql_changes` merges and `crsql_unpack_columns` on release and debug
+builds (random, mutated and valid packages; bad table and column names; site ids of every length; extreme
+counters; invalid UTF-8; every key type) and found no remaining crash. The rerun on the fixed builds —
+800,000 cases across release and debug — also had **0 crashes**, and no in-range, right-arity merge was
+refused. What remains:
+- **No known peer-triggered crash** in the merge or read path. A malformed package, a wrong-arity key, an
+  out-of-range counter and a NUL in a table or column name are each an error.
+- ⚠️ **SPECULATIVE — allocation failure on a near-1 GB payload.** Decoding a package copies each blob or
+  text key into a Rust `Vec`, and a merged value of up to SQLite's 1 GB length limit is handled in memory.
+  If that allocation fails, Rust's allocation-failure handler aborts the process instead of returning
+  `SQLITE_NOMEM`. Not reproduced; it needs a peer to send a payload near the limit to a node short of
+  memory. A host can lower `SQLITE_LIMIT_LENGTH` to shrink it.
+- ⚠️ **SPECULATIVE, debug builds only — a NULL `column_text`.** `sqlite3_capi::column_text` builds a
+  slice from the pointer SQLite returns without checking it for NULL. A debug build checks that
+  precondition and panics; a release build does not check. `changes_next` reads the table name and column
+  id this way, but from the local clock tables, where neither is NULL; no peer input reaches it. Not
+  reproduced. The fix belongs in the `sqlite-rs-embedded` submodule, which is pinned and unchanged.
+- **Not crashes, unchanged:** text in a package is still taken as UTF-8 unchecked, and trailing bytes after
+  a package's last column are ignored.
 
 ### Pin this
 
 | | |
 |---|---|
-| **`CRSQLITE_REF`** | ⚠️ **`ba3c7ff5721fa45789abff9539c4d824b374bcae`** — PROVISIONAL, to be updated to the fixed release (see **Status**). Lives only in silicon_brain's `scripts/build_crsqlite_static.sh` |
+| **`CRSQLITE_REF`** | ⚠️ **`ba3c7ff5721fa45789abff9539c4d824b374bcae`** — PROVISIONAL, to be updated to the commit that includes the merge fixes (see **Status**). Lives only in silicon_brain's `scripts/build_crsqlite_static.sh` |
 | **submodule pin** | **unchanged**: `c3c01fb84622b29bdf356d060254f36c9f4ca9ce`. No submodule push is needed |
 | `crsql_build_id()` | `e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic <sha>` |
 | toolchain | stable `1.95.0` (unchanged) |
@@ -1309,6 +1349,14 @@ any commit from it up to the fix — `ba3c7ff5` included.** What it fixes:
   failures carry their own code and `cr-sqlite init: <reason>`; the version-0 refusal message is
   unchanged. ⚠️ Any downstream test helper, log filter or retry rule that matches the old empty-message
   form or `rc == SQLITE_ERROR` for these opens needs to match the new text and code.
+- **What a refused merge now reports** (**Merge Input Validation**). An `INSERT INTO crsql_changes` that
+  was accepted before — a wrong-arity key, or a counter outside 0 to 2^53 — now fails with
+  `SQLITE_ERROR` and a `crsql - …` message (`… primary key for table <t> has <n> columns but the change
+  carries <m>`, `… <counter> <value> is out of range (0 to 9007199254740992)`). A change naming an unknown
+  table with a NUL in its name fails with `SQLITE_ERROR` where it failed with `SQLITE_NOMEM`. Only a
+  malformed or hostile change is affected, and nothing in the API or wire format changes. ⚠️ A batch
+  applied in one transaction fails as a whole when one change is refused; how the app's sync apply reports
+  and retries such a refusal is not assessed here.
 
 ### Verification (upstream, stable 1.95.0, Linux)
 
@@ -1328,9 +1376,15 @@ any commit from it up to the fix — `ba3c7ff5` included.** What it fixes:
 - 11 mutations of the key guarantees at `578ef5d6`, and 6 more for the follow-up, each red (or, for the
   fd fallback, reporting SKIPPED), each restored and checked. The follow-up's stress run
   (`tools/init_race_stress.sh 200 10`, all three modes) had 0 failed opens and 0 wedged files.
-- With the blocker fix (working tree): `make test` green with 33 C test cases, 23 `init_race`, 11 Rust
+- With the blocker fix (`b8c6ffb1`, `75d42269`): `make test` green with 33 C test cases, 23 `init_race`, 11 Rust
   suites; `make valgrind-strict` 0 errors, 0 bytes in use; `py/correctness` 265 passed (104 new boundary
   and malformed-package cases; the pins need Python ≥ 3.10); `tools/init_race_stress.sh 100 8`, all three
   modes, 0 failed opens and 0 wedged; `make static` and `make loadable` build; 7 mutations each red (or
   SKIPPED), restored and checked.
+- With the merge fixes (working tree): `make test` green with 33 C test cases, 23 `init_race`, 11 Rust
+  suites; `make valgrind-strict` 0 errors, 0 bytes in use; `py/correctness` 320 passed (55 new in
+  `test_merge_input_validation.py`, 41 of them red before the fixes);
+  `tools/init_race_stress.sh 100 8`, all three modes, 0 failed opens and 0 wedged; `make static`,
+  `make loadable` and `make loadable_dbg` build; the reviewer's fuzz drivers, 800,000 cases across release
+  and debug, 0 crashes; 5 mutations each red, restored and checked.
 - ⚠️ **Not verified upstream:** macOS and Windows builds.

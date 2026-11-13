@@ -169,3 +169,17 @@ mod tests {
         );
     }
 }
+
+/// Builds the C string for an error message that may quote a peer's input.
+///
+/// **Error Message NUL Escape** (docs/CRSQLITE_INIT_RACE_FIX.md, "Merge Input
+/// Validation"). A table name, column name or other string in a
+/// `crsql_changes` insert comes from a peer and can contain a NUL byte, which
+/// `CString::new` refuses. With `?` that refusal became `SQLITE_NOMEM`
+/// (sqlite_nostd maps `NulError` to NOMEM), so a host saw memory pressure
+/// instead of the real error. Each NUL is written as the two characters `\0`,
+/// so the message keeps the rest of the name and cannot fail to build.
+pub fn error_cstring(msg: &str) -> alloc::ffi::CString {
+    let escaped = msg.replace('\0', "\\0");
+    alloc::ffi::CString::new(escaped).unwrap_or_default()
+}

@@ -22,3 +22,13 @@ pub const ROWID_SLAB_SIZE: i64 = 10000000000000;
 // million entries per second for 3,000 centuries.
 pub const MIN_POSSIBLE_DB_VERSION: i64 = 0;
 pub const MAX_TBL_NAME_LEN: i32 = 2048;
+
+// **Merge Counter Bound** (docs/CRSQLITE_INIT_RACE_FIX.md, "Merge Input
+// Validation"). A merged change's col_version, db_version, causal length and
+// seq must lie in 0..=MAX_MERGED_COUNTER, or the merge is refused. Each grows
+// by at most two per write (a re-insert moves the causal length by 2), so an
+// honest peer never comes near 2^53. Without the bound, a peer could send
+// col_version = i64::MAX and the next local write of that cell, which stores
+// col_version + 1, would overflow and fail. 2^53 is also the largest integer a
+// JavaScript or JSON consumer of crsql_changes holds exactly.
+pub const MAX_MERGED_COUNTER: i64 = 1 << 53;
