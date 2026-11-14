@@ -405,8 +405,11 @@ the pushdown, on its own, with its own 3-platform verification. Windows/MinGW lo
   implied. `make test`, `make valgrind-strict`, the correctness suite and the init-race stress run all pass.
 - **2026-11-13 (upstream, release blocker):** ⛔ those bumps, committed in `85faa868`, broke reading packed
   blob primary keys (`bytes` 1.11 sign-extends `get_int`); none of the suites above had a blob key of 128 bytes
-  or more. The fix is in the fork's working tree, awaiting commit; details in section 14. Never pin `85faa868`
+  or more. The fix is committed in `b8c6ffb1` and `75d42269`; details in section 14. Never pin `85faa868`
   or anything from it up to the fix. The py suite's pins need Python ≥ 3.10 (pytest 9).
+- **2026-11-13 (downstream, pin):** silicon_brain pins `5eac6ac3` — the init race fix, the sign-extension
+  fix and the **Merge Input Validation** (`f523d36e`), with token `e5-merge-validation` — and its CI and
+  hub-deploy gates require `e5-merge-validation`. Details in section 14.
 
 ## 9. Next release — the `crsql_changes` table-filter pushdown (Release A)
 
@@ -1251,22 +1254,24 @@ the submodule-rides-with-ref fact; the toolchain-aware cache stamp (ref changed)
 
 ---
 
-## 14. Init race fix (`e4-init-atomic`) — committed; adopted downstream at a provisional pin (2026-11-13)
+## 14. Init race fix (`e4-init-atomic`) — committed; adopted downstream at `5eac6ac3` (2026-11-13)
 
 Design and full verification: the fork's `docs/CRSQLITE_INIT_RACE_FIX.md` (**Build record**). Downstream
 integration: `docs/CRSQLITE_INIT_RACE_FIX_INTEGRATION.md` in silicon_brain (**Adoption Record**).
 
-**Status.** The fix is committed in the fork as `578ef5d6`, with the code review's follow-up
-(`f39caadd`), dependency bumps (`85faa868`) and a test fix (`ba3c7ff5`) on top, all on `origin/main`.
-Downstream pinned `ba3c7ff5` **provisionally**: ⛔ a review of `578ef5d6..ba3c7ff5` found a release blocker
-in the dependency bumps (`bytes` 1.11.1 makes `Buf::get_int` sign-extend, so `pack_columns.rs` misdecodes
-blob primary-key lengths 128–255 and 32768–65535, and `crsql_changes` reads and merges abort). That
-blocker's fix is committed in `b8c6ffb1` and `75d42269`, on `origin/main`. A crash-safety review of it then
-found three older defects a peer can trigger through a merge; their fixes are in the fork's working tree,
-verified, and **awaiting the operator's commit** (2026-11-13).
-⭐ **The pin will be the commit that includes these fixes.** Its SHA is not known yet, so the pin below
-stays provisional until that commit is on `origin/main`. ⛔ **Never pin `85faa868` alone, or any commit from it up to the sign-extension fix —
-`ba3c7ff5` included.**
+**Status.** All on the fork's `origin/main`:
+- the fix, `578ef5d6`, with the code review's follow-up (`f39caadd`), dependency bumps (`85faa868`) and a
+  test fix (`ba3c7ff5`) on top;
+- the fix for a release blocker a review of `578ef5d6..ba3c7ff5` found in the dependency bumps (`bytes`
+  1.11.1 makes `Buf::get_int` sign-extend, so `pack_columns.rs` misdecoded blob primary-key lengths 128–255
+  and 32768–65535, and `crsql_changes` reads and merges aborted), in `b8c6ffb1` and `75d42269`;
+- the fixes for three older defects a peer can trigger through a merge, found by a crash-safety review of
+  that fix, in `f523d36e`;
+- their release token `e5-merge-validation`, in `5eac6ac3`.
+
+⭐ **Downstream pins `5eac6ac3`** (2026-11-13), with its gates on `e5-merge-validation`. `ba3c7ff5` was a
+provisional downstream pin and never shipped. ⛔ **Never pin `85faa868` alone, or any commit from it up to
+the sign-extension fix — `ba3c7ff5` included.**
 
 **The sign-extension fix** (**Packed Blob Length Sign-Extension**, in the fork doc's **Build record**;
 committed in `b8c6ffb1` and `75d42269`):
@@ -1279,7 +1284,8 @@ committed in `b8c6ffb1` and `75d42269`):
 - a failed init always reports a valid SQLite code: an empty stored site id gave `unknown error`, and rc
   136 through an auto-extension open; it is now `SQLITE_ERROR` with `cr-sqlite init: SQL logic error`.
 
-**The merge fixes** (**Merge Input Validation**, in the fork doc's **Build record**; working tree). Each
+**The merge fixes** (**Merge Input Validation**, in the fork doc's **Build record**; committed in
+`f523d36e`). Each
 refuses a peer's change in `merge_insert` with `SQLITE_ERROR` before anything is written:
 - **Packed PK Arity Check** (data loss): a packed primary key with fewer or more columns than the table's
   primary key is refused. Fewer was accepted: the merged value landed in a key column, the pks table got a
@@ -1292,8 +1298,8 @@ refuses a peer's change in `merge_insert` with `SQLITE_ERROR` before anything is
 - **Error Message NUL Escape** (wrong error code): a change naming a table that does not exist, with a NUL
   byte in the name, returned `SQLITE_NOMEM` because the error message could not be built; it now returns
   `SQLITE_ERROR`, with the NUL shown as `\0`.
-- **Release token `e5-merge-validation`** (approved by the operator on 2026-11-13). The release that
-  carries these fixes appends it to `crsql_build_id()`, so a gate can tell it from a build that has
+- **Release token `e5-merge-validation`** (approved by the operator on 2026-11-13; committed in
+  `5eac6ac3`). It is appended to `crsql_build_id()`, so a gate can tell this release from a build that has
   `e4-init-atomic` but not the merge fixes (see **Pin this** and **What downstream must change with the
   pin bump**).
 
@@ -1323,9 +1329,9 @@ refused. What remains:
 
 | | |
 |---|---|
-| **`CRSQLITE_REF`** | ⚠️ **`ba3c7ff5721fa45789abff9539c4d824b374bcae`** — PROVISIONAL, to be updated to the commit that includes the merge fixes (see **Status**). Lives only in silicon_brain's `scripts/build_crsqlite_static.sh` |
+| **`CRSQLITE_REF`** | **`5eac6ac332e68f5f6c4e56876f288b0eec8fea82`** (see **Status**). Lives only in silicon_brain's `scripts/build_crsqlite_static.sh` |
 | **submodule pin** | **unchanged**: `c3c01fb84622b29bdf356d060254f36c9f4ca9ce`. No submodule push is needed |
-| `crsql_build_id()` | `e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic+e5-merge-validation <sha>` for the release that includes the merge fixes. ⚠️ The provisional pin `ba3c7ff5` returns the list without `+e5-merge-validation` |
+| `crsql_build_id()` | `e1-fd-close+e2-tbl-pushdown+e3-tbl-collate-gate+e4-init-atomic+e5-merge-validation 5eac6ac332e68f5f6c4e56876f288b0eec8fea82` (measured downstream on the Linux test NIF of both build trees). ⚠️ `ba3c7ff5` returns the list without `+e5-merge-validation` |
 | toolchain | stable `1.95.0` (unchanged) |
 
 ### What downstream must change with the pin bump
@@ -1344,10 +1350,11 @@ refused. What remains:
   the CI `SB_REQUIRE_BUILD_MARKER` (`.github/workflows/build.yml`), `CRSQLITE_REQUIRED_MARKER` in
   `deploy/deploy-hub.sh`, and the pin comment in `scripts/build_crsqlite_static.sh` that names the gate
   token. The token list is cumulative, so `e5-merge-validation` implies `e4-init-atomic`, and an
-  `e4-init-atomic` gate alone would pass a build without the merge fixes (the provisional pin is one).
+  `e4-init-atomic` gate alone would pass a build without the merge fixes (`ba3c7ff5` is one).
   Both gates use `grep -aq <token>` on the linked binary; the token is one contiguous literal in the fork's
   static archive and in a NIF linked from it, so no other change to the gates is needed. ⚠️ Moving a gate
-  before the pin would fail every build, because `ba3c7ff5` does not carry the token.
+  before the pin would fail every build, because `ba3c7ff5` does not carry the token. ✅ Done downstream,
+  with the `5eac6ac3` pin.
 - **Unchanged:** the on-disk format, the public SQL API, and the submodule. The bytes of the wire format
   (packed primary keys in `crsql_changes`) are unchanged too, but ⛔ `85faa868` through `ba3c7ff5` cannot
   **read** blob primary keys of 128–255, 32768–65535 or 2^23 to 2^24−1 bytes, so they fail to merge them
@@ -1392,14 +1399,20 @@ refused. What remains:
   and malformed-package cases; the pins need Python ≥ 3.10); `tools/init_race_stress.sh 100 8`, all three
   modes, 0 failed opens and 0 wedged; `make static` and `make loadable` build; 7 mutations each red (or
   SKIPPED), restored and checked.
-- With the merge fixes (working tree): `make test` green with 33 C test cases, 23 `init_race`, 11 Rust
+- With the merge fixes (`f523d36e`): `make test` green with 33 C test cases, 23 `init_race`, 11 Rust
   suites; `make valgrind-strict` 0 errors, 0 bytes in use; `py/correctness` 320 passed (55 new in
   `test_merge_input_validation.py`, 41 of them red before the fixes);
   `tools/init_race_stress.sh 100 8`, all three modes, 0 failed opens and 0 wedged; `make static`,
   `make loadable` and `make loadable_dbg` build; the reviewer's fuzz drivers, 800,000 cases across release
   and debug, 0 crashes; 5 mutations each red, restored and checked.
-- With the `e5-merge-validation` token added: `make test` green; `make valgrind-strict` 0 errors, 0 bytes
+- With the `e5-merge-validation` token added (`5eac6ac3`): `make test` green; `make valgrind-strict` 0 errors, 0 bytes
   in use; `py/correctness` 320 passed; `make static` builds and `grep -aq e5-merge-validation` finds the
   token in the static archive and the loadable `.so`; removing the token turns
   `testBuildIdReportsFeatureMarker` red.
 - ⚠️ **Not verified upstream:** macOS and Windows builds.
+- **Downstream, at `5eac6ac3`** (silicon_brain, Linux; its **Adoption Record**): the static test NIF of
+  both build trees reports the build id above; the init race stress test has zero failed opens and zero
+  wedged files, and the targeted cr-sqlite and sync tests pass, in the spoke build. The hub build's tests,
+  macOS, Windows and the hub release eval are not verified there. Copies of two production project
+  databases scanned with silicon_brain's `scripts/scan_crsqlite_merge_bounds.sh` hold nothing the merge
+  checks would refuse.

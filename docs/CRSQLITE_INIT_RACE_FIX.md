@@ -5,8 +5,8 @@ follow-up (**Code review follow-up**, in the **Build record**) committed in `f39
 bumps committed next, in `85faa868`, broke the decoding of packed primary keys
 (**Packed Blob Length Sign-Extension**, in the **Build record**); that fix is committed in `b8c6ffb1`
 and `75d42269`. A crash-safety review of it found three older defects a peer can trigger through a merge
-(**Merge Input Validation**, in the **Build record**); their fixes are in the working tree, verified, and
-awaiting the operator's commit. The release SHA to pin is the commit that includes them.
+(**Merge Input Validation**, in the **Build record**); their fixes are committed in `f523d36e`, and the
+release token `e5-merge-validation` in `5eac6ac3`. The release to pin is `5eac6ac3`; silicon_brain pins it.
 ⛔ **Never pin `85faa868`, or any commit from it up to the sign-extension fix (including `ba3c7ff5`).** Every
 part below is implemented; `make test`, `make valgrind-strict`, `py/correctness` and the stress script
 are green, and the key guarantees are mutation-verified. Where the build made a choice the plan left open,
@@ -1002,9 +1002,9 @@ Built 2026-11-13 on stable Rust 1.95.0 (asdf), gcc, Linux x86_64, against this f
 and committed as `578ef5d6`. The **Code review follow-up** below is committed in `f39caadd`; the
 dependency bumps in `85faa868` and a test fix in `ba3c7ff5` followed. The fix for the release blocker
 those bumps introduced (**Packed Blob Length Sign-Extension**, below) is committed in `b8c6ffb1` and
-`75d42269`. The fixes for three older peer-reachable defects (**Merge Input Validation**, below) are in
-the working tree, awaiting the operator's commit. The release SHA to pin is the commit that includes
-them; the coordination doc's **Pin this** table carries a provisional pin until then.
+`75d42269`. The fixes for three older peer-reachable defects (**Merge Input Validation**, below) are
+committed in `f523d36e`, and their release token in `5eac6ac3`, the release to pin; the coordination
+doc's **Pin this** table carries it, and silicon_brain pins it.
 
 ### Where the code is
 
@@ -1268,8 +1268,8 @@ above, on Linux).
 
 ### Merge Input Validation — three peer-reachable defects, and their fixes
 
-**In the working tree, awaiting the operator's commit** (2026-11-13; approved by the operator the same
-day). A crash-safety review of the **Packed Blob Length Sign-Extension** fix fuzzed `crsql_changes`
+**Committed in `f523d36e`**, with the release token in `5eac6ac3` (2026-11-13; approved by the operator
+the same day). A crash-safety review of the **Packed Blob Length Sign-Extension** fix fuzzed `crsql_changes`
 merges and found no remaining crash, but it found three older defects that any peer can trigger, because
 every row inserted into `crsql_changes` comes from another node. None is caused by the earlier fixes. All
 three are fixed in `merge_insert` (`core/rs/core/src/changes_vtab_write.rs`), before the merge writes
