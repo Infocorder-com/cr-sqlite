@@ -1349,8 +1349,9 @@ refused. What remains:
 - **Gates** keyed on `e2-tbl-pushdown` / `e3-tbl-collate-gate` / `e4-init-atomic` keep working
   (substring match). ⭐ **Move the app's gates to `e5-merge-validation` in the same change as the pin**:
   the CI `SB_REQUIRE_BUILD_MARKER` (`.github/workflows/build.yml`), `CRSQLITE_REQUIRED_MARKER` in
-  `deploy/deploy-hub.sh`, and the pin comment in `scripts/build_crsqlite_static.sh` that names the gate
-  token. The token list is cumulative, so `e5-merge-validation` implies `e4-init-atomic`, and an
+  `deploy/deploy-hub.sh`, the `SB_REQUIRE_BUILD_MARKER` default in `deploy/run-spoke-iex.sh` (the
+  local spoke rebuilds a stale NIF on every start), and the pin comment in
+  `scripts/build_crsqlite_static.sh` that names the gate token. The token list is cumulative, so `e5-merge-validation` implies `e4-init-atomic`, and an
   `e4-init-atomic` gate alone would pass a build without the merge fixes (`ba3c7ff5` is one).
   Both gates use `grep -aq <token>` on the linked binary; the token is one contiguous literal in the fork's
   static archive and in a NIF linked from it, so no other change to the gates is needed. ⚠️ Moving a gate
