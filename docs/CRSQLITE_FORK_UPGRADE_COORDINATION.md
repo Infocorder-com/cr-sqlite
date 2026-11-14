@@ -1338,7 +1338,8 @@ refused. What remains:
 
 - ⛔ **The startup shim, in the same change as the pin.**
   `monkeypatched_deps/exqlite_crsqlite_init.c` must register the new entry point:
-  `sqlite3_auto_extension((void *)sqlite3_crsqlite_autoext_init)`. The signature is the same as
+  `sqlite3_auto_extension((void (*)(void))sqlite3_crsqlite_autoext_init)` (the type-correct cast for
+  `sqlite3_auto_extension`'s parameter). The signature is the same as
   `sqlite3_crsqlite_init`'s. A pin bump **without** it links cleanly and passes every `e4-init-atomic`
   gate, but ships without the busy wait. The token cannot tell the two apart.
 - **Declare the symbol** where the shim declares `sqlite3_crsqlite_init`, or include the fork's
@@ -1353,8 +1354,10 @@ refused. What remains:
   `e4-init-atomic` gate alone would pass a build without the merge fixes (`ba3c7ff5` is one).
   Both gates use `grep -aq <token>` on the linked binary; the token is one contiguous literal in the fork's
   static archive and in a NIF linked from it, so no other change to the gates is needed. ⚠️ Moving a gate
-  before the pin would fail every build, because `ba3c7ff5` does not carry the token. ✅ Done downstream,
-  with the `5eac6ac3` pin.
+  before the pin fails every build, because `ba3c7ff5` does not carry the token — downstream, that holds
+  on a cache hit too only since 2026-11-13: `build_crsqlite_static.sh` exits 0 at its Step 3 stamp match,
+  and CI caches `_build`, so its marker check, which ran only after a fresh link, was skipped on a hit. It
+  now runs on both exits. ✅ Done downstream, with the `5eac6ac3` pin.
 - **Unchanged:** the on-disk format, the public SQL API, and the submodule. The bytes of the wire format
   (packed primary keys in `crsql_changes`) are unchanged too, but ⛔ `85faa868` through `ba3c7ff5` cannot
   **read** blob primary keys of 128–255, 32768–65535 or 2^23 to 2^24−1 bytes, so they fail to merge them
@@ -1373,8 +1376,9 @@ refused. What remains:
   carries <m>`, `… <counter> <value> is out of range (0 to 9007199254740992)`). A change naming an unknown
   table with a NUL in its name fails with `SQLITE_ERROR` where it failed with `SQLITE_NOMEM`. Only a
   malformed or hostile change is affected, and nothing in the API or wire format changes. ⚠️ A batch
-  applied in one transaction fails as a whole when one change is refused; how the app's sync apply reports
-  and retries such a refusal is not assessed here.
+  applied in one transaction fails as a whole when one change is refused. Downstream, the app's
+  **Merge Input Pre-Check** finds such changes before the merge, drops them and reports them, so the rest
+  of the batch applies (`docs/CRSQLITE_INIT_RACE_FIX_INTEGRATION.md` in the app repo).
 
 ### Verification (upstream, stable 1.95.0, Linux)
 
